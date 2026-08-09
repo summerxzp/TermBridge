@@ -1,0 +1,63 @@
+[package]
+name = "termbridge"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[lib]
+name = "termbridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "termbridge"
+path = "src/main.rs"
+
+# Phase 0 原型用 examples/ 验证各 crate，不污染主二进制
+[[example]]
+name = "p0_echo_mcp"
+path = "examples/p0_echo_mcp.rs"
+
+[[example]]
+name = "p0_ssh_pty"
+path = "examples/p0_ssh_pty.rs"
+
+[[example]]
+name = "p0_ssh_config"
+path = "examples/p0_ssh_config.rs"
+
+[[example]]
+name = "p0_sftp"
+path = "examples/p0_sftp.rs"
+
+[dependencies]
+# MCP（Phase 0-A 验证 rmcp 3.1.1）
+rmcp = { version = "3.1", features = ["server", "macros", "transport-io", "schemars"] }
+
+# SSH / SFTP
+# russh 默认用 aws-lc-rs（需 NASM），Windows 无 NASM → 切 ring（纯 Rust）
+# 保留 flate2（压缩）+ rsa（RSA 主机密钥兼容）+ async-trait（Handler trait）
+russh = { version = "0.62", default-features = false, features = ["ring", "flate2", "rsa", "async-trait"] }
+russh-sftp = "2.4"
+
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# 序列化 / Schema
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 工具
+bytes = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
