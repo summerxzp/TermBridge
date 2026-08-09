@@ -1,4 +1,7 @@
 // TermBridge domain 层：核心实体与接口。
-// Phase 0-B：先实现 OutputEngine（项目核心 IP），其余 domain 模块 Phase 1 起逐步迁入。
+// Phase 0-B：OutputEngine（项目核心 IP）。
+// Phase 0-C：provider（TerminalProvider/Handle + Host + TermError）+ session。
 
 pub mod output;
+pub mod provider;
+pub mod session;
