@@ -1,4 +1,4 @@
-//! rmcp MCP server —— 6 工具映射到 application 层（§6）
+//! rmcp MCP server —— 7 工具映射到 application 层（§6 / §7.4 Phase 1）
 //!
 //! 工具：
 //! 1. `list_hosts`       → HostManager::list_hosts
@@ -7,6 +7,7 @@
 //! 4. `read_output`      → SessionManager::read_output
 //! 5. `send_control`     → SessionManager::send_control
 //! 6. `close_session`    → SessionManager::close_session
+//! 7. `sftp_transfer`    → SessionManager::sftp_transfer（Phase 1，upload/download only）
 //!
 //! 错误格式（§6.1）：`CallToolResult::structured_error({code, message, retriable})`
 //! 成功格式：`CallToolResult::structured({工具特定结构})`
@@ -25,7 +26,7 @@ use serde_json::json;
 use crate::application::hosts::HostManager;
 use crate::application::sessions::SessionManager;
 use crate::domain::output::ReadOutputParams;
-use crate::domain::provider::{ControlKey, PtySize, TermError};
+use crate::domain::provider::{ControlKey, PtySize, TermError, TransferDirection};
 
 // ───────────────────────────────────────────────────────────────────────────
 // ToolError —— §6.1 统一错误格式
@@ -118,6 +119,19 @@ pub struct CloseSessionParams {
     pub session_id: String,
 }
 
+/// sftp_transfer 参数（Phase 1，§7.4）
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SftpTransferParams {
+    /// Session ID returned by open_session
+    pub session_id: String,
+    /// Transfer direction: "upload" (local→remote) or "download" (remote→local)
+    pub direction: String,
+    /// Local file path. For upload: source (must exist). For download: destination (will be created/overwritten atomically).
+    pub local_path: String,
+    /// Remote file path. Path policy enforced (realpath resolution; rejects ../ and null bytes).
+    pub remote_path: String,
+}
+
 // ── 返回类型 ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -150,6 +164,14 @@ struct ReadOutputDto {
     matched: bool,
     timed_out: bool,
     mode: String,
+}
+
+/// sftp_transfer 成功返回（Phase 1）
+#[derive(Serialize)]
+struct SftpTransferResult {
+    direction: String,
+    local_path: String,
+    remote_path: String,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -299,12 +321,51 @@ impl TermBridgeServer {
             Err(e) => err_result(&e),
         }
     }
+
+    /// Transfer files via SFTP (Phase 1, upload/download only).
+    #[tool(description = "Transfer files via SFTP. Supports upload (local->remote) and download (remote->local). Path policy enforced: local paths must be under allowedLocalPaths (default cwd); remote paths resolved via realpath to prevent ../ traversal and symlink escape. Download uses atomic write (temp + fsync + rename).")]
+    async fn sftp_transfer(
+        &self,
+        Parameters(params): Parameters<SftpTransferParams>,
+    ) -> CallToolResult {
+        let direction = match TransferDirection::from_name(&params.direction) {
+            Some(d) => d,
+            None => {
+                return CallToolResult::structured_error(json!(ToolError {
+                    code: "INVALID_ARGUMENT".to_string(),
+                    message: format!(
+                        "unknown direction '{}'; supported: upload, download",
+                        params.direction
+                    ),
+                    retriable: false,
+                }));
+            }
+        };
+
+        match self
+            .session_manager
+            .sftp_transfer(
+                &params.session_id,
+                direction,
+                std::path::PathBuf::from(&params.local_path),
+                params.remote_path.clone(),
+            )
+            .await
+        {
+            Ok(()) => ok_result(SftpTransferResult {
+                direction: params.direction,
+                local_path: params.local_path,
+                remote_path: params.remote_path,
+            }),
+            Err(e) => err_result(&e),
+        }
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for TermBridgeServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("TermBridge: Remote terminal bridge for AI agents. Open a session to an SSH host, send commands, read output, send control characters (Ctrl+C etc.), and close when done.")
+            .with_instructions("TermBridge: Remote terminal bridge for AI agents. Open a session to an SSH host, send commands, read output, send control characters (Ctrl+C etc.), transfer files via SFTP (upload/download), and close when done.")
     }
 }

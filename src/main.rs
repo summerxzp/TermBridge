@@ -11,15 +11,16 @@ use std::sync::Arc;
 
 use termbridge::application::hosts::HostManager;
 use termbridge::application::sessions::SessionManager;
+use termbridge::infrastructure::redact::RedactingMakeWriter;
 use termbridge::infrastructure::ssh::SshProvider;
 use termbridge::transport::mcp::server::TermBridgeServer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // tracing → stderr（stdio 留给 MCP JSON-RPC）
+    // tracing → stderr（stdio 留给 MCP JSON-RPC），经 RedactingMakeWriter 脱敏（§5.5）
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
+        .with_writer(RedactingMakeWriter::new())
         .init();
 
     tracing::info!("termbridge: Phase 0-C vertical slice starting");

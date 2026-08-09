@@ -20,6 +20,7 @@
 //! // None = PTY EOF / channel closed，read task 退出
 //! ```
 
+use std::any::Any;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -38,14 +39,22 @@ pub type HostName = String;
 ///
 /// 由 `ssh -G <alias>` 解析得到（ADR-0006），已展开 Include/Match/ProxyJump。
 /// Phase 0-C：proxy_jump 只解析不连接（MVP 不涉及跳板）。
+/// Phase 1：新增 user_known_hosts_file / strict_host_key_checking（§5.5 host key 校验）。
 #[derive(Debug, Clone)]
 pub struct Host {
     pub name: HostName,
     pub hostname: String,
     pub user: String,
     pub port: u16,
-    pub identity_file: Option<PathBuf>,
+    /// `IdentityFile` 列表（已展开 ~，仅含存在的文件，保持 ssh -G 输出顺序）。空 Vec 表示无。
+    /// Phase 1：支持多 IdentityFile 遍历（凭据优先级 SSH Agent > IdentityFile > HITL）。
+    pub identity_files: Vec<PathBuf>,
     pub proxy_jump: Option<HostName>,
+    /// `UserKnownHostsFile`（已展开 ~）。取首个路径（OpenSSH 默认 `~/.ssh/known_hosts ~/.ssh/known_hosts2`）。
+    /// None 表示 ssh -G 未输出该字段（极少见，按默认路径处理）。
+    pub user_known_hosts_file: Option<PathBuf>,
+    /// `StrictHostKeyChecking`：ask / yes / no（小写）。缺省 ask（OpenSSH 默认）。
+    pub strict_host_key_checking: String,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -145,8 +154,11 @@ pub trait TerminalProvider: Send + Sync {
 ///
 /// `Send + Sync`：让 `Arc<dyn TerminalHandle>` 可跨线程（PTY read task 持有 clone）。
 /// 实现方（如 SshTerminalHandle）内部用 Mutex 包非 Sync 的 channel 状态。
+///
+/// Phase 1：trait 加 `Any` supertrait + `as_any()` 默认方法，让 SessionManager 可下转
+/// 到具体 `SshTerminalHandle` 以访问 SFTP 能力（upload/download）。
 #[async_trait]
-pub trait TerminalHandle: Send + Sync {
+pub trait TerminalHandle: Send + Sync + Any {
     /// 读一批原始 PTY output。`Ok(None)` = PTY EOF / channel closed（read task 应退出）。
     async fn read(&self) -> Result<Option<Bytes>, TermError>;
 
@@ -161,6 +173,13 @@ pub trait TerminalHandle: Send + Sync {
 
     /// 关闭 PTY + channel + 远端 shell（§4.6 契约 9：Session close 才结束 shell）。
     async fn close(&self) -> Result<(), TermError>;
+
+    /// 下转 `&self` 为 `&dyn Any`，供 SessionManager 下转到具体 `SshTerminalHandle`
+    /// 以访问 SFTP 能力（upload/download）。
+    ///
+    /// 实现方写 `fn as_any(&self) -> &dyn Any { self }` 即可（依赖 `Self: Any`）。
+    /// 不放默认实现：默认 `self` 在 trait 对象上下文中无法编译（`Self` unsized）。
+    fn as_any(&self) -> &dyn Any;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -185,14 +204,31 @@ pub enum TermError {
     #[error("operation timed out")]
     OperationTimeout,
 
-    #[error("host key rejected")]
-    HostKeyRejected,
+    /// Host key 校验失败（Phase 1，§5.5）。
+    /// 携带拒绝原因（key 不匹配 / host 未知 / known_hosts 读取失败等）。
+    #[error("host key rejected: {0}")]
+    HostKeyRejected(String),
 
     #[error("SSH channel error: {0}")]
     ChannelError(String),
 
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    /// SFTP 操作失败（§6.1：SFTP_ERROR，retriable=true）。
+    /// Phase 1：upload/download/canonicalize 等远端 SFTP 失败统一映射到此。
+    #[error("SFTP error: {0}")]
+    SftpError(String),
+
+    /// 本地路径策略拒绝（§5.5 / §6.1：LOCAL_PATH_NOT_ALLOWED，retriable=false）。
+    /// 路径不在 `allowedLocalPaths` 白名单内，或含 `..` 穿越等。
+    #[error("local path not allowed: {0}")]
+    LocalPathNotAllowed(String),
+
+    /// 远端路径策略拒绝（§5.5 / §6.1：REMOTE_PATH_NOT_ALLOWED，retriable=false）。
+    /// realpath 解析后不在 `allowedRemotePaths` 白名单内，或含 null 字节等。
+    #[error("remote path not allowed: {0}")]
+    RemotePathNotAllowed(String),
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -208,8 +244,11 @@ impl TermError {
             Self::ConnectFailed(_) => "CONNECT_FAILED",
             Self::OperationTimeout => "OPERATION_TIMEOUT",
             Self::ChannelError(_) => "CONNECT_FAILED",
-            Self::HostKeyRejected => "HOST_KEY_REJECTED",
+            Self::HostKeyRejected(_) => "HOST_KEY_REJECTED",
             Self::InvalidArgument(_) => "INVALID_ARGUMENT",
+            Self::SftpError(_) => "SFTP_ERROR",
+            Self::LocalPathNotAllowed(_) => "LOCAL_PATH_NOT_ALLOWED",
+            Self::RemotePathNotAllowed(_) => "REMOTE_PATH_NOT_ALLOWED",
             Self::Io(_) => "CONNECT_FAILED",
         }
     }
@@ -220,14 +259,59 @@ impl TermError {
             Self::AuthFailed
             | Self::SessionNotFound(_)
             | Self::SessionClosed(_)
-            | Self::HostKeyRejected
-            | Self::InvalidArgument(_) => false,
+            | Self::HostKeyRejected(_)
+            | Self::InvalidArgument(_)
+            | Self::LocalPathNotAllowed(_)
+            | Self::RemotePathNotAllowed(_) => false,
             Self::ConnectFailed(_)
             | Self::OperationTimeout
             | Self::ChannelError(_)
+            | Self::SftpError(_)
             | Self::Io(_) => true,
         }
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// TransferDirection —— SFTP 传输方向（§5.5 / §7.4 Phase 1）
+// ───────────────────────────────────────────────────────────────────────────
+
+/// SFTP 传输方向。Phase 1 仅支持 upload（local→remote）与 download（remote→local）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransferDirection {
+    /// 本地 → 远端
+    Upload,
+    /// 远端 → 本地
+    Download,
+}
+
+impl TransferDirection {
+    /// 字符串名 → TransferDirection（MCP sftp_transfer 参数解析用）。
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "upload" => Some(Self::Upload),
+            "download" => Some(Self::Download),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Upload => "upload",
+            Self::Download => "download",
+        }
+    }
+}
+
+/// 路径策略检查所需 SFTP 能力（domain 层接口）。
+///
+/// PathPolicy::check_remote 需要调远端 `realpath` 解析路径，避免 `..` 与 symlink 逃逸。
+/// 此 trait 由 infrastructure 层 SFTP 实现（`SftpProvider`）实现，application 层
+/// PathPolicy 通过此 trait 解耦具体 SFTP 库（russh-sftp）。
+#[async_trait]
+pub trait SftpCanonicalize: Send + Sync {
+    /// 解析远端路径为绝对路径（等价 SFTP `realpath`）。
+    async fn canonicalize(&self, path: &str) -> Result<String, TermError>;
 }
 
 #[cfg(test)]
@@ -264,5 +348,58 @@ mod tests {
 
         assert_eq!(TermError::SessionNotFound("s1".into()).code(), "SESSION_NOT_FOUND");
         assert!(!TermError::SessionNotFound("s1".into()).retriable());
+    }
+
+    #[test]
+    fn host_key_rejected_error_code_and_retriable() {
+        // Phase 1：HOST_KEY_REJECTED 不可重试（key 不匹配通常是配置/攻击问题，重试无意义）。
+        let err = TermError::HostKeyRejected("key mismatch at line 3".into());
+        assert_eq!(err.code(), "HOST_KEY_REJECTED");
+        assert!(!err.retriable());
+        assert!(format!("{err}").contains("key mismatch at line 3"));
+    }
+
+    #[test]
+    fn sftp_error_code_and_retriable() {
+        // Phase 1：SFTP_ERROR 可重试（网络抖动等导致，重试可能成功）
+        let err = TermError::SftpError("channel closed".into());
+        assert_eq!(err.code(), "SFTP_ERROR");
+        assert!(err.retriable());
+        assert!(format!("{err}").contains("channel closed"));
+    }
+
+    #[test]
+    fn path_not_allowed_errors_are_not_retriable() {
+        // Phase 1：路径策略拒绝不可重试（路径不会因重试而变合法）
+        let local = TermError::LocalPathNotAllowed("/etc/passwd not in allowed roots".into());
+        assert_eq!(local.code(), "LOCAL_PATH_NOT_ALLOWED");
+        assert!(!local.retriable());
+
+        let remote = TermError::RemotePathNotAllowed("/root not allowed".into());
+        assert_eq!(remote.code(), "REMOTE_PATH_NOT_ALLOWED");
+        assert!(!remote.retriable());
+    }
+
+    #[test]
+    fn transfer_direction_from_name_case_insensitive() {
+        assert_eq!(
+            TransferDirection::from_name("upload"),
+            Some(TransferDirection::Upload)
+        );
+        assert_eq!(
+            TransferDirection::from_name("DOWNLOAD"),
+            Some(TransferDirection::Download)
+        );
+        assert_eq!(
+            TransferDirection::from_name("Download"),
+            Some(TransferDirection::Download)
+        );
+        assert_eq!(TransferDirection::from_name("sync"), None);
+    }
+
+    #[test]
+    fn transfer_direction_as_str() {
+        assert_eq!(TransferDirection::Upload.as_str(), "upload");
+        assert_eq!(TransferDirection::Download.as_str(), "download");
     }
 }

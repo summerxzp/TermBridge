@@ -7,7 +7,8 @@
 //! resolve("testhost")
 //!   → `ssh -G testhost` 子进程
 //!   → 解析 `key value` 行
-//!   → Host { name, hostname, user, port, identity_file, proxy_jump }
+//!   → Host { name, hostname, user, port, identity_files, proxy_jump,
+//!            user_known_hosts_file, strict_host_key_checking }
 //! ```
 
 use std::collections::HashMap;
@@ -80,20 +81,42 @@ fn parse_ssh_g(alias: &str, stdout: &str) -> Result<Host, TermError> {
         .filter(|v| !v.is_empty() && *v != "none")
         .cloned();
 
-    // identityfile：取第一个，展开 ~ 为 home dir
-    let identity_file = multi
+    // identityfile：收集所有存在的文件（展开 ~），保持 ssh -G 输出顺序。
+    // Phase 1：支持多 IdentityFile 遍历（凭据优先级 SSH Agent > IdentityFile > HITL）。
+    let identity_files: Vec<PathBuf> = multi
         .get("identityfile")
-        .and_then(|files| files.first())
-        .map(|s| expand_tilde(s))
-        .filter(|p| p.is_file());
+        .map(|files| {
+            files
+                .iter()
+                .map(|s| expand_tilde(s))
+                .filter(|p| p.is_file())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // userknownhostsfile：可能含多个空格分隔路径，取首个并展开 ~。
+    // 不做 is_file 过滤——known_hosts 缺失本身是有意义状态（host 未知），
+    // 应让校验层报 "host 未知" 而非这里悄悄吞掉。
+    let user_known_hosts_file = single
+        .get("userknownhostsfile")
+        .and_then(|v| v.split_whitespace().next())
+        .map(|s| expand_tilde(s));
+
+    // stricthostkeychecking：ask / yes / no（OpenSSH 默认 ask）。统一小写便于后续匹配。
+    let strict_host_key_checking = single
+        .get("stricthostkeychecking")
+        .map(|v| v.to_ascii_lowercase())
+        .unwrap_or_else(|| "ask".to_string());
 
     Ok(Host {
         name: alias.to_string(),
         hostname,
         user,
         port,
-        identity_file,
+        identity_files,
         proxy_jump,
+        user_known_hosts_file,
+        strict_host_key_checking,
     })
 }
 
@@ -123,6 +146,10 @@ fn dirs_or_home() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    /// 序列化所有操作 HOME 环境变量的测试，避免并行竞争。
+    /// Windows 上 HOME 不控制 home 目录，但 expand_tilde 读它，多测试并行 set/restore 会竞态。
+    static HOME_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     const SAMPLE_G: &str = r#"user testuser
 hostname 192.168.88.140
 port 22
@@ -145,23 +172,47 @@ proxyjump none
     }
 
     #[test]
-    fn parse_multi_identityfile_takes_first() {
-        // 用 tempdir 模拟 identity file，避免依赖真实 ~/.ssh/id_ed25519
+    fn parse_multi_identityfile_collects_all_existing() {
+        // 多个 identityfile：收集所有存在的文件，保持顺序；跳过不存在的
         let temp_dir = std::env::temp_dir();
-        let temp_key = temp_dir.join("termbridge_test_id_ed25519");
-        std::fs::write(&temp_key, "dummy_key_content").unwrap();
+        let temp_key_a = temp_dir.join("termbridge_test_id_ed25519_a");
+        let temp_key_b = temp_dir.join("termbridge_test_id_rsa_b");
+        std::fs::write(&temp_key_a, "dummy_key_content_a").unwrap();
+        std::fs::write(&temp_key_b, "dummy_key_content_b").unwrap();
 
         let g = format!(
-            "user testuser\nhostname 192.168.88.140\nport 22\nidentityfile {}\nidentityfile /nonexistent_key\n",
-            temp_key.display()
+            "user testuser\nhostname 192.168.88.140\nport 22\nidentityfile {}\nidentityfile {}\nidentityfile /nonexistent_key\n",
+            temp_key_a.display(),
+            temp_key_b.display()
         );
         let host = parse_ssh_g("testhost", &g).unwrap();
-        assert!(host.identity_file.is_some());
-        let p = host.identity_file.unwrap();
-        assert!(p.ends_with("termbridge_test_id_ed25519"));
+        assert_eq!(
+            host.identity_files.len(),
+            2,
+            "应收集两个存在的 key 文件（跳过不存在的）"
+        );
+        assert_eq!(host.identity_files[0], temp_key_a);
+        assert_eq!(host.identity_files[1], temp_key_b);
 
         // cleanup
-        std::fs::remove_file(&temp_key).ok();
+        std::fs::remove_file(&temp_key_a).ok();
+        std::fs::remove_file(&temp_key_b).ok();
+    }
+
+    #[test]
+    fn parse_identityfile_empty_when_none_exist() {
+        // 全部 identityfile 都不存在 → 空 Vec
+        let g = "user testuser\nhostname 192.168.88.140\nport 22\nidentityfile /nonexistent_a\nidentityfile /nonexistent_b\n";
+        let host = parse_ssh_g("testhost", g).unwrap();
+        assert!(host.identity_files.is_empty());
+    }
+
+    #[test]
+    fn parse_identityfile_empty_when_absent() {
+        // 无 identityfile 行 → 空 Vec
+        let g = "user u\nhostname h\nport 22\n";
+        let host = parse_ssh_g("testhost", g).unwrap();
+        assert!(host.identity_files.is_empty());
     }
 
     #[test]
@@ -186,6 +237,7 @@ port 22
 
     #[test]
     fn expand_tilde_home() {
+        let _guard = HOME_ENV_LOCK.lock();
         // 保存并恢复 HOME，避免影响并行测试
         let saved_home = std::env::var_os("HOME");
         std::env::set_var("HOME", "/tmp/fakehome");
@@ -214,5 +266,103 @@ port 2222
 "#;
         let host = parse_ssh_g("custom", g).unwrap();
         assert_eq!(host.port, 2222);
+    }
+
+    #[test]
+    fn parse_user_known_hosts_file_expands_tilde() {
+        let _guard = HOME_ENV_LOCK.lock();
+        // 保存并恢复 HOME，避免影响并行测试
+        let saved_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/tmp/fakehome");
+
+        let host = parse_ssh_g("testhost", SAMPLE_G).unwrap();
+        let p = host.user_known_hosts_file.expect("应解析出 known_hosts 路径");
+        let expected = PathBuf::from("/tmp/fakehome").join(".ssh").join("known_hosts");
+        assert_eq!(p, expected);
+        assert!(!p.to_string_lossy().contains('~'));
+
+        match saved_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn parse_user_known_hosts_file_takes_first_when_multiple() {
+        let _guard = HOME_ENV_LOCK.lock();
+        // OpenSSH 默认 `~/.ssh/known_hosts ~/.ssh/known_hosts2`，应取首个
+        let saved_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/tmp/fakehome");
+
+        let g = r#"user u
+hostname h
+port 22
+userknownhostsfile ~/.ssh/known_hosts ~/.ssh/known_hosts2
+"#;
+        let host = parse_ssh_g("multi", g).unwrap();
+        let p = host.user_known_hosts_file.unwrap();
+        let expected = PathBuf::from("/tmp/fakehome").join(".ssh").join("known_hosts");
+        assert_eq!(p, expected);
+
+        match saved_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    fn parse_strict_host_key_checking_values() {
+        // SAMPLE_G 用 "ask"
+        let host = parse_ssh_g("testhost", SAMPLE_G).unwrap();
+        assert_eq!(host.strict_host_key_checking, "ask");
+
+        // yes
+        let g = r#"user u
+hostname h
+port 22
+stricthostkeychecking yes
+"#;
+        let host = parse_ssh_g("strict_yes", g).unwrap();
+        assert_eq!(host.strict_host_key_checking, "yes");
+
+        // no
+        let g = r#"user u
+hostname h
+port 22
+stricthostkeychecking no
+"#;
+        let host = parse_ssh_g("strict_no", g).unwrap();
+        assert_eq!(host.strict_host_key_checking, "no");
+
+        // 大写应归一化为小写
+        let g = r#"user u
+hostname h
+port 22
+stricthostkeychecking YES
+"#;
+        let host = parse_ssh_g("strict_upper", g).unwrap();
+        assert_eq!(host.strict_host_key_checking, "yes");
+    }
+
+    #[test]
+    fn parse_strict_host_key_checking_defaults_to_ask() {
+        // 缺省 stricthostkeychecking → "ask"（OpenSSH 默认）
+        let g = r#"user u
+hostname h
+port 22
+"#;
+        let host = parse_ssh_g("default", g).unwrap();
+        assert_eq!(host.strict_host_key_checking, "ask");
+    }
+
+    #[test]
+    fn parse_user_known_hosts_file_none_when_absent() {
+        // 缺省 userknownhostsfile → None
+        let g = r#"user u
+hostname h
+port 22
+"#;
+        let host = parse_ssh_g("default", g).unwrap();
+        assert!(host.user_known_hosts_file.is_none());
     }
 }

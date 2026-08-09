@@ -15,13 +15,23 @@
 //! None / Err → 退出，置 SessionState::Lost（§4.6 契约 10：disconnect 不销毁 Session，
 //! 但状态反映断开）。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
 use super::output::{OutputEngine, ReadOutputParams, ReadOutputResult, DEFAULT_BUFFER_SIZE};
 use super::provider::{ControlKey, HostName, PtySize, TerminalHandle, TermError};
+
+/// 获取当前 Unix 时间戳（秒）。系统时钟异常时返回 0。
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // SessionId / SessionState
@@ -71,6 +81,8 @@ impl SessionState {
 ///
 /// 一个 Session = 一个 OutputEngine + 一个 TerminalHandle + 一个 PTY read task。
 /// Agent 通过 `read_output` / `send_input` / `send_control` / `close` 操作。
+///
+/// Phase 1：新增 `last_activity`（Unix 秒）供 idleReaper 判定空闲超时。
 pub struct Session {
     id: SessionId,
     host: HostName,
@@ -79,6 +91,9 @@ pub struct Session {
     output: OutputEngine,
     handle: Arc<dyn TerminalHandle>,
     read_task: Mutex<Option<JoinHandle<()>>>,
+    /// 最近一次活动时间（Unix 秒）。send_input / read_output / send_control 调用时更新。
+    /// idleReaper 据此判定是否空闲超时（§7.4 Phase 1）。
+    last_activity: AtomicU64,
 }
 
 impl Session {
@@ -129,6 +144,7 @@ impl Session {
             output,
             handle,
             read_task: Mutex::new(Some(read_task)),
+            last_activity: AtomicU64::new(now_secs()),
         }
     }
 
@@ -148,6 +164,35 @@ impl Session {
         self.pty_size
     }
 
+    /// 最近一次活动时间（Unix 秒）。
+    pub fn last_activity(&self) -> u64 {
+        self.last_activity.load(Ordering::Relaxed)
+    }
+
+    /// 是否空闲超过 `threshold_secs` 秒。供 idleReaper 判定（§7.4 Phase 1）。
+    pub fn is_idle(&self, threshold_secs: u64) -> bool {
+        let last = self.last_activity.load(Ordering::Relaxed);
+        now_secs().saturating_sub(last) >= threshold_secs
+    }
+
+    /// 刷新 last_activity 为当前时间。send_input / read_output / send_control 调用前触发。
+    fn touch_last_activity(&self) {
+        self.last_activity.store(now_secs(), Ordering::Relaxed);
+    }
+
+    /// 测试辅助：直接设置 last_activity（模拟"很久没活动"）。
+    #[cfg(test)]
+    pub fn set_last_activity_for_test(&self, ts: u64) {
+        self.last_activity.store(ts, Ordering::Relaxed);
+    }
+
+    /// 返回底层 TerminalHandle 引用（供 SessionManager 下转到具体 SshTerminalHandle 调 SFTP）。
+    ///
+    /// Phase 1：SFTP 能力通过 `handle.as_any().downcast_ref::<SshTerminalHandle>()` 访问。
+    pub fn handle(&self) -> &Arc<dyn TerminalHandle> {
+        &self.handle
+    }
+
     /// 读取输出（§5.3 三模式 + §4.6 契约 3/4/5/11）。
     ///
     /// 仅 `Closed` 拒绝；`Lost` 仍可读 buffer 剩余数据（§4.6 契约 10：disconnect 不销毁 Session）。
@@ -158,6 +203,7 @@ impl Session {
         if self.state().is_closed() {
             return Err(TermError::SessionClosed(self.id.clone()));
         }
+        self.touch_last_activity();
         Ok(self.output.read_output(params).await)
     }
 
@@ -167,6 +213,7 @@ impl Session {
         if !self.state().is_usable() {
             return Err(TermError::SessionClosed(self.id.clone()));
         }
+        self.touch_last_activity();
         self.handle.write(data).await
     }
 
@@ -175,6 +222,7 @@ impl Session {
         if !self.state().is_usable() {
             return Err(TermError::SessionClosed(self.id.clone()));
         }
+        self.touch_last_activity();
         self.handle.send_control(key).await
     }
 
@@ -275,6 +323,9 @@ mod tests {
         async fn close(&self) -> Result<(), TermError> {
             Ok(())
         }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     #[tokio::test]
@@ -336,5 +387,66 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), "SESSION_CLOSED");
+    }
+
+    // ── Phase 1：last_activity / is_idle 测试 ──────────────────────────
+
+    #[tokio::test]
+    async fn last_activity_initialized_to_now() {
+        let handle = Arc::new(FakeHandle {
+            chunks: Mutex::new(vec![]),
+        }) as Arc<dyn TerminalHandle>;
+        let before = now_secs();
+        let session = Session::new("s1".into(), "h".into(), PtySize::default(), handle);
+        let after = now_secs();
+
+        let la = session.last_activity();
+        assert!(la >= before && la <= after, "last_activity 应为当前时间");
+    }
+
+    #[tokio::test]
+    async fn is_idle_true_when_last_activity_old() {
+        let handle = Arc::new(FakeHandle {
+            chunks: Mutex::new(vec![]),
+        }) as Arc<dyn TerminalHandle>;
+        let session = Session::new("s1".into(), "h".into(), PtySize::default(), handle);
+
+        // 设为 100 秒前 → 超过 1 秒阈值 → idle
+        session.set_last_activity_for_test(now_secs().saturating_sub(100));
+        assert!(session.is_idle(1));
+        assert!(session.is_idle(60));
+        assert!(!session.is_idle(200));
+    }
+
+    #[tokio::test]
+    async fn is_idle_false_when_recently_active() {
+        let handle = Arc::new(FakeHandle {
+            chunks: Mutex::new(vec![]),
+        }) as Arc<dyn TerminalHandle>;
+        let session = Session::new("s1".into(), "h".into(), PtySize::default(), handle);
+
+        // 刚创建，last_activity 为当前 → 不 idle
+        assert!(!session.is_idle(1800));
+    }
+
+    #[tokio::test]
+    async fn send_input_updates_last_activity() {
+        let handle = Arc::new(FakeHandle {
+            chunks: Mutex::new(vec![]),
+        }) as Arc<dyn TerminalHandle>;
+        let session = Session::new("s1".into(), "h".into(), PtySize::default(), handle);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // 设为很久以前
+        session.set_last_activity_for_test(0);
+        assert!(session.is_idle(1));
+
+        // read task EOF → state Lost → send_input 返回 SessionClosed，不会 touch
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(session.state(), SessionState::Lost);
+
+        // Lost 状态下 send_input 不更新 last_activity（is_usable 为 false，提前返回）
+        let _ = session.send_input(b"ls\n").await;
+        assert_eq!(session.last_activity(), 0);
     }
 }

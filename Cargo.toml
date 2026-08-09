@@ -58,6 +58,8 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 regex = "1"
 parking_lot = "0.12"
+# 并发 HashMap（Phase 1：多 session 并发读写，替代 Mutex<HashMap>）
+dashmap = "6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
