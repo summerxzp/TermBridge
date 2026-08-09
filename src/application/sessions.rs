@@ -119,12 +119,18 @@ impl SessionManager {
     ///
     /// 流程：`ssh -G <alias>` 解析 → `provider.open()` → `Session::new()` → 存入 map。
     /// 返回 session_id 供后续操作引用。
+    ///
+    /// - `persistent=false`：Interactive Session（Phase 1/2 路径，SSH 直连 PTY）
+    /// - `persistent=true`：Persistent Session（Phase 3 路径，远端 daemon 托管 PTY，ADR-0004）
+    ///   `name` 仅 persistent 模式有效，作为远端 session 可读标签
     pub async fn open_session(
         &self,
         host_alias: &HostName,
         pty_size: Option<PtySize>,
+        persistent: bool,
+        name: Option<String>,
     ) -> Result<SessionId, TermError> {
-        tracing::info!(host = %host_alias, "open_session: resolving ssh config");
+        tracing::info!(host = %host_alias, persistent, "open_session: resolving ssh config");
 
         // 1. ssh -G 解析（ADR-0006：复用 OpenSSH 完整 config 解析）
         let host = sshconfig::resolve(host_alias).await?;
@@ -133,16 +139,21 @@ impl SessionManager {
             hostname = %host.hostname,
             port = host.port,
             user = %host.user,
+            persistent,
             "open_session: resolved, connecting"
         );
 
-        // 2. Provider 创建 Terminal Backend（SSH connect + auth + PTY + shell）
+        // 2. Provider 创建 Terminal Backend
+        //    persistent=false → SshProvider 路径（SSH connect + auth + PTY + shell）
+        //    persistent=true  → PersistentProvider 路径（check/deploy/bootstrap daemon + session.create）
         let pty_size = pty_size.unwrap_or_default();
         let handle = self
             .provider
             .open(OpenTerminalRequest {
                 host: host.clone(),
                 pty_size,
+                persistent,
+                name,
             })
             .await?;
 

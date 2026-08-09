@@ -399,6 +399,194 @@ impl TerminalProvider for SshProvider {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// SshProvider —— exec / exec_stream（Phase 3：远端 daemon 探测与 proxy 透传）
+// ───────────────────────────────────────────────────────────────────────────
+
+impl SshProvider {
+    /// 执行一条 SSH 命令，收集 stdout 并返回。用于 check_remote_runtime / bootstrap。
+    ///
+    /// Phase 3 用途：
+    /// - `check_remote_runtime`：执行
+    ///   `test -x ~/.local/share/termbridge/termbridge-agentd` 等探测命令
+    /// - `bootstrap_daemon`：执行
+    ///   `termbridge-agentd bootstrap --sock <path>`，收集 stdout JSON 响应
+    ///
+    /// 行为：
+    /// - 复用 `connect_session`（不开 PTY、不发 shell）建立已认证 session
+    /// - `channel.exec(command)` 触发远端执行
+    /// - 循环收 `ChannelMsg::Data`（stdout）拼接为 String
+    /// - `ChannelMsg::ExtendedData`（stderr）记录到 tracing::debug 后丢弃（不阻塞）
+    /// - 收 `ChannelMsg::ExitStatus` 记录退出码，等 `Eof`/`Close` 退出循环
+    /// - 命令完成后主动 `session.disconnect` 关闭连接（exec 是短连接）
+    ///
+    /// 错误映射：
+    /// - SSH 连接失败 → `TermError::ConnectFailed` / `HostKeyRejected` / `AuthFailed`
+    /// - channel / exec 操作失败 → `TermError::ChannelError`
+    /// - 命令退出码非 0 → `TermError::ChannelError("command exited with code {code}")`
+    pub async fn exec(&self, host: &Host, command: &str) -> Result<String, TermError> {
+        tracing::info!(
+            host = %host.name,
+            hostname = %host.hostname,
+            command,
+            "ssh exec"
+        );
+
+        // 连接 + 认证（复用 connect_session，支持直连与 ProxyJump）
+        let connected = connect_session(host, 0).await?;
+        let session = connected.handle;
+        let bastions = connected.bastions;
+
+        // 开 session channel + exec（不开 PTY）
+        // want_reply=true：要求 server 回 success/failure，便于及早发现 exec 被拒
+        let mut channel = session
+            .channel_open_session()
+            .await
+            .map_err(|e| TermError::ChannelError(format!("channel_open_session: {e}")))?;
+        channel
+            .exec(true, command)
+            .await
+            .map_err(|e| TermError::ChannelError(format!("channel.exec: {e}")))?;
+
+        // 循环收消息：Data → stdout；ExtendedData → stderr 丢弃；ExitStatus → 退出码
+        let mut stdout = Vec::new();
+        let mut exit_code: Option<u32> = None;
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    stdout.extend_from_slice(&data);
+                }
+                Some(ChannelMsg::ExtendedData { data, ext }) => {
+                    // stderr 不阻塞 stdout 收集，仅 debug 记录后丢弃
+                    tracing::debug!(
+                        host = %host.name,
+                        ext,
+                        len = data.len(),
+                        "ssh exec stderr (discarded)"
+                    );
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    exit_code = Some(exit_status);
+                    // 不 break：等 Eof/Close 确保所有 stdout 数据已收到
+                }
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                Some(_) => continue,
+            }
+        }
+
+        // 清理：channel eof + session/bastions disconnect（exec 是短连接）
+        let _ = channel.eof().await;
+        let _ = session
+            .disconnect(Disconnect::ByApplication, "termbridge exec done", "en")
+            .await;
+        for bs in bastions.into_iter().rev() {
+            let _ = bs
+                .disconnect(
+                    Disconnect::ByApplication,
+                    "termbridge exec done bastion",
+                    "en",
+                )
+                .await;
+        }
+
+        let stdout = String::from_utf8_lossy(&stdout).into_owned();
+        match exit_code {
+            Some(0) => {
+                tracing::info!(
+                    host = %host.name,
+                    stdout_len = stdout.len(),
+                    "ssh exec completed (exit 0)"
+                );
+                Ok(stdout)
+            }
+            Some(code) => {
+                tracing::warn!(
+                    host = %host.name,
+                    code,
+                    stdout_len = stdout.len(),
+                    "ssh exec failed (non-zero exit)"
+                );
+                Err(TermError::ChannelError(format!(
+                    "command exited with code {code}"
+                )))
+            }
+            None => {
+                // channel 关闭但未收到 ExitStatus（部分 server 实现不发送）
+                tracing::warn!(
+                    host = %host.name,
+                    "ssh exec: channel closed without ExitStatus, treating as success"
+                );
+                Ok(stdout)
+            }
+        }
+    }
+
+    /// 执行一条 SSH 命令，返回 (read_half, write_half) 双向字节流。
+    ///
+    /// Phase 3 用途：`ssh_proxy_connect` —— 执行
+    /// `termbridge-agentd proxy --sock <path>`，获取双向字节流透传 daemon RPC。
+    /// stdin ↔ Unix socket 双向透传。
+    ///
+    /// 行为：
+    /// - 复用 `connect_session`（不开 PTY、不发 shell）建立已认证 session
+    /// - `channel.exec(command)` 触发远端执行
+    /// - `channel.split()` 拆为读/写两半，返回给调用方
+    /// - **不等待 ExitStatus**：proxy 是长连接，channel 关闭时自然结束
+    ///
+    /// 返回：
+    /// - `read_half: ChannelReadHalf` —— 收 daemon → stdout（调用方读数据）
+    /// - `write_half: ChannelWriteHalf<client::Msg>` —— 发 stdin → daemon（调用方写数据）
+    ///
+    /// 生命周期：
+    /// - `session` Handle 与 `bastion_sessions` 在本函数返回时被 drop。
+    ///   russh 的 `Handle::drop` 不主动 disconnect，session loop 由 `write_half`
+    ///   持有的 sender 维持存活。
+    /// - 调用方 drop `write_half` 后，所有 sender 被释放，session loop 自然退出，
+    ///   SSH 连接随之关闭。
+    /// - ProxyJump 场景下，bastion session 由 direct-tcpip channel 维持存活
+    ///   （target session 通过 stream 读取），同样在 `write_half` drop 后级联退出。
+    ///
+    /// 错误映射：
+    /// - SSH 连接失败 → `TermError::ConnectFailed` / `HostKeyRejected` / `AuthFailed`
+    /// - channel / exec 操作失败 → `TermError::ChannelError`
+    pub async fn exec_stream(
+        &self,
+        host: &Host,
+        command: &str,
+    ) -> Result<(russh::ChannelReadHalf, russh::ChannelWriteHalf<client::Msg>), TermError> {
+        tracing::info!(
+            host = %host.name,
+            hostname = %host.hostname,
+            command,
+            "ssh exec_stream (proxy)"
+        );
+
+        // 连接 + 认证（复用 connect_session，支持直连与 ProxyJump）
+        let connected = connect_session(host, 0).await?;
+        let session = connected.handle;
+        // bastions 在函数返回时 drop；SSH 连接不会断（见 docstring 生命周期说明）
+        let _bastions = connected.bastions;
+
+        // 开 session channel + exec（不开 PTY）
+        // want_reply=true：要求 server 回 success/failure，便于及早发现 exec 被拒
+        let channel = session
+            .channel_open_session()
+            .await
+            .map_err(|e| TermError::ChannelError(format!("channel_open_session: {e}")))?;
+        channel
+            .exec(true, command)
+            .await
+            .map_err(|e| TermError::ChannelError(format!("channel.exec: {e}")))?;
+
+        // 拆分 channel 为读/写两半，返回给调用方。
+        // session 与 bastions 在此函数返回时 drop，但 SSH 连接不会断：
+        // - write_half 持有 session loop 的 sender，维持 loop 存活
+        // - 调用方 drop write_half 后，loop 退出，连接关闭
+        let (read_half, write_half) = channel.split();
+        Ok((read_half, write_half))
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // connect_session —— connect + auth（直连 / ProxyJump，§7.4 Phase 2）
 // ───────────────────────────────────────────────────────────────────────────
 

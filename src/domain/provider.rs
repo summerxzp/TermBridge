@@ -126,13 +126,21 @@ impl ControlKey {
 // OpenTerminalRequest
 // ───────────────────────────────────────────────────────────────────────────
 
-/// 创建 Terminal Backend 的请求（§4.4）。
+/// 创建 Terminal Backend 的请求（§4.4 / ADR-0004 §8）。
 ///
 /// `host` 已由 `ssh -G` 解析完成；Provider 不感知 ssh config。
+///
+/// - `persistent = false`：Interactive Session（Phase 1/2 路径，SSH 直连 PTY）
+/// - `persistent = true`：Persistent Session（Phase 3 路径，远端 daemon 托管 PTY）
+///   `name` 仅 persistent 模式有效，作为远端 session 的可读标签（list_remote_sessions 返回）
 #[derive(Debug, Clone)]
 pub struct OpenTerminalRequest {
     pub host: Host,
     pub pty_size: PtySize,
+    /// 是否走远端 daemon persistent 路径（ADR-0004 §8）
+    pub persistent: bool,
+    /// 远端 session 可读标签（仅 persistent=true 时使用）
+    pub name: Option<String>,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -264,6 +272,28 @@ pub enum TermError {
     #[error("policy needs confirm: {0}")]
     PolicyNeedsConfirm(String),
 
+    // —— Phase 3：远端 daemon persistent session 错误（ADR-0004）——
+
+    /// Session 处于 Detached 状态，读写被拒绝（ADR-0004 §8）。
+    /// client 必须先 attach 才能继续操作。retriable=false。
+    #[error("session detached: {0}")]
+    SessionDetached(String),
+
+    /// daemon 协议版本不匹配（ADR-0004 §4 handshake）。
+    /// client 需 upgrade_runtime。retriable=false。
+    #[error("daemon protocol mismatch: client={client}, daemon={daemon}")]
+    DaemonProtocolMismatch { client: u32, daemon: u32 },
+
+    /// 远端 daemon runtime 缺失（二进制未部署，ADR-0004 §6/§7）。
+    /// deploy 后可重试。retriable=true。
+    #[error("remote runtime missing: {0}")]
+    RuntimeMissing(String),
+
+    /// 远端 daemon 部署失败（SFTP 上传 / chmod / version 写入失败，ADR-0004 §6）。
+    /// retriable=false（需人工排查原因）。
+    #[error("remote runtime deploy failed: {0}")]
+    RuntimeDeployFailed(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -287,6 +317,10 @@ impl TermError {
             Self::RemotePathNotAllowed(_) => "REMOTE_PATH_NOT_ALLOWED",
             Self::PolicyDenied(_) => "POLICY_DENIED",
             Self::PolicyNeedsConfirm(_) => "POLICY_NEEDS_CONFIRM",
+            Self::SessionDetached(_) => "SESSION_DETACHED",
+            Self::DaemonProtocolMismatch { .. } => "PROTOCOL_MISMATCH",
+            Self::RuntimeMissing(_) => "RUNTIME_MISSING",
+            Self::RuntimeDeployFailed(_) => "RUNTIME_DEPLOY_FAILED",
             Self::Io(_) => "CONNECT_FAILED",
         }
     }
@@ -304,11 +338,15 @@ impl TermError {
             | Self::PolicyDenied(_)
             | Self::PolicyNeedsConfirm(_)
             | Self::SftpNoSuchFile(_)
-            | Self::SftpPermissionDenied(_) => false,
+            | Self::SftpPermissionDenied(_)
+            | Self::SessionDetached(_)
+            | Self::DaemonProtocolMismatch { .. }
+            | Self::RuntimeDeployFailed(_) => false,
             Self::ConnectFailed(_)
             | Self::OperationTimeout
             | Self::ChannelError(_)
             | Self::SftpError(_)
+            | Self::RuntimeMissing(_)
             | Self::Io(_) => true,
         }
     }

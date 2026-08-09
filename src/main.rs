@@ -12,7 +12,7 @@ use std::sync::Arc;
 use termbridge::application::hosts::HostManager;
 use termbridge::application::sessions::SessionManager;
 use termbridge::infrastructure::redact::RedactingMakeWriter;
-use termbridge::infrastructure::ssh::SshProvider;
+use termbridge::infrastructure::persistent::PersistentProvider;
 use termbridge::transport::mcp::server::TermBridgeServer;
 
 #[tokio::main]
@@ -23,10 +23,12 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(RedactingMakeWriter::new())
         .init();
 
-    tracing::info!("termbridge: Phase 0-C vertical slice starting");
+    tracing::info!("termbridge: Phase 3-A starting (persistent provider enabled)");
 
-    // 组装依赖链：SshProvider → SessionManager, HostManager → Server
-    let provider = Arc::new(SshProvider::new()) as Arc<dyn termbridge::domain::provider::TerminalProvider>;
+    // 组装依赖链：PersistentProvider（内化 SshProvider，persistent=false 委托 SSH 直连，
+    // persistent=true 走远端 daemon 路径 ADR-0004）→ SessionManager, HostManager → Server
+    let provider = Arc::new(PersistentProvider::default())
+        as Arc<dyn termbridge::domain::provider::TerminalProvider>;
     let session_manager = Arc::new(SessionManager::new(provider));
     let host_manager = Arc::new(HostManager::new());
 

@@ -1,3 +1,7 @@
+# Phase 3-A W2：agentd + cli 作为 workspace 成员（远端 daemon + 测试 client，仅 Linux 编译）
+[workspace]
+members = ["agentd", "cli"]
+
 [package]
 name = "termbridge"
 version = "0.0.1"
@@ -55,6 +59,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 工具
 bytes = "1"
 async-trait = "0.1"
+# Phase 3-A W3：daemon protocol 的 data 字段是 base64 编码（send_input 编码 / pty_data 解码）
+base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
 regex = "1"
 parking_lot = "0.12"

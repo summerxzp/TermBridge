@@ -1,0 +1,31 @@
+[package]
+name = "termbridge-cli"
+version = "0.0.1"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "termbridge-cli"
+path = "src/main.rs"
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 错误处理
+anyhow = "1"
+thiserror = "2"
+
+# 日志（输出到 stderr，不污染 stdout 的 PTY 输出）
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 工具
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+base64 = "0.23"
+chrono = "0.4"
