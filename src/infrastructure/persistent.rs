@@ -287,6 +287,25 @@ impl DaemonClient {
         Ok(session_id)
     }
 
+    /// session.attach → 启动 daemon 侧 event_pump + 返回 since_cursor 后的 buffer 快照。
+    ///
+    /// attach 成功后 daemon 开始向此连接推送 pty_data 事件（增量，自 cursor_end 起）。
+    /// 返回的 `ReadResult.data` 为 attach 时刻 buffer 中 `[since_cursor, cursor_end]` 的
+    /// base64 快照，调用方应优先消费此数据再读 pty_data 事件流，避免与 event_pump 推送竞态。
+    pub async fn session_attach(
+        &self,
+        session_id: &str,
+        since_cursor: u64,
+    ) -> Result<ReadResult, TermError> {
+        let params = serde_json::json!({
+            "session_id": session_id,
+            "since_cursor": since_cursor,
+        });
+        let result = self.call(methods::SESSION_ATTACH, params).await?;
+        from_value(&result)
+            .map_err(|e| TermError::ChannelError(format!("session.attach parse: {e}")))
+    }
+
     /// session.send_input：base64 编码 data 后发送
     pub async fn session_send_input(
         &self,
@@ -568,6 +587,11 @@ pub struct PersistentTerminalHandle {
     pty_data_rx: TokioMutex<mpsc::Receiver<Bytes>>,
     event_rx: TokioMutex<broadcast::Receiver<Event>>,
     closed: AtomicBool,
+    /// attach 时 buffer 的初始快照（`[0, cursor_end]`），`read()` 优先返回。
+    ///
+    /// 避免 attach 响应内联数据与 event_pump 推送的 pty_data 事件之间的竞态：
+    /// 初始快照在 handle 内同步消费，event_pump 增量（`[cursor_end, ...]`）随后入队。
+    initial_data: TokioMutex<Option<Bytes>>,
 }
 
 impl PersistentTerminalHandle {
@@ -575,6 +599,7 @@ impl PersistentTerminalHandle {
         daemon: Arc<DaemonClient>,
         remote_session_id: String,
         pty_data_rx: mpsc::Receiver<Bytes>,
+        initial_data: Option<Bytes>,
     ) -> Self {
         let event_rx = daemon.subscribe_events();
         Self {
@@ -583,6 +608,7 @@ impl PersistentTerminalHandle {
             pty_data_rx: TokioMutex::new(pty_data_rx),
             event_rx: TokioMutex::new(event_rx),
             closed: AtomicBool::new(false),
+            initial_data: TokioMutex::new(initial_data),
         }
     }
 }
@@ -591,6 +617,16 @@ impl PersistentTerminalHandle {
 impl TerminalHandle for PersistentTerminalHandle {
     /// 读 PTY output。None = PTY EOF（pty_exit / session_lost / daemon 断开）。
     async fn read(&self) -> Result<Option<Bytes>, TermError> {
+        // 优先返回 attach 时的初始 buffer 快照（[0, cursor_end]）。
+        // 先消费完 initial_data 再读 pty_data_rx，保证顺序：初始快照 → event_pump 增量。
+        {
+            let mut init = self.initial_data.lock().await;
+            if let Some(data) = init.take() {
+                if !data.is_empty() {
+                    return Ok(Some(data));
+                }
+            }
+        }
         let mut pty_rx = self.pty_data_rx.lock().await;
         let mut ev_rx = self.event_rx.lock().await;
         loop {
@@ -727,14 +763,29 @@ impl TerminalProvider for PersistentProvider {
             )
             .await?;
 
-        // 5. 订阅 pty_data
+        // 5. 订阅 pty_data（attach 前订阅，确保 event_pump 启动后不漏增量推送）
         let pty_data_rx = daemon.subscribe_pty_data();
 
-        // 6. 返回 handle
+        // 6. attach：启动 daemon 侧 event_pump + 取初始 buffer 快照 [0, cursor_end]。
+        //    未 attach 时 daemon 不会推送 pty_data 事件，read_output 会永久阻塞。
+        let initial = daemon.session_attach(&remote_session_id, 0).await?;
+        let initial_data = match BASE64_STANDARD.decode(&initial.data) {
+            Ok(bytes) if !bytes.is_empty() => Some(Bytes::from(bytes)),
+            _ => None,
+        };
+        tracing::info!(
+            session_id = %remote_session_id,
+            cursor_end = initial.cursor_end,
+            initial_bytes = initial_data.as_ref().map(|b| b.len()).unwrap_or(0),
+            "daemon session attached"
+        );
+
+        // 7. 返回 handle（initial_data 优先于 pty_data_rx 被消费）
         let handle = Arc::new(PersistentTerminalHandle::new(
             daemon,
             remote_session_id,
             pty_data_rx,
+            initial_data,
         )) as Arc<dyn TerminalHandle>;
         Ok(handle)
     }
