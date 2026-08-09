@@ -34,7 +34,6 @@ chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.23"
 
 # Linux-only 依赖：nix（PTY / fork / setsid / signal）
-# nix 0.29 的 pty 模块归在 process feature 下（无独立 pty feature）
 # 非 Linux 平台 agentd 编译会失败，这是预期行为（agentd 仅跑 Linux，见 ADR-0004 §10 W2）
 [target.'cfg(target_os="linux")'.dependencies]
-nix = { version = "0.29", features = ["fs", "process", "signal", "user"] }
+nix = { version = "0.29", features = ["fs", "process", "signal", "user", "term"] }

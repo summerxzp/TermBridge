@@ -168,7 +168,12 @@ impl DaemonClient {
     /// 列出 daemon 上所有 session
     pub async fn list_sessions(&mut self) -> Result<Vec<SessionInfo>> {
         let result = self.call(methods::SESSION_LIST, serde_json::json!({})).await?;
-        Ok(serde_json::from_value(result)?)
+        // daemon 返回 { sessions: [SessionInfo] }
+        let sessions = result
+            .get("sessions")
+            .cloned()
+            .unwrap_or(serde_json::json!([]));
+        Ok(serde_json::from_value(sessions)?)
     }
 
     /// 发送输入字节到 session 的 PTY

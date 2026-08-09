@@ -217,10 +217,10 @@ mod tests {
         let buf = RingBuffer::new(0);
         buf.write(b"abc");
         let r = buf.read_since(3);
-        assert_eq!(r.data, Vec::new());
+        assert_eq!(r.data, Vec::<u8>::new());
         assert_eq!(r.cursor_end, 3);
         let r = buf.read_since(100);
-        assert_eq!(r.data, Vec::new());
+        assert_eq!(r.data, Vec::<u8>::new());
         assert_eq!(r.cursor_end, 3);
     }
 
@@ -241,14 +241,18 @@ mod tests {
         assert_eq!(buf.written(), (size + size / 2) as u64);
         // 最旧游标推进到 size/2
         assert_eq!(buf.cursor_start(), (size / 2) as u64);
-        // 读全部当前内容，应是 [0xBB; size/2] + [0xAA; size/2]
+        // 读全部当前内容
+        // 物理状态: buf[0..size/2]=0xBB(新), buf[size/2..size]=0xAA(旧)
+        // read_since(cursor_start=size/2) 从游标 size/2 开始读 size 字节
+        // 游标 size/2 对应物理位置 (head=size/2 + (size/2 - earliest=size/2)) % size = size/2
+        // 所以从 buf[size/2] 开始读: [0xAA; size/2] + [0xBB; size/2]
         let r = buf.read_since(buf.cursor_start());
         assert!(!r.is_truncated);
         assert_eq!(r.data.len(), size);
-        // 后半是 0xAA（旧的剩余）
-        assert!(r.data[size / 2..].iter().all(|&b| b == 0xAA));
-        // 前半是 0xBB（新写入）
-        assert!(r.data[..size / 2].iter().all(|&b| b == 0xBB));
+        // 前半是 0xAA（旧的剩余，从 buf[size/2..] 开始读）
+        assert!(r.data[..size / 2].iter().all(|&b| b == 0xAA));
+        // 后半是 0xBB（新写入，回绕到 buf[0..size/2]）
+        assert!(r.data[size / 2..].iter().all(|&b| b == 0xBB));
     }
 
     /// truncation 检测：since 早于已被覆盖的数据
@@ -314,6 +318,6 @@ mod tests {
         assert_eq!(buf.written(), 400);
         let r = buf.read_since(0);
         assert_eq!(r.data.len(), 400);
-        assert!(r.data.windows(4).all(|w| w == b"abcd"));
+        assert!(r.data.chunks(4).all(|w| w == b"abcd"));
     }
 }

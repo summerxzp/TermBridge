@@ -133,6 +133,7 @@ async fn bootstrap(sock: Option<PathBuf>) -> Result<()> {
 async fn proxy(sock: Option<PathBuf>) -> Result<()> {
     let socket_path = sock.unwrap_or_else(default_socket_path);
     let mut socket = tokio::net::UnixStream::connect(&socket_path)
+        .await
         .with_context(|| format!("connect socket 失败: {:?}", socket_path))?;
 
     // split socket + stdin/stdout

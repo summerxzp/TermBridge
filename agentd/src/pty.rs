@@ -7,7 +7,7 @@
 
 use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 
 use anyhow::{Context, Result};
 use nix::pty::{openpty, Winsize};
@@ -43,58 +43,55 @@ impl Pty {
             ws_ypixel: 0,
         };
         // openpty 创建 master/slave PTY 对
-        let pty = openpty(None, Some(&winsize)).context("openpty 失败")?;
-        let master_fd = pty.master.as_raw_fd();
-        let slave_fd = pty.slave.as_raw_fd();
+        let pty = openpty(Some(&winsize), None).context("openpty 失败")?;
+
+        // fork 前消耗 OwnedFd 为 RawFd，防止 fork 后子进程触发 OwnedFd::drop
+        // （Rust Drop 不是 async-signal-safe，在多线程 fork 后可能死锁/UB）
+        let master_fd = pty.master.into_raw_fd();
+        let slave_fd = pty.slave.into_raw_fd();
 
         // fork 子进程执行 shell
-        // SAFETY: 子进程仅调 async-signal-safe 函数（setsid/dup2/close/chdir/execvp）。
-        // 父进程继续。fork 后两边都不持锁（openpty 的 OwnedFd 在 fork 点已取 raw fd）。
+        // SAFETY: 子进程仅调 async-signal-safe 的 libc 函数（close/setsid/dup2/chdir/execvp/_exit）。
+        // 不触发任何 Rust Drop 逻辑。父进程继续。
         let fork_result = unsafe { fork() }.context("fork 失败")?;
 
         match fork_result {
             ForkResult::Child => {
                 // —— 子进程 ——
-                drop(pty.master); // 子进程不需要 master，关闭
-                // setsid 脱离控制终端，使 slave 成为新会话的 controlling terminal
-                let _ = setsid();
-                // dup2 slave 到 stdin/stdout/stderr
-                // 用 libc 直接调用，避免 nix API 版本差异
+                // 仅调 async-signal-safe 函数，不用 Rust Drop
                 unsafe {
+                    libc::close(master_fd); // 子进程不需要 master
                     libc::dup2(slave_fd, 0);
                     libc::dup2(slave_fd, 1);
                     libc::dup2(slave_fd, 2);
+                    libc::close(slave_fd); // 关闭原 slave（0/1/2 是副本）
                 }
-                // slave fd 已 dup 到 0/1/2，关闭原 slave（pty.slave 在此 drop 会 close）
-                drop(pty.slave);
+                let _ = setsid();
                 // chdir 到指定工作目录
                 if let Some(dir) = cwd {
                     if let Ok(c_dir) = CString::new(dir) {
-                        let _ = nix::unistd::chdir(&c_dir);
+                        let _ = nix::unistd::chdir(c_dir.as_c_str());
                     }
                 }
                 // execvp shell（成功不返回）
                 let shell_c = match CString::new(shell) {
                     Ok(c) => c,
                     Err(_) => {
-                        eprintln!("agentd: shell 路径含 NUL: {}", shell);
-                        std::process::exit(127);
+                        // _exit 是 async-signal-safe，exit 不是
+                        unsafe { libc::_exit(127); }
                     }
                 };
                 let argv: Vec<CString> = vec![shell_c.clone()];
                 match nix::unistd::execvp(&shell_c, &argv) {
                     Ok(infallible) => match infallible {},
-                    Err(e) => {
-                        eprintln!("agentd: execvp {} 失败: {}", shell, e);
-                        std::process::exit(127);
+                    Err(_) => {
+                        unsafe { libc::_exit(127); }
                     }
                 }
             }
             ForkResult::Parent { child } => {
                 // —— 父进程 ——
-                // 关闭 slave（父进程不需要）；master 保留
-                drop(pty.slave);
-                // 注意：master OwnedFd 移入 Pty 结构，drop 时关闭
+                unsafe { libc::close(slave_fd); } // 父进程不需要 slave
                 Ok(Pty {
                     master_fd,
                     child_pid: child,
