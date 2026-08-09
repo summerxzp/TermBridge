@@ -30,38 +30,42 @@ echo "=== CREATE: session_id=$SID ==="
 # 2. 检查子进程
 sleep 0.5
 echo "=== PS (cat + agentd) ==="
-ps aux | grep -E 'cat|agentd' | grep -v grep
+ps aux | grep -E 'cat|agentd' | grep -v grep | head -5
 
-# 3. LIST
-echo "=== LIST ==="
+# 3. LIST (state=created)
+echo "=== LIST (created) ==="
 $CLI list 2>&1
 
-# 4. SEND
+# 4. SEND (无需 attach 即可写 PTY)
 echo "=== SEND ==="
 $CLI send $SID "hello-from-test" 2>&1 || echo "send failed"
 
-# 5. READ
+# 5. READ (从 buffer 读输出)
 echo "=== READ ==="
-$CLI read $SID 0 2>&1 || echo "read failed"
+$CLI read $SID --since 0 2>&1 || echo "read failed"
 
-# 6. DETACH
+# 6. ATTACH（timeout 2s 拉取增量后退出，session 转为 attached）
+echo "=== ATTACH ==="
+timeout 2 $CLI attach $SID --since 0 2>&1 || echo "attach exited (expected with timeout)"
+
+# 7. DETACH (现在 session 处于 attached，可 detach)
 echo "=== DETACH ==="
 $CLI detach $SID 2>&1 || echo "detach failed"
 
-# 7. LIST after detach
-echo "=== LIST after detach ==="
+# 8. LIST (state=detached)
+echo "=== LIST (detached) ==="
 $CLI list 2>&1
 
-# 8. ATTACH
-echo "=== ATTACH ==="
-$CLI attach $SID 0 2>&1 || echo "attach failed"
+# 9. RE-ATTACH (验证 detach 后可重新 attach + 读存量输出)
+echo "=== RE-ATTACH ==="
+timeout 2 $CLI attach $SID --since 0 2>&1 || echo "re-attach exited (expected with timeout)"
 
-# 9. CLOSE
+# 10. CLOSE
 echo "=== CLOSE ==="
 $CLI close $SID 2>&1
 
-# 10. LIST after close
-echo "=== LIST after close ==="
+# 11. LIST (应为空)
+echo "=== LIST (empty) ==="
 $CLI list 2>&1
 
 # 清理
