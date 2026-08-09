@@ -3,5 +3,6 @@
 // Phase 0-C：provider（TerminalProvider/Handle + Host + TermError）+ session。
 
 pub mod output;
+pub mod policy;
 pub mod provider;
 pub mod session;

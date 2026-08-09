@@ -8,7 +8,7 @@
 //!   → `ssh -G testhost` 子进程
 //!   → 解析 `key value` 行
 //!   → Host { name, hostname, user, port, identity_files, proxy_jump,
-//!            user_known_hosts_file, strict_host_key_checking }
+//!            user_known_hosts_files, strict_host_key_checking }
 //! ```
 
 use std::collections::HashMap;
@@ -94,15 +94,21 @@ fn parse_ssh_g(alias: &str, stdout: &str) -> Result<Host, TermError> {
         })
         .unwrap_or_default();
 
-    // userknownhostsfile：可能含多个空格分隔路径，取首个并展开 ~。
-    // 不做 is_file 过滤——known_hosts 缺失本身是有意义状态（host 未知），
-    // 应让校验层报 "host 未知" 而非这里悄悄吞掉。
-    let user_known_hosts_file = single
+    // userknownhostsfile：可能含多个空格分隔路径（OpenSSH 默认 `~/.ssh/known_hosts ~/.ssh/known_hosts2`）。
+    // Phase 2：收集全部路径并展开 ~（之前 Phase 1 仅取首个）。
+    // 不做 is_file 过滤——known_hosts 缺失本身是有意义状态（host 未知 / TOFU 首次写入），
+    // 应让校验层报 "host 未知" 而非这里悄悄吞掉。空 Vec 表示 ssh -G 未输出该字段。
+    let user_known_hosts_files: Vec<PathBuf> = single
         .get("userknownhostsfile")
-        .and_then(|v| v.split_whitespace().next())
-        .map(|s| expand_tilde(s));
+        .map(|v| {
+            v.split_whitespace()
+                .map(|s| expand_tilde(s))
+                .collect()
+        })
+        .unwrap_or_default();
 
-    // stricthostkeychecking：ask / yes / no（OpenSSH 默认 ask）。统一小写便于后续匹配。
+    // stricthostkeychecking：ask / yes / no / accept-new（OpenSSH 默认 ask）。统一小写便于后续匹配。
+    // accept-new：TOFU——首次连接（host 不在 known_hosts）自动添加 key（Phase 2）。
     let strict_host_key_checking = single
         .get("stricthostkeychecking")
         .map(|v| v.to_ascii_lowercase())
@@ -115,7 +121,7 @@ fn parse_ssh_g(alias: &str, stdout: &str) -> Result<Host, TermError> {
         port,
         identity_files,
         proxy_jump,
-        user_known_hosts_file,
+        user_known_hosts_files,
         strict_host_key_checking,
     })
 }
@@ -140,6 +146,87 @@ fn dirs_or_home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// ProxyJumpTarget —— ProxyJump 跳板机解析（§7.4 Phase 2）
+// ───────────────────────────────────────────────────────────────────────────
+
+/// ProxyJump 解析结果（§7.4 Phase 2）。
+///
+/// 解析 `ssh -G` 输出的 `proxyjump` 字段值，格式 `[user@]host[:port]`。
+/// 缺省 user/port 时为 None —— 由调用方按 ssh config 默认值填充
+/// （通过 `ssh -G <bastion>` 解析跳板机完整配置）。
+///
+/// **限制**（Phase 2 MVP）：
+/// - 仅单跳：不支持逗号分隔的多跳链（`bastion1,bastion2`）。
+/// - 不支持 IPv6 字面量（`[::1]:22`）—— 企业跳板机通常为域名/IPv4。
+/// - 链式跳板由 `SshProvider::connect_session` 的递归 + MAX_PROXY_DEPTH 兜底。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyJumpTarget {
+    /// 跳板机用户名（None 表示用 ssh config 默认值）。
+    pub user: Option<String>,
+    /// 跳板机主机名/IP。
+    pub host: String,
+    /// 跳板机端口（None 表示 22）。
+    pub port: Option<u16>,
+}
+
+/// 解析 ProxyJump 字符串 `[user@]host[:port]` 为 [`ProxyJumpTarget`]。
+///
+/// 支持格式：
+/// - `bastion` → host="bastion", user=None, port=None
+/// - `user@bastion` → user=Some("user"), host="bastion", port=None
+/// - `bastion:2222` → host="bastion", port=Some(2222), user=None
+/// - `user@bastion:2222` → user=Some("user"), host="bastion", port=Some(2222)
+///
+/// 空字符串 / 多跳链 / host 为空 → `Err(InvalidArgument)`。
+pub fn parse_proxy_jump(s: &str) -> Result<ProxyJumpTarget, TermError> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(TermError::InvalidArgument(
+            "proxyjump 为空字符串".into(),
+        ));
+    }
+
+    // Phase 2 MVP：不支持逗号分隔的多跳链
+    if s.contains(',') {
+        return Err(TermError::InvalidArgument(format!(
+            "proxyjump 多跳链不支持（Phase 2 仅单跳，深度上限见 MAX_PROXY_DEPTH）: {s}"
+        )));
+    }
+
+    // 拆分 user@...（取首个 '@'；空用户名视为 None）
+    let (user, rest) = match s.find('@') {
+        Some(pos) => {
+            let u = s[..pos].to_string();
+            let r = &s[pos + 1..];
+            (if u.is_empty() { None } else { Some(u) }, r)
+        }
+        None => (None, s),
+    };
+
+    // 拆分 host:port（找最后一个 ':'，且其后为有效 u16 才算 port）
+    // 不支持 IPv6 字面量（含多个 ':' 或 '[...]'）—— MVP 限制
+    let (host, port) = match rest.rfind(':') {
+        Some(pos) => {
+            let maybe_port = &rest[pos + 1..];
+            match maybe_port.parse::<u16>() {
+                Ok(port) => (rest[..pos].to_string(), Some(port)),
+                // ':' 后非数字 → 视为 host 的一部分（如 IPv6 无括号）
+                Err(_) => (rest.to_string(), None),
+            }
+        }
+        None => (rest.to_string(), None),
+    };
+
+    if host.is_empty() {
+        return Err(TermError::InvalidArgument(format!(
+            "proxyjump host 为空: {s}"
+        )));
+    }
+
+    Ok(ProxyJumpTarget { user, host, port })
 }
 
 #[cfg(test)]
@@ -226,6 +313,117 @@ proxyjump bastion
         assert_eq!(host.proxy_jump.as_deref(), Some("bastion"));
     }
 
+    // ── Phase 2：ProxyJumpTarget 解析单元测试 ────────────────────────────
+
+    #[test]
+    fn parse_proxy_jump_bare_host() {
+        // 纯主机名：user=None, port=None
+        let t = parse_proxy_jump("bastion").unwrap();
+        assert_eq!(t.user, None);
+        assert_eq!(t.host, "bastion");
+        assert_eq!(t.port, None);
+    }
+
+    #[test]
+    fn parse_proxy_jump_user_at_host() {
+        // user@bastion：user=Some, port=None
+        let t = parse_proxy_jump("ops@bastion").unwrap();
+        assert_eq!(t.user.as_deref(), Some("ops"));
+        assert_eq!(t.host, "bastion");
+        assert_eq!(t.port, None);
+    }
+
+    #[test]
+    fn parse_proxy_jump_host_port() {
+        // bastion:2222：user=None, port=Some(2222)
+        let t = parse_proxy_jump("bastion:2222").unwrap();
+        assert_eq!(t.user, None);
+        assert_eq!(t.host, "bastion");
+        assert_eq!(t.port, Some(2222));
+    }
+
+    #[test]
+    fn parse_proxy_jump_user_host_port() {
+        // user@bastion:2222：完整格式
+        let t = parse_proxy_jump("ops@bastion:2222").unwrap();
+        assert_eq!(t.user.as_deref(), Some("ops"));
+        assert_eq!(t.host, "bastion");
+        assert_eq!(t.port, Some(2222));
+    }
+
+    #[test]
+    fn parse_proxy_jump_empty_user() {
+        // @bastion：空用户名视为 None（不报错）
+        let t = parse_proxy_jump("@bastion").unwrap();
+        assert_eq!(t.user, None);
+        assert_eq!(t.host, "bastion");
+    }
+
+    #[test]
+    fn parse_proxy_jump_trims_whitespace() {
+        // 前后空格应被 trim
+        let t = parse_proxy_jump("  bastion  ").unwrap();
+        assert_eq!(t.host, "bastion");
+    }
+
+    #[test]
+    fn parse_proxy_jump_ipv4_address() {
+        // IPv4 地址作为 host
+        let t = parse_proxy_jump("10.0.0.1:2222").unwrap();
+        assert_eq!(t.host, "10.0.0.1");
+        assert_eq!(t.port, Some(2222));
+    }
+
+    #[test]
+    fn parse_proxy_jump_rejects_empty_string() {
+        let err = parse_proxy_jump("").unwrap_err();
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn parse_proxy_jump_rejects_whitespace_only() {
+        let err = parse_proxy_jump("   ").unwrap_err();
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn parse_proxy_jump_rejects_multi_hop() {
+        // Phase 2 MVP 不支持多跳链
+        let err = parse_proxy_jump("bastion1,bastion2").unwrap_err();
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+        assert!(format!("{err}").contains("多跳链"));
+    }
+
+    #[test]
+    fn parse_proxy_jump_rejects_empty_host_after_at() {
+        // user@ → host 为空
+        let err = parse_proxy_jump("ops@").unwrap_err();
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn parse_proxy_jump_rejects_empty_host_before_port() {
+        // :2222 → host 为空
+        let err = parse_proxy_jump(":2222").unwrap_err();
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn parse_proxy_jump_non_numeric_port_treated_as_host() {
+        // ':' 后非数字 → 整个当作 host（不报错，兼容 IPv6 无括号）
+        let t = parse_proxy_jump("bastion:notaport").unwrap();
+        assert_eq!(t.host, "bastion:notaport");
+        assert_eq!(t.port, None);
+    }
+
+    #[test]
+    fn parse_proxy_jump_port_overflow_treated_as_host() {
+        // 端口超出 u16 范围 → parse 失败 → 当作 host
+        let t = parse_proxy_jump("bastion:99999").unwrap();
+        assert_eq!(t.host, "bastion:99999");
+        assert_eq!(t.port, None);
+    }
+
     #[test]
     fn parse_missing_hostname_errors() {
         let g = r#"user u
@@ -269,16 +467,18 @@ port 2222
     }
 
     #[test]
-    fn parse_user_known_hosts_file_expands_tilde() {
+    fn parse_user_known_hosts_files_expands_tilde() {
         let _guard = HOME_ENV_LOCK.lock();
         // 保存并恢复 HOME，避免影响并行测试
         let saved_home = std::env::var_os("HOME");
         std::env::set_var("HOME", "/tmp/fakehome");
 
         let host = parse_ssh_g("testhost", SAMPLE_G).unwrap();
-        let p = host.user_known_hosts_file.expect("应解析出 known_hosts 路径");
+        // SAMPLE_G 只有一个 userknownhostsfile 路径
+        assert_eq!(host.user_known_hosts_files.len(), 1, "单路径应收集为 1 元素 Vec");
+        let p = &host.user_known_hosts_files[0];
         let expected = PathBuf::from("/tmp/fakehome").join(".ssh").join("known_hosts");
-        assert_eq!(p, expected);
+        assert_eq!(p, &expected);
         assert!(!p.to_string_lossy().contains('~'));
 
         match saved_home {
@@ -288,9 +488,10 @@ port 2222
     }
 
     #[test]
-    fn parse_user_known_hosts_file_takes_first_when_multiple() {
+    fn parse_user_known_hosts_files_collects_all_when_multiple() {
         let _guard = HOME_ENV_LOCK.lock();
-        // OpenSSH 默认 `~/.ssh/known_hosts ~/.ssh/known_hosts2`，应取首个
+        // OpenSSH 默认 `~/.ssh/known_hosts ~/.ssh/known_hosts2`，
+        // Phase 2 应收集全部（Phase 1 仅取首个）。
         let saved_home = std::env::var_os("HOME");
         std::env::set_var("HOME", "/tmp/fakehome");
 
@@ -300,9 +501,15 @@ port 22
 userknownhostsfile ~/.ssh/known_hosts ~/.ssh/known_hosts2
 "#;
         let host = parse_ssh_g("multi", g).unwrap();
-        let p = host.user_known_hosts_file.unwrap();
-        let expected = PathBuf::from("/tmp/fakehome").join(".ssh").join("known_hosts");
-        assert_eq!(p, expected);
+        assert_eq!(
+            host.user_known_hosts_files.len(),
+            2,
+            "应收集全部 2 个路径（Phase 2 多文件支持）"
+        );
+        let expected1 = PathBuf::from("/tmp/fakehome").join(".ssh").join("known_hosts");
+        let expected2 = PathBuf::from("/tmp/fakehome").join(".ssh").join("known_hosts2");
+        assert_eq!(host.user_known_hosts_files[0], expected1);
+        assert_eq!(host.user_known_hosts_files[1], expected2);
 
         match saved_home {
             Some(h) => std::env::set_var("HOME", h),
@@ -334,6 +541,15 @@ stricthostkeychecking no
         let host = parse_ssh_g("strict_no", g).unwrap();
         assert_eq!(host.strict_host_key_checking, "no");
 
+        // accept-new（Phase 2 TOFU）
+        let g = r#"user u
+hostname h
+port 22
+stricthostkeychecking accept-new
+"#;
+        let host = parse_ssh_g("strict_accept_new", g).unwrap();
+        assert_eq!(host.strict_host_key_checking, "accept-new");
+
         // 大写应归一化为小写
         let g = r#"user u
 hostname h
@@ -356,13 +572,16 @@ port 22
     }
 
     #[test]
-    fn parse_user_known_hosts_file_none_when_absent() {
-        // 缺省 userknownhostsfile → None
+    fn parse_user_known_hosts_files_empty_when_absent() {
+        // 缺省 userknownhostsfile → 空 Vec
         let g = r#"user u
 hostname h
 port 22
 "#;
         let host = parse_ssh_g("default", g).unwrap();
-        assert!(host.user_known_hosts_file.is_none());
+        assert!(
+            host.user_known_hosts_files.is_empty(),
+            "缺省 userknownhostsfile 应为空 Vec"
+        );
     }
 }

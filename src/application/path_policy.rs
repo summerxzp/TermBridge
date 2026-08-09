@@ -160,6 +160,48 @@ impl PathPolicy {
         )))
     }
 
+    /// 检查远端路径是否允许创建新目录/文件（Phase 2，mkdir 等用）。
+    ///
+    /// 与 `check_remote` 的区别：目标路径可能尚不存在（mkdir 的目标），
+    /// 因此先尝试 realpath；若返回 `SftpNoSuchFile`（路径不存在），则校验其
+    /// **父目录**是否在允许的根下（父目录必须存在且被允许）。
+    ///
+    /// - realpath 成功 → 目标已存在，用 check_remote_canonical 检查
+    /// - realpath 返回 SftpNoSuchFile → 目标不存在（预期），校验父目录
+    /// - realpath 返回其他错误 → 传播（权限不足 / 连接问题等）
+    /// - 父目录为 None（目标是根）→ 拒绝（不允许在根下直接创建）
+    pub async fn check_remote_allow_new(
+        &self,
+        path: &str,
+        sftp: &dyn SftpCanonicalize,
+    ) -> Result<(), TermError> {
+        // 1. 拒绝 null 字节
+        if path.as_bytes().contains(&0u8) {
+            return Err(TermError::RemotePathNotAllowed(format!(
+                "path contains null byte: {path}"
+            )));
+        }
+
+        // 2. 尝试 realpath
+        match sftp.canonicalize(path).await {
+            Ok(canonical) => {
+                // 目标已存在 → 检查是否在允许根下
+                self.check_remote_canonical(&canonical, path)
+            }
+            Err(TermError::SftpNoSuchFile(_)) => {
+                // 目标不存在（预期 for mkdir）→ 校验父目录
+                let parent = parent_remote_path(path).ok_or_else(|| {
+                    TermError::RemotePathNotAllowed(format!(
+                        "cannot create: '{path}' has no parent directory"
+                    ))
+                })?;
+                let parent_canonical = sftp.canonicalize(&parent).await?;
+                self.check_remote_canonical(&parent_canonical, path)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// 已规范化本地路径的前缀检查（提取为独立方法便于测试）。
     fn check_canonical_under_any(
         &self,
@@ -223,6 +265,29 @@ fn is_under_remote(canonical: &str, root: &str) -> bool {
     canonical.starts_with(&prefix)
 }
 
+/// 取远端 POSIX 路径的父目录（Phase 2，check_remote_allow_new 用）。
+///
+/// 远端路径是 POSIX 风格（正斜杠），不能用 `Path::parent`（Windows 上会按反斜杠解析）。
+///
+/// 返回值：
+/// - `/home/user/newdir` → `Some("/home/user")`
+/// - `/newdir` → `Some("/")`（父目录是根）
+/// - `/` → `None`（根无父目录）
+/// - `relative` → `None`（无斜杠，无父目录）
+/// - `/home/user/` → `Some("/home/user")`（先去尾斜杠再取父）
+fn parent_remote_path(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        // 原路径是 "/" 或全斜杠 → 根，无父目录
+        return None;
+    }
+    match trimmed.rfind('/') {
+        Some(0) => Some("/".to_string()), // 父目录是根
+        Some(idx) => Some(trimmed[..idx].to_string()),
+        None => None, // 无斜杠（相对路径），无父目录
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,7 +307,7 @@ mod tests {
                 .unwrap()
                 .get(path)
                 .cloned()
-                .ok_or_else(|| TermError::SftpError(format!("not found: {path}")))
+                .ok_or_else(|| TermError::SftpNoSuchFile(format!("not found: {path}")))
         }
     }
 
@@ -538,5 +603,88 @@ mod tests {
 
         let _ = std::fs::remove_dir(&outside_dir);
         let _ = std::fs::remove_dir(&allowed_root);
+    }
+
+    // ── Phase 2：parent_remote_path 单元测试 ─────────────────────
+
+    #[test]
+    fn parent_remote_path_normal() {
+        assert_eq!(parent_remote_path("/home/user/newdir"), Some("/home/user".into()));
+    }
+
+    #[test]
+    fn parent_remote_path_one_level_deep() {
+        assert_eq!(parent_remote_path("/newdir"), Some("/".into()));
+    }
+
+    #[test]
+    fn parent_remote_path_root_returns_none() {
+        assert_eq!(parent_remote_path("/"), None);
+        assert_eq!(parent_remote_path("///"), None);
+    }
+
+    #[test]
+    fn parent_remote_path_trailing_slash() {
+        assert_eq!(parent_remote_path("/home/user/"), Some("/home".into()));
+    }
+
+    #[test]
+    fn parent_remote_path_relative_no_slash() {
+        assert_eq!(parent_remote_path("relative"), None);
+    }
+
+    // ── Phase 2：check_remote_allow_new 测试 ─────────────────────
+
+    #[tokio::test]
+    async fn check_remote_allow_new_existing_path_ok() {
+        // 目标已存在 → realpath 成功 → 检查在允许根下
+        let sftp = FakeCanonicalize {
+            mapping: Mutex::new([("/home/user/newdir".into(), "/home/user/newdir".into())].into()),
+        };
+        let p = policy(vec![], vec!["/home/user".into()]);
+        assert!(p.check_remote_allow_new("/home/user/newdir", &sftp).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_remote_allow_new_nonexistent_falls_back_to_parent() {
+        // 目标不存在 → SftpNoSuchFile → 校验父目录
+        // 父目录 /home/user 存在且在允许根下 → Ok
+        let sftp = FakeCanonicalize {
+            mapping: Mutex::new([("/home/user".into(), "/home/user".into())].into()),
+        };
+        let p = policy(vec![], vec!["/home/user".into()]);
+        assert!(p.check_remote_allow_new("/home/user/newdir", &sftp).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_remote_allow_new_nonexistent_parent_outside_rejected() {
+        // 目标不存在 → 校验父目录 → 父目录不在允许根下 → REMOTE_PATH_NOT_ALLOWED
+        let sftp = FakeCanonicalize {
+            mapping: Mutex::new([("/etc".into(), "/etc".into())].into()),
+        };
+        let p = policy(vec![], vec!["/home/user".into()]);
+        let err = p.check_remote_allow_new("/etc/newdir", &sftp).await.unwrap_err();
+        assert_eq!(err.code(), "REMOTE_PATH_NOT_ALLOWED");
+    }
+
+    #[tokio::test]
+    async fn check_remote_allow_new_root_rejected() {
+        // 目标是根 → 无父目录 → 拒绝
+        let sftp = FakeCanonicalize {
+            mapping: Mutex::new(std::collections::HashMap::new()),
+        };
+        let p = policy(vec![], vec!["/".into()]);
+        let err = p.check_remote_allow_new("/", &sftp).await.unwrap_err();
+        assert_eq!(err.code(), "REMOTE_PATH_NOT_ALLOWED");
+    }
+
+    #[tokio::test]
+    async fn check_remote_allow_new_rejects_null_byte() {
+        let sftp = FakeCanonicalize {
+            mapping: Mutex::new(std::collections::HashMap::new()),
+        };
+        let p = policy(vec![], vec!["/".into()]);
+        let err = p.check_remote_allow_new("/home/user\0/etc", &sftp).await.unwrap_err();
+        assert_eq!(err.code(), "REMOTE_PATH_NOT_ALLOWED");
     }
 }

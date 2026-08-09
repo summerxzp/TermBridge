@@ -40,6 +40,8 @@ pub type HostName = String;
 /// 由 `ssh -G <alias>` 解析得到（ADR-0006），已展开 Include/Match/ProxyJump。
 /// Phase 0-C：proxy_jump 只解析不连接（MVP 不涉及跳板）。
 /// Phase 1：新增 user_known_hosts_file / strict_host_key_checking（§5.5 host key 校验）。
+/// Phase 2：user_known_hosts_file 改为 Vec（支持 known_hosts2 多文件），
+/// strict_host_key_checking 新增 "accept-new"（TOFU 自动添加）。
 #[derive(Debug, Clone)]
 pub struct Host {
     pub name: HostName,
@@ -50,10 +52,17 @@ pub struct Host {
     /// Phase 1：支持多 IdentityFile 遍历（凭据优先级 SSH Agent > IdentityFile > HITL）。
     pub identity_files: Vec<PathBuf>,
     pub proxy_jump: Option<HostName>,
-    /// `UserKnownHostsFile`（已展开 ~）。取首个路径（OpenSSH 默认 `~/.ssh/known_hosts ~/.ssh/known_hosts2`）。
-    /// None 表示 ssh -G 未输出该字段（极少见，按默认路径处理）。
-    pub user_known_hosts_file: Option<PathBuf>,
-    /// `StrictHostKeyChecking`：ask / yes / no（小写）。缺省 ask（OpenSSH 默认）。
+    /// `UserKnownHostsFile` 路径列表（已展开 ~，保留全部空格分隔路径）。
+    /// OpenSSH 默认 `~/.ssh/known_hosts ~/.ssh/known_hosts2`，Phase 2 改为收集全部路径：
+    /// 校验时遍历所有文件查找 host key；TOFU 添加时写入首个路径。
+    /// 不做 is_file 过滤——known_hosts 缺失本身是有意义状态（host 未知 / TOFU 首次写入）。
+    /// 空 Vec 表示 ssh -G 未输出该字段（极少见，strict 模式下拒绝）。
+    pub user_known_hosts_files: Vec<PathBuf>,
+    /// `StrictHostKeyChecking`（小写）。缺省 ask（OpenSSH 默认）。
+    /// - `yes`：严格校验，未知主机拒绝（Phase 1）
+    /// - `ask`：MVP 无 HITL，等同 yes（Phase 1）
+    /// - `accept-new`：TOFU——首次连接（host 不在 known_hosts）自动添加 key，已知主机正常校验（Phase 2）
+    /// - `no`：接受任意 key（仅 WARN，不安全）
     pub strict_host_key_checking: String,
 }
 
@@ -220,6 +229,16 @@ pub enum TermError {
     #[error("SFTP error: {0}")]
     SftpError(String),
 
+    /// SFTP 目标不存在（Phase 2，§6.1：SFTP_NO_SUCH_FILE，retriable=false）。
+    /// 远端路径不存在（mkdir 父目录缺失、remove/list/chmod 目标不存在等）。
+    #[error("SFTP no such file: {0}")]
+    SftpNoSuchFile(String),
+
+    /// SFTP 权限不足（Phase 2，§6.1：SFTP_PERMISSION_DENIED，retriable=false）。
+    /// 远端拒绝执行操作（目标属主非当前用户且无权限等）。
+    #[error("SFTP permission denied: {0}")]
+    SftpPermissionDenied(String),
+
     /// 本地路径策略拒绝（§5.5 / §6.1：LOCAL_PATH_NOT_ALLOWED，retriable=false）。
     /// 路径不在 `allowedLocalPaths` 白名单内，或含 `..` 穿越等。
     #[error("local path not allowed: {0}")]
@@ -229,6 +248,21 @@ pub enum TermError {
     /// realpath 解析后不在 `allowedRemotePaths` 白名单内，或含 null 字节等。
     #[error("remote path not allowed: {0}")]
     RemotePathNotAllowed(String),
+
+    /// Policy 拒绝（Phase 2，§8 / §6.1：POLICY_DENIED，retriable=false）。
+    /// 命中 blocklist（如 `rm -rf /`、`mkfs`、`dd of=/dev/...`）。
+    /// 携带拒绝原因（命中的规则描述）。
+    #[error("policy denied: {0}")]
+    PolicyDenied(String),
+
+    /// Policy 需确认（Phase 2，§8 / §6.1：POLICY_NEEDS_CONFIRM，retriable=false）。
+    /// 命中 confirm 列表（如 `sudo`、`rm -rf <非根>`、`kill -9`）。
+    ///
+    /// Phase 2 MVP：无 HITL UI，等同 Deny；Agent 应提示用户手动执行。
+    /// Phase 6 实现 HITL UI 后才真正交互确认。
+    /// 携带需确认的原因（命中的规则描述）。
+    #[error("policy needs confirm: {0}")]
+    PolicyNeedsConfirm(String),
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -247,8 +281,12 @@ impl TermError {
             Self::HostKeyRejected(_) => "HOST_KEY_REJECTED",
             Self::InvalidArgument(_) => "INVALID_ARGUMENT",
             Self::SftpError(_) => "SFTP_ERROR",
+            Self::SftpNoSuchFile(_) => "SFTP_NO_SUCH_FILE",
+            Self::SftpPermissionDenied(_) => "SFTP_PERMISSION_DENIED",
             Self::LocalPathNotAllowed(_) => "LOCAL_PATH_NOT_ALLOWED",
             Self::RemotePathNotAllowed(_) => "REMOTE_PATH_NOT_ALLOWED",
+            Self::PolicyDenied(_) => "POLICY_DENIED",
+            Self::PolicyNeedsConfirm(_) => "POLICY_NEEDS_CONFIRM",
             Self::Io(_) => "CONNECT_FAILED",
         }
     }
@@ -262,7 +300,11 @@ impl TermError {
             | Self::HostKeyRejected(_)
             | Self::InvalidArgument(_)
             | Self::LocalPathNotAllowed(_)
-            | Self::RemotePathNotAllowed(_) => false,
+            | Self::RemotePathNotAllowed(_)
+            | Self::PolicyDenied(_)
+            | Self::PolicyNeedsConfirm(_)
+            | Self::SftpNoSuchFile(_)
+            | Self::SftpPermissionDenied(_) => false,
             Self::ConnectFailed(_)
             | Self::OperationTimeout
             | Self::ChannelError(_)
@@ -378,6 +420,42 @@ mod tests {
         let remote = TermError::RemotePathNotAllowed("/root not allowed".into());
         assert_eq!(remote.code(), "REMOTE_PATH_NOT_ALLOWED");
         assert!(!remote.retriable());
+    }
+
+    #[test]
+    fn sftp_no_such_file_error_code_and_retriable() {
+        // Phase 2：SFTP_NO_SUCH_FILE 不可重试（远端路径不存在，重试无意义）
+        let err = TermError::SftpNoSuchFile("mkdir parent missing: /no/such/path".into());
+        assert_eq!(err.code(), "SFTP_NO_SUCH_FILE");
+        assert!(!err.retriable());
+        assert!(format!("{err}").contains("/no/such/path"));
+    }
+
+    #[test]
+    fn sftp_permission_denied_error_code_and_retriable() {
+        // Phase 2：SFTP_PERMISSION_DENIED 不可重试（权限不足，需用户介入）
+        let err = TermError::SftpPermissionDenied("chmod /root/.ssh: denied".into());
+        assert_eq!(err.code(), "SFTP_PERMISSION_DENIED");
+        assert!(!err.retriable());
+        assert!(format!("{err}").contains("denied"));
+    }
+
+    #[test]
+    fn policy_denied_error_code_and_retriable() {
+        // Phase 2：POLICY_DENIED 不可重试（命中 blocklist，重试仍会被拒）
+        let err = TermError::PolicyDenied("command blocked: rm -rf /".into());
+        assert_eq!(err.code(), "POLICY_DENIED");
+        assert!(!err.retriable());
+        assert!(format!("{err}").contains("rm -rf /"));
+    }
+
+    #[test]
+    fn policy_needs_confirm_error_code_and_retriable() {
+        // Phase 2：POLICY_NEEDS_CONFIRM 不可重试（需用户确认，Agent 应提示用户）
+        let err = TermError::PolicyNeedsConfirm("sftp remove (recursive) needs confirmation: /tmp/foo".into());
+        assert_eq!(err.code(), "POLICY_NEEDS_CONFIRM");
+        assert!(!err.retriable());
+        assert!(format!("{err}").contains("needs confirmation"));
     }
 
     #[test]

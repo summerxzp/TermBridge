@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::domain::output::{ReadOutputParams, ReadOutputResult};
+use crate::domain::policy::{Action, Decision};
 use crate::domain::provider::{
     ControlKey, HostName, OpenTerminalRequest, PtySize, TerminalProvider, TermError,
     TransferDirection,
@@ -27,6 +28,7 @@ use crate::domain::session::{Session, SessionId, SessionSummary};
 use crate::infrastructure::ssh::SshTerminalHandle;
 use crate::infrastructure::sshconfig;
 use crate::application::path_policy::PathPolicy;
+use crate::application::policy::PolicyManager;
 
 // ───────────────────────────────────────────────────────────────────────────
 // idleReaper 配置常量（§7.4 Phase 1）
@@ -54,13 +56,19 @@ pub struct SessionManager {
     counter: AtomicU64,
     /// SFTP 路径策略（ADR-0005 §4）。默认 cwd + 全放行。
     path_policy: PathPolicy,
+    /// 危险动作拦截策略链（PLAN.md §8，Phase 2）。默认 [DefaultPolicy]。
+    policy: Arc<PolicyManager>,
     /// idleReaper task 句柄。Drop 时 abort 防泄漏。
     idle_reaper_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl SessionManager {
     pub fn new(provider: Arc<dyn TerminalProvider>) -> Self {
-        Self::build(provider, PathPolicy::default_from_cwd())
+        Self::build(
+            provider,
+            PathPolicy::default_from_cwd(),
+            Arc::new(PolicyManager::with_default()),
+        )
     }
 
     /// 用自定义路径策略构造（测试 / 配置覆盖用）。
@@ -68,10 +76,27 @@ impl SessionManager {
         provider: Arc<dyn TerminalProvider>,
         path_policy: PathPolicy,
     ) -> Self {
-        Self::build(provider, path_policy)
+        Self::build(
+            provider,
+            path_policy,
+            Arc::new(PolicyManager::with_default()),
+        )
     }
 
-    fn build(provider: Arc<dyn TerminalProvider>, path_policy: PathPolicy) -> Self {
+    /// 用自定义路径策略 + Policy 链构造（Phase 2，测试 / 配置覆盖用）。
+    pub fn with_policy(
+        provider: Arc<dyn TerminalProvider>,
+        path_policy: PathPolicy,
+        policy: Arc<PolicyManager>,
+    ) -> Self {
+        Self::build(provider, path_policy, policy)
+    }
+
+    fn build(
+        provider: Arc<dyn TerminalProvider>,
+        path_policy: PathPolicy,
+        policy: Arc<PolicyManager>,
+    ) -> Self {
         let sessions = Arc::new(DashMap::new());
 
         // spawn idleReaper task：每 30s 扫描，关闭空闲超 30min 的 session（§7.4 Phase 1）
@@ -85,6 +110,7 @@ impl SessionManager {
             provider,
             counter: AtomicU64::new(0),
             path_policy,
+            policy,
             idle_reaper_task: Mutex::new(Some(idle_reaper_task)),
         }
     }
@@ -136,12 +162,27 @@ impl SessionManager {
 
     /// 写输入到 PTY（§4.6 契约 7：立即返回，不等命令完成）。
     ///
+    /// Phase 2：调用 Policy 拦截危险命令（PLAN.md §8）。
+    /// - Allow → 继续发送
+    /// - Deny → 返回 `TermError::PolicyDenied`
+    /// - Confirm → 返回 `TermError::PolicyNeedsConfirm`（Phase 2 MVP 等同 Deny）
+    ///
+    /// Policy 检查在 session 查找前——拒绝危险命令不泄漏 session 存在性。
+    ///
     /// Phase 1：若返回 SessionClosed 且 session 已 Lost/Closed，从 map 移除防泄漏。
     pub async fn send_input(
         &self,
         session_id: &str,
         data: &[u8],
     ) -> Result<(), TermError> {
+        // Phase 2：Policy 拦截（PLAN.md §8）
+        // 字节按 UTF-8 lossy 转字符串供 Policy 文本检查（best-effort）
+        let data_str = String::from_utf8_lossy(data).into_owned();
+        self.check_policy(&Action::SendInput {
+            session_id: session_id.to_string(),
+            data: data_str,
+        })?;
+
         let session = self.get_session(session_id)?;
         match session.send_input(data).await {
             Ok(()) => Ok(()),
@@ -218,6 +259,13 @@ impl SessionManager {
         local: PathBuf,
         remote: String,
     ) -> Result<(), TermError> {
+        // Phase 2：Policy 拦截（PLAN.md §8）
+        self.check_policy(&Action::SftpTransfer {
+            direction,
+            local: local.to_string_lossy().into_owned(),
+            remote: remote.clone(),
+        })?;
+
         let session = self.get_session(session_id)?;
 
         // 1. 下转 handle 到 SshTerminalHandle（FakeHandle 等非 SSH handle 不支持 SFTP）
@@ -259,12 +307,167 @@ impl SessionManager {
         result
     }
 
+    // ── Phase 2：SFTP 目录 / 权限 / 列表 / 删除 ──────────────────
+
+    /// SFTP 创建远端目录（Phase 2）。
+    ///
+    /// 流程与 sftp_transfer 一致：get session → 开 SFTP channel → 路径策略校验
+    /// → mkdir → close。
+    /// mkdir 的 remote_path 可能尚不存在，用 `check_remote_allow_new` 校验
+    /// （先尝试 realpath，失败则校验父目录）。
+    pub async fn sftp_mkdir(
+        &self,
+        session_id: &str,
+        remote: String,
+        mode: u32,
+    ) -> Result<(), TermError> {
+        let sftp = self.open_sftp_for_session(session_id).await?;
+        tracing::info!(
+            session = %session_id,
+            remote = %remote,
+            mode = format!("{mode:o}"),
+            "sftp_mkdir: starting"
+        );
+
+        // 路径策略校验：mkdir 目标可能不存在，用 allow_new 变体
+        let result = async {
+            self.path_policy.check_remote_allow_new(&remote, &sftp).await?;
+            sftp.mkdir(&remote, mode).await
+        }
+        .await;
+
+        let _ = sftp.close().await;
+        result
+    }
+
+    /// SFTP 列远端目录（Phase 2）。
+    ///
+    /// 返回 `Vec<RemoteEntry>`。remote_path 必须存在（check_remote）。
+    pub async fn sftp_list(
+        &self,
+        session_id: &str,
+        remote: String,
+    ) -> Result<Vec<crate::infrastructure::sftp::RemoteEntry>, TermError> {
+        let sftp = self.open_sftp_for_session(session_id).await?;
+        tracing::info!(
+            session = %session_id,
+            remote = %remote,
+            "sftp_list: starting"
+        );
+
+        let result = async {
+            self.path_policy.check_remote(&remote, &sftp).await?;
+            sftp.list_dir(&remote).await
+        }
+        .await;
+
+        let _ = sftp.close().await;
+        result
+    }
+
+    /// SFTP 删除远端文件/目录（Phase 2）。
+    ///
+    /// - `recursive=false`：删除文件（用 remove_file）；若目标是目录会失败。
+    /// - `recursive=true`：删除目录树（递归 list_dir → remove 子项 → rmdir）。
+    ///
+    /// Phase 2：Policy 拦截（PLAN.md §8）——递归删除系统目录 → Deny，
+    /// 其他递归/非递归删除 → Confirm。
+    pub async fn sftp_remove(
+        &self,
+        session_id: &str,
+        remote: String,
+        recursive: bool,
+    ) -> Result<(), TermError> {
+        // Phase 2：Policy 拦截（PLAN.md §8）
+        self.check_policy(&Action::SftpRemove {
+            remote: remote.clone(),
+            recursive,
+        })?;
+
+        let sftp = self.open_sftp_for_session(session_id).await?;
+        tracing::info!(
+            session = %session_id,
+            remote = %remote,
+            recursive,
+            "sftp_remove: starting"
+        );
+
+        let result = async {
+            self.path_policy.check_remote(&remote, &sftp).await?;
+            if recursive {
+                sftp_remove_recursive(&sftp, &remote, 0).await
+            } else {
+                sftp.remove(&remote).await
+            }
+        }
+        .await;
+
+        let _ = sftp.close().await;
+        result
+    }
+
+    /// SFTP 修改远端文件/目录权限（Phase 2）。
+    ///
+    /// `mode` 为 POSIX 权限位（如 `0o755`）。
+    ///
+    /// Phase 2：Policy 拦截（PLAN.md §8）——chmod 777 系统目录 → Confirm。
+    pub async fn sftp_chmod(
+        &self,
+        session_id: &str,
+        remote: String,
+        mode: u32,
+    ) -> Result<(), TermError> {
+        // Phase 2：Policy 拦截（PLAN.md §8）
+        self.check_policy(&Action::SftpChmod {
+            remote: remote.clone(),
+            mode: format!("{mode:o}"),
+        })?;
+
+        let sftp = self.open_sftp_for_session(session_id).await?;
+        tracing::info!(
+            session = %session_id,
+            remote = %remote,
+            mode = format!("{mode:o}"),
+            "sftp_chmod: starting"
+        );
+
+        let result = async {
+            self.path_policy.check_remote(&remote, &sftp).await?;
+            sftp.chmod(&remote, mode).await
+        }
+        .await;
+
+        let _ = sftp.close().await;
+        result
+    }
+
     /// 列出所有 Session 摘要。
     pub fn list_sessions(&self) -> Vec<SessionSummary> {
         self.sessions.iter().map(|r| r.value().summary()).collect()
     }
 
     // ── 内部辅助 ──────────────────────────────────────────────────
+
+    /// 打开 SFTP channel 并返回 SftpProvider（Phase 2 提取的公共逻辑）。
+    ///
+    /// 流程：get session → 下转 SshTerminalHandle → open_sftp_provider。
+    /// 调用方负责在操作完成后 `sftp.close()`。
+    async fn open_sftp_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::infrastructure::sftp::SftpProvider, TermError> {
+        let session = self.get_session(session_id)?;
+        let handle = session.handle();
+        let ssh_handle = handle
+            .as_any()
+            .downcast_ref::<SshTerminalHandle>()
+            .ok_or_else(|| {
+                TermError::InvalidArgument(format!(
+                    "session '{session_id}' does not support SFTP (non-SSH handle)"
+                ))
+            })?;
+        ssh_handle.open_sftp_provider().await
+    }
 
     fn get_session(&self, id: &str) -> Result<Arc<Session>, TermError> {
         self.sessions
@@ -291,6 +494,23 @@ impl SessionManager {
                 "session lost/closed, removing from map; agent should reopen via open_session"
             );
             self.sessions.remove(session_id);
+        }
+    }
+
+    /// Phase 2：调用 Policy 链拦截动作（PLAN.md §8）。
+    ///
+    /// - Allow → Ok(())
+    /// - Deny → Err(PolicyDenied)
+    /// - Confirm → Err(PolicyNeedsConfirm)（Phase 2 MVP 等同 Deny）
+    fn check_policy(&self, action: &Action) -> Result<(), TermError> {
+        let decision = self.policy.authorize(action);
+        match decision {
+            Decision::Allow => Ok(()),
+            Decision::Deny => Err(TermError::PolicyDenied(policy_reason(action, "blocked"))),
+            Decision::Confirm => Err(TermError::PolicyNeedsConfirm(policy_reason(
+                action,
+                "needs confirmation",
+            ))),
         }
     }
 }
@@ -347,6 +567,74 @@ pub async fn reap_idle(sessions: &DashMap<SessionId, Arc<Session>>, idle_timeout
         if let Some((_, session)) = sessions.remove(&id) {
             tracing::info!(session = %id, "idle_reaper: 关闭空闲超时 session");
             let _ = session.close().await;
+        }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Phase 2：递归删除目录树 + Policy reason 辅助
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 递归删除远端目录树（Phase 2，sftp_remove recursive=true 用）。
+///
+/// 流程：list_dir → 对每个条目：目录则递归，文件则 remove → 最后 rmdir 空目录。
+/// 深度限制 `MAX_DEPTH` 防止 symlink 环导致无限递归。
+async fn sftp_remove_recursive(
+    sftp: &crate::infrastructure::sftp::SftpProvider,
+    remote: &str,
+    depth: usize,
+) -> Result<(), TermError> {
+    const MAX_DEPTH: usize = 20;
+    if depth > MAX_DEPTH {
+        return Err(TermError::InvalidArgument(format!(
+            "sftp recursive remove exceeded max depth {MAX_DEPTH} at '{remote}' \
+             (possible symlink loop)"
+        )));
+    }
+
+    let entries = sftp.list_dir(remote).await?;
+    for entry in entries {
+        let child_path = if remote.ends_with('/') {
+            format!("{}{}", remote, entry.name)
+        } else {
+            format!("{}/{}", remote, entry.name)
+        };
+        if entry.is_dir {
+            Box::pin(sftp_remove_recursive(sftp, &child_path, depth + 1)).await?;
+        } else {
+            sftp.remove(&child_path).await?;
+        }
+    }
+    sftp.rmdir(remote).await
+}
+
+/// 从 Action + 状态描述构造 Policy 拒绝/需确认的原因字符串。
+fn policy_reason(action: &Action, status: &str) -> String {
+    match action {
+        Action::SendInput { data, .. } => {
+            let snippet = data
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            let snippet: String = if snippet.chars().count() > 80 {
+                format!("{}...", snippet.chars().take(77).collect::<String>())
+            } else {
+                snippet.to_string()
+            };
+            format!("command {status}: {snippet}")
+        }
+        Action::SftpTransfer { direction, remote, .. } => {
+            format!("sftp {} {status}: {remote}", direction.as_str())
+        }
+        Action::SftpRemove { remote, recursive } => {
+            format!(
+                "sftp remove{} {status}: {remote}",
+                if *recursive { " (recursive)" } else { "" }
+            )
+        }
+        Action::SftpChmod { remote, mode } => {
+            format!("sftp chmod {mode} {status}: {remote}")
         }
     }
 }
@@ -636,5 +924,146 @@ mod tests {
             !mgr.sessions.contains_key("sess_lost"),
             "Lost session 应从 map 移除"
         );
+    }
+
+    // ── Phase 2：Policy 集成测试 ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_input_dangerous_command_returns_policy_denied() {
+        // rm -rf / 命中 blocklist → POLICY_DENIED
+        // Policy 检查在 session 查找前，无需真实 session
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let err = mgr.send_input("any_session", b"rm -rf /\n").await.unwrap_err();
+        assert_eq!(err.code(), "POLICY_DENIED");
+        assert!(!err.retriable());
+    }
+
+    #[tokio::test]
+    async fn send_input_mkfs_returns_policy_denied() {
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let err = mgr
+            .send_input("any", b"mkfs.ext4 /dev/sda1\n")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "POLICY_DENIED");
+    }
+
+    #[tokio::test]
+    async fn send_input_sudo_returns_policy_needs_confirm() {
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let err = mgr.send_input("any", b"sudo apt update\n").await.unwrap_err();
+        assert_eq!(err.code(), "POLICY_NEEDS_CONFIRM");
+    }
+
+    #[tokio::test]
+    async fn send_input_normal_command_to_nonexistent_returns_session_not_found() {
+        // Policy Allow → 继续查找 session → SESSION_NOT_FOUND
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let err = mgr.send_input("nonexistent", b"ls\n").await.unwrap_err();
+        assert_eq!(err.code(), "SESSION_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn send_input_multiline_dangerous_denies_all() {
+        // 多行输入，第二行命中 blocklist → POLICY_DENIED
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let input = b"ls -la\nrm -rf /\necho done\n";
+        let err = mgr.send_input("any", input).await.unwrap_err();
+        assert_eq!(err.code(), "POLICY_DENIED");
+    }
+
+    #[tokio::test]
+    async fn sftp_transfer_to_dev_returns_policy_needs_confirm() {
+        // upload 到 /dev/ → Confirm → POLICY_NEEDS_CONFIRM
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let err = mgr
+            .sftp_transfer(
+                "any",
+                TransferDirection::Upload,
+                PathBuf::from("/tmp/file"),
+                "/dev/sda".to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "POLICY_NEEDS_CONFIRM");
+    }
+
+    #[tokio::test]
+    async fn sftp_remove_recursive_system_dir_returns_policy_denied() {
+        // 递归删除 /etc → Deny → POLICY_DENIED
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let err = mgr
+            .sftp_remove("any", "/etc".to_string(), true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "POLICY_DENIED");
+    }
+
+    #[tokio::test]
+    async fn sftp_remove_non_recursive_returns_policy_needs_confirm() {
+        // 非递归删除 → Confirm → POLICY_NEEDS_CONFIRM
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let err = mgr
+            .sftp_remove("any", "/tmp/file".to_string(), false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "POLICY_NEEDS_CONFIRM");
+    }
+
+    #[tokio::test]
+    async fn sftp_chmod_777_system_dir_returns_policy_needs_confirm() {
+        // chmod 777 /etc → Confirm → POLICY_NEEDS_CONFIRM
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let err = mgr
+            .sftp_chmod("any", "/etc/passwd".to_string(), 0o777)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "POLICY_NEEDS_CONFIRM");
+    }
+
+    #[tokio::test]
+    async fn sftp_chmod_normal_returns_session_not_found() {
+        // chmod 644 普通路径 → Policy Allow → SESSION_NOT_FOUND
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let err = mgr
+            .sftp_chmod("nonexistent", "/home/user/file".to_string(), 0o644)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "SESSION_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn sftp_mkdir_nonexistent_session_returns_session_not_found() {
+        // mkdir 普通路径 → 无 Policy 拦截 → SESSION_NOT_FOUND
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let err = mgr
+            .sftp_mkdir("nonexistent", "/home/user/newdir".to_string(), 0o755)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "SESSION_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn sftp_list_nonexistent_session_returns_session_not_found() {
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let err = mgr
+            .sftp_list("nonexistent", "/home/user".to_string())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "SESSION_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn custom_policy_manager_empty_chain_allows_dangerous() {
+        // 空 PolicyManager（无 Policy）→ 所有命令 Allow
+        let empty_policy = Arc::new(PolicyManager::new());
+        let mgr = SessionManager::with_policy(
+            Arc::new(FakeProvider) as Arc<dyn TerminalProvider>,
+            PathPolicy::default_from_cwd(),
+            empty_policy,
+        );
+        // 无 Policy 拦截，rm -rf / 不会被拒（但 session 不存在 → SESSION_NOT_FOUND）
+        let err = mgr.send_input("any", b"rm -rf /\n").await.unwrap_err();
+        assert_eq!(err.code(), "SESSION_NOT_FOUND", "空 Policy 链不拦截");
     }
 }

@@ -1,4 +1,4 @@
-//! rmcp MCP server —— 7 工具映射到 application 层（§6 / §7.4 Phase 1）
+//! rmcp MCP server —— 11 工具映射到 application 层（§6 / §7.4 Phase 1-2）
 //!
 //! 工具：
 //! 1. `list_hosts`       → HostManager::list_hosts
@@ -7,7 +7,11 @@
 //! 4. `read_output`      → SessionManager::read_output
 //! 5. `send_control`     → SessionManager::send_control
 //! 6. `close_session`    → SessionManager::close_session
-//! 7. `sftp_transfer`    → SessionManager::sftp_transfer（Phase 1，upload/download only）
+//! 7. `sftp_transfer`    → SessionManager::sftp_transfer（Phase 1，upload/download）
+//! 8. `sftp_mkdir`       → SessionManager::sftp_mkdir（Phase 2）
+//! 9. `sftp_list`        → SessionManager::sftp_list（Phase 2）
+//! 10. `sftp_remove`     → SessionManager::sftp_remove（Phase 2）
+//! 11. `sftp_chmod`      → SessionManager::sftp_chmod（Phase 2）
 //!
 //! 错误格式（§6.1）：`CallToolResult::structured_error({code, message, retriable})`
 //! 成功格式：`CallToolResult::structured({工具特定结构})`
@@ -58,6 +62,20 @@ fn ok_result<T: Serialize>(result: T) -> CallToolResult {
 /// 构建错误结果（structured error，is_error=true）。
 fn err_result(e: &TermError) -> CallToolResult {
     CallToolResult::structured_error(json!(ToolError::from_term(e)))
+}
+
+/// 解析八进制权限模式字符串（Phase 2）。
+///
+/// 接受 "755"、"0o755"、"0" 等形式；None / 空串 → 0（服务器默认）。
+/// 返回 `Ok(u32)`（如 0o755 = 493）或 `Err(错误描述)`。
+fn parse_octal_mode(mode: Option<&str>) -> Result<u32, String> {
+    let raw = match mode {
+        None | Some("") => return Ok(0),
+        Some(s) => s.trim(),
+    };
+    let stripped = raw.strip_prefix("0o").or_else(|| raw.strip_prefix("0O")).unwrap_or(raw);
+    u32::from_str_radix(stripped, 8)
+        .map_err(|_| format!("invalid octal mode '{raw}'; expected e.g. '755' or '0o755'"))
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -132,6 +150,48 @@ pub struct SftpTransferParams {
     pub remote_path: String,
 }
 
+/// sftp_mkdir 参数（Phase 2）
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SftpMkdirParams {
+    /// Session ID returned by open_session
+    pub session_id: String,
+    /// Remote directory path to create. Parent must exist. Path policy enforced.
+    pub remote_path: String,
+    /// POSIX permissions as octal string, e.g. "755" or "0o755". Use "0" for server default.
+    pub mode: Option<String>,
+}
+
+/// sftp_list 参数（Phase 2）
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SftpListParams {
+    /// Session ID returned by open_session
+    pub session_id: String,
+    /// Remote directory path to list. Must exist. Path policy enforced.
+    pub remote_path: String,
+}
+
+/// sftp_remove 参数（Phase 2）
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SftpRemoveParams {
+    /// Session ID returned by open_session
+    pub session_id: String,
+    /// Remote file or directory path to delete. Path policy enforced.
+    pub remote_path: String,
+    /// If true, recursively delete directory tree. Policy: recursive delete of system dirs is denied.
+    pub recursive: Option<bool>,
+}
+
+/// sftp_chmod 参数（Phase 2）
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SftpChmodParams {
+    /// Session ID returned by open_session
+    pub session_id: String,
+    /// Remote file or directory path. Must exist. Path policy enforced.
+    pub remote_path: String,
+    /// POSIX permissions as octal string, e.g. "755" or "644".
+    pub mode: String,
+}
+
 // ── 返回类型 ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -171,6 +231,30 @@ struct ReadOutputDto {
 struct SftpTransferResult {
     direction: String,
     local_path: String,
+    remote_path: String,
+}
+
+/// sftp_list 单条目录条目（Phase 2）
+#[derive(Serialize)]
+struct RemoteEntryDto {
+    name: String,
+    is_dir: bool,
+    is_file: bool,
+    size: u64,
+    permissions: Option<u32>,
+}
+
+/// sftp_list 成功返回（Phase 2）
+#[derive(Serialize)]
+struct SftpListResult {
+    path: String,
+    entries: Vec<RemoteEntryDto>,
+}
+
+/// sftp_mkdir / sftp_remove / sftp_chmod 成功返回（Phase 2）
+#[derive(Serialize)]
+struct SftpOkResult {
+    ok: bool,
     remote_path: String,
 }
 
@@ -360,12 +444,157 @@ impl TermBridgeServer {
             Err(e) => err_result(&e),
         }
     }
+
+    /// Create a remote directory via SFTP (Phase 2).
+    #[tool(description = "Create a remote directory via SFTP. Parent directory must exist. Path policy enforced. Mode is octal string like '755'; use '0' or omit for server default.")]
+    async fn sftp_mkdir(
+        &self,
+        Parameters(params): Parameters<SftpMkdirParams>,
+    ) -> CallToolResult {
+        let mode = match parse_octal_mode(params.mode.as_deref()) {
+            Ok(m) => m,
+            Err(msg) => {
+                return CallToolResult::structured_error(json!(ToolError {
+                    code: "INVALID_ARGUMENT".to_string(),
+                    message: msg,
+                    retriable: false,
+                }));
+            }
+        };
+        match self
+            .session_manager
+            .sftp_mkdir(&params.session_id, params.remote_path.clone(), mode)
+            .await
+        {
+            Ok(()) => ok_result(SftpOkResult {
+                ok: true,
+                remote_path: params.remote_path,
+            }),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    /// List remote directory contents via SFTP (Phase 2).
+    #[tool(description = "List remote directory contents via SFTP. Returns entry names, types (file/dir), sizes, and permissions. Path must exist. Path policy enforced.")]
+    async fn sftp_list(
+        &self,
+        Parameters(params): Parameters<SftpListParams>,
+    ) -> CallToolResult {
+        match self
+            .session_manager
+            .sftp_list(&params.session_id, params.remote_path.clone())
+            .await
+        {
+            Ok(entries) => {
+                let dtos: Vec<RemoteEntryDto> = entries
+                    .into_iter()
+                    .map(|e| RemoteEntryDto {
+                        name: e.name,
+                        is_dir: e.is_dir,
+                        is_file: e.is_file,
+                        size: e.size,
+                        permissions: e.permissions,
+                    })
+                    .collect();
+                ok_result(SftpListResult {
+                    path: params.remote_path,
+                    entries: dtos,
+                })
+            }
+            Err(e) => err_result(&e),
+        }
+    }
+
+    /// Delete a remote file or directory via SFTP (Phase 2).
+    #[tool(description = "Delete a remote file or directory via SFTP. Set recursive=true to delete a directory tree. Policy: recursive delete of system directories (/etc, /usr, etc.) is denied; other deletes need confirmation.")]
+    async fn sftp_remove(
+        &self,
+        Parameters(params): Parameters<SftpRemoveParams>,
+    ) -> CallToolResult {
+        let recursive = params.recursive.unwrap_or(false);
+        match self
+            .session_manager
+            .sftp_remove(&params.session_id, params.remote_path.clone(), recursive)
+            .await
+        {
+            Ok(()) => ok_result(SftpOkResult {
+                ok: true,
+                remote_path: params.remote_path,
+            }),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    /// Change remote file/directory permissions via SFTP (Phase 2).
+    #[tool(description = "Change remote file/directory permissions via SFTP (chmod). Mode is octal string like '755' or '644'. Path must exist. Policy: chmod 777 on system directories needs confirmation.")]
+    async fn sftp_chmod(
+        &self,
+        Parameters(params): Parameters<SftpChmodParams>,
+    ) -> CallToolResult {
+        let mode = match parse_octal_mode(Some(&params.mode)) {
+            Ok(m) => m,
+            Err(msg) => {
+                return CallToolResult::structured_error(json!(ToolError {
+                    code: "INVALID_ARGUMENT".to_string(),
+                    message: msg,
+                    retriable: false,
+                }));
+            }
+        };
+        match self
+            .session_manager
+            .sftp_chmod(&params.session_id, params.remote_path.clone(), mode)
+            .await
+        {
+            Ok(()) => ok_result(SftpOkResult {
+                ok: true,
+                remote_path: params.remote_path,
+            }),
+            Err(e) => err_result(&e),
+        }
+    }
 }
 
 #[tool_handler]
 impl ServerHandler for TermBridgeServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_instructions("TermBridge: Remote terminal bridge for AI agents. Open a session to an SSH host, send commands, read output, send control characters (Ctrl+C etc.), transfer files via SFTP (upload/download), and close when done.")
+            .with_instructions("TermBridge: Remote terminal bridge for AI agents. Open a session to an SSH host, send commands, read output, send control characters (Ctrl+C etc.), transfer files via SFTP (upload/download), create/list/delete remote directories and files, change permissions (chmod), and close when done.")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_octal_mode_plain() {
+        assert_eq!(parse_octal_mode(Some("755")).unwrap(), 0o755);
+        assert_eq!(parse_octal_mode(Some("644")).unwrap(), 0o644);
+        assert_eq!(parse_octal_mode(Some("777")).unwrap(), 0o777);
+    }
+
+    #[test]
+    fn parse_octal_mode_with_0o_prefix() {
+        assert_eq!(parse_octal_mode(Some("0o755")).unwrap(), 0o755);
+        assert_eq!(parse_octal_mode(Some("0O644")).unwrap(), 0o644);
+    }
+
+    #[test]
+    fn parse_octal_mode_none_or_empty_returns_zero() {
+        assert_eq!(parse_octal_mode(None).unwrap(), 0);
+        assert_eq!(parse_octal_mode(Some("")).unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_octal_mode_whitespace_trimmed() {
+        assert_eq!(parse_octal_mode(Some("  755  ")).unwrap(), 0o755);
+    }
+
+    #[test]
+    fn parse_octal_mode_invalid_returns_error() {
+        assert!(parse_octal_mode(Some("abc")).is_err());
+        assert!(parse_octal_mode(Some("8")).is_err()); // 8 is not valid octal
+        assert!(parse_octal_mode(Some("rwxr-xr-x")).is_err());
     }
 }

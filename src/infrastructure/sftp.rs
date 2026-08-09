@@ -22,10 +22,33 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use russh::client::{Handler, Handle};
+use russh_sftp::client::error::Error as SftpLibError;
 use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::{FileAttributes, StatusCode};
+use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 
 use crate::domain::provider::{SftpCanonicalize, TermError};
+
+/// 远端目录条目（Phase 2，sftp_list 返回类型）。
+///
+/// 序列化为 JSON 供 MCP 工具返回给 Agent。
+/// `permissions` 为原始 POSIX 权限位（如 `0o755`），含文件类型位；
+/// 不存在时为 None（部分 SFTP server 不返回 permissions）。
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteEntry {
+    /// 条目名称（不含父路径）
+    pub name: String,
+    /// 是否为目录
+    pub is_dir: bool,
+    /// 是否为普通文件
+    pub is_file: bool,
+    /// 文件大小（字节）；目录可能为 0
+    pub size: u64,
+    /// POSIX 权限位（含类型位），如 `0o40755`（目录 755）；不存在则 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<u32>,
+}
 
 /// SFTP 操作封装。每次构造会新建一个 SFTP channel（独立于 PTY channel）。
 ///
@@ -187,17 +210,140 @@ impl SftpProvider {
             .await
             .map_err(|e| TermError::SftpError(format!("sftp close: {e}")))
     }
+
+    // ── Phase 2：目录 / 权限 / 列表 / 删除 ──────────────────────
+
+    /// 创建远端目录（Phase 2）。
+    ///
+    /// `mode` 为 POSIX 权限位（如 `0o755`）。russh-sftp 的 `create_dir` 不支持
+    /// 直接传 attrs，因此先创建目录再通过 `set_metadata` 设置权限。
+    /// `mode == 0` 时跳过 set_metadata（使用服务器默认 umask）。
+    pub async fn mkdir(&self, remote: &str, mode: u32) -> Result<(), TermError> {
+        tracing::info!(remote = remote, mode = format!("{mode:o}"), "sftp mkdir: starting");
+        self.sftp
+            .create_dir(remote)
+            .await
+            .map_err(|e| map_sftp_error(e, &format!("sftp mkdir '{remote}'")))?;
+
+        if mode != 0 {
+            let attrs = FileAttributes {
+                permissions: Some(mode),
+                ..Default::default()
+            };
+            self.sftp
+                .set_metadata(remote, attrs)
+                .await
+                .map_err(|e| map_sftp_error(e, &format!("sftp mkdir setperm '{remote}'")))?;
+        }
+        tracing::info!(remote = remote, "sftp mkdir: complete");
+        Ok(())
+    }
+
+    /// 删除远端空目录（Phase 2）。
+    /// 目标非空或不存在会失败（映射为 SftpError / SftpNoSuchFile）。
+    pub async fn rmdir(&self, remote: &str) -> Result<(), TermError> {
+        tracing::info!(remote = remote, "sftp rmdir: starting");
+        self.sftp
+            .remove_dir(remote)
+            .await
+            .map_err(|e| map_sftp_error(e, &format!("sftp rmdir '{remote}'")))?;
+        tracing::info!(remote = remote, "sftp rmdir: complete");
+        Ok(())
+    }
+
+    /// 删除远端文件（Phase 2）。
+    /// 目标是目录会失败；不存在映射为 SftpNoSuchFile。
+    pub async fn remove(&self, remote: &str) -> Result<(), TermError> {
+        tracing::info!(remote = remote, "sftp remove: starting");
+        self.sftp
+            .remove_file(remote)
+            .await
+            .map_err(|e| map_sftp_error(e, &format!("sftp remove '{remote}'")))?;
+        tracing::info!(remote = remote, "sftp remove: complete");
+        Ok(())
+    }
+
+    /// 修改远端文件/目录权限（Phase 2，chmod）。
+    /// `mode` 为 POSIX 权限位（如 `0o755`），通过 SFTP setstat 设置。
+    pub async fn chmod(&self, remote: &str, mode: u32) -> Result<(), TermError> {
+        tracing::info!(remote = remote, mode = format!("{mode:o}"), "sftp chmod: starting");
+        let attrs = FileAttributes {
+            permissions: Some(mode),
+            ..Default::default()
+        };
+        self.sftp
+            .set_metadata(remote, attrs)
+            .await
+            .map_err(|e| map_sftp_error(e, &format!("sftp chmod '{remote}'")))?;
+        tracing::info!(remote = remote, "sftp chmod: complete");
+        Ok(())
+    }
+
+    /// 列出远端目录内容（Phase 2）。
+    /// 返回 `Vec<RemoteEntry>`，已过滤 `.` 和 `..`。
+    /// 目标不存在映射为 SftpNoSuchFile；非目录映射为 SftpError。
+    pub async fn list_dir(&self, remote: &str) -> Result<Vec<RemoteEntry>, TermError> {
+        tracing::info!(remote = remote, "sftp list_dir: starting");
+        let read_dir = self
+            .sftp
+            .read_dir(remote)
+            .await
+            .map_err(|e| map_sftp_error(e, &format!("sftp list_dir '{remote}'")))?;
+
+        let entries: Vec<RemoteEntry> = read_dir
+            .map(|entry| {
+                let metadata = entry.metadata();
+                RemoteEntry {
+                    name: entry.file_name(),
+                    is_dir: metadata.is_dir(),
+                    is_file: metadata.is_regular(),
+                    size: metadata.len(),
+                    permissions: metadata.permissions,
+                }
+            })
+            .collect();
+
+        tracing::info!(remote = remote, count = entries.len(), "sftp list_dir: complete");
+        Ok(entries)
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 错误映射（Phase 2）
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 将 russh-sftp 库错误映射为 TermError（Phase 2）。
+///
+/// - `Status(NoSuchFile)` → `SftpNoSuchFile`（retriable=false）
+/// - `Status(PermissionDenied)` → `SftpPermissionDenied`（retriable=false）
+/// - 其他 → `SftpError`（retriable=true）
+fn map_sftp_error(e: SftpLibError, context: &str) -> TermError {
+    match &e {
+        SftpLibError::Status(status) => match status.status_code {
+            StatusCode::NoSuchFile => {
+                TermError::SftpNoSuchFile(format!("{context}: {e}"))
+            }
+            StatusCode::PermissionDenied => {
+                TermError::SftpPermissionDenied(format!("{context}: {e}"))
+            }
+            _ => TermError::SftpError(format!("{context}: {e}")),
+        },
+        _ => TermError::SftpError(format!("{context}: {e}")),
+    }
 }
 
 #[async_trait]
 impl SftpCanonicalize for SftpProvider {
     /// 调远端 SFTP `realpath` 协议，解析为绝对路径。
     /// 用于 PathPolicy::check_remote 防 `..` 与 symlink 逃逸（ADR-0005 §4）。
+    ///
+    /// Phase 2：使用 map_sftp_error 映射 NoSuchFile / PermissionDenied，
+    /// 供 PathPolicy::check_remote_allow_new 区分"路径不存在"与其他错误。
     async fn canonicalize(&self, path: &str) -> Result<String, TermError> {
         self.sftp
             .canonicalize(path)
             .await
-            .map_err(|e| TermError::SftpError(format!("sftp canonicalize '{path}': {e}")))
+            .map_err(|e| map_sftp_error(e, &format!("sftp canonicalize '{path}'")))
     }
 }
 
@@ -294,5 +440,89 @@ mod tests {
         let local = Path::new("/tmp/a.tar.gz");
         let tmp: PathBuf = format!("{}.termbridge.tmp", local.to_string_lossy()).into();
         assert_eq!(tmp, PathBuf::from("/tmp/a.tar.gz.termbridge.tmp"));
+    }
+
+    // ── Phase 2：RemoteEntry 序列化测试 ──────────────────────────
+
+    #[test]
+    fn remote_entry_serializes_with_all_fields() {
+        let entry = RemoteEntry {
+            name: "test.txt".into(),
+            is_dir: false,
+            is_file: true,
+            size: 1024,
+            permissions: Some(0o644),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"name\":\"test.txt\""));
+        assert!(json.contains("\"is_dir\":false"));
+        assert!(json.contains("\"is_file\":true"));
+        assert!(json.contains("\"size\":1024"));
+        assert!(json.contains("\"permissions\":420")); // 0o644 = 420
+    }
+
+    #[test]
+    fn remote_entry_serializes_without_permissions() {
+        let entry = RemoteEntry {
+            name: "nofile".into(),
+            is_dir: true,
+            is_file: false,
+            size: 0,
+            permissions: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        // permissions 为 None 时应被 skip
+        assert!(!json.contains("permissions"));
+    }
+
+    // ── Phase 2：map_sftp_error 测试 ──────────────────────────────
+
+    #[test]
+    fn map_sftp_error_no_such_file() {
+        let status = russh_sftp::protocol::Status {
+            id: 0,
+            status_code: StatusCode::NoSuchFile,
+            error_message: "No such file".into(),
+            language_tag: "en".into(),
+        };
+        let err = map_sftp_error(SftpLibError::Status(status), "mkdir");
+        assert!(matches!(err, TermError::SftpNoSuchFile(_)));
+        assert_eq!(err.code(), "SFTP_NO_SUCH_FILE");
+        assert!(!err.retriable());
+    }
+
+    #[test]
+    fn map_sftp_error_permission_denied() {
+        let status = russh_sftp::protocol::Status {
+            id: 0,
+            status_code: StatusCode::PermissionDenied,
+            error_message: "Permission denied".into(),
+            language_tag: "en".into(),
+        };
+        let err = map_sftp_error(SftpLibError::Status(status), "chmod");
+        assert!(matches!(err, TermError::SftpPermissionDenied(_)));
+        assert_eq!(err.code(), "SFTP_PERMISSION_DENIED");
+        assert!(!err.retriable());
+    }
+
+    #[test]
+    fn map_sftp_error_other_status_maps_to_sftp_error() {
+        let status = russh_sftp::protocol::Status {
+            id: 0,
+            status_code: StatusCode::Failure,
+            error_message: "Failure".into(),
+            language_tag: "en".into(),
+        };
+        let err = map_sftp_error(SftpLibError::Status(status), "remove");
+        assert!(matches!(err, TermError::SftpError(_)));
+        assert_eq!(err.code(), "SFTP_ERROR");
+        assert!(err.retriable());
+    }
+
+    #[test]
+    fn map_sftp_error_timeout_maps_to_sftp_error() {
+        let err = map_sftp_error(SftpLibError::Timeout, "list_dir");
+        assert!(matches!(err, TermError::SftpError(_)));
+        assert!(err.retriable());
     }
 }

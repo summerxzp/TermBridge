@@ -11,4 +11,5 @@
 
 pub mod hosts;
 pub mod path_policy;
+pub mod policy;
 pub mod sessions;
