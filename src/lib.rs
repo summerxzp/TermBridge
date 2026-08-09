@@ -1,4 +1,8 @@
 // TermBridge library crate。
-// Phase 0-B：实现 OutputEngine（项目核心 IP），不接 MCP/SSH。
+// Phase 0-B：OutputEngine（核心 IP）。
+// Phase 0-C：domain（provider/session）+ infrastructure（ssh/sshconfig）+ application + transport。
 
+pub mod application;
 pub mod domain;
+pub mod infrastructure;
+pub mod transport;

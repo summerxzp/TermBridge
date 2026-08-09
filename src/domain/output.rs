@@ -931,16 +931,16 @@ mod tests {
     fn test_tail_zero() {
         let buf = OutputRingBuffer::new_raw(1024);
         buf.write(b"data\n");
-        assert_eq!(buf.tail(0), Vec::new());
+        assert_eq!(buf.tail(0), Vec::<u8>::new());
     }
 
     #[test]
     fn test_empty_buffer() {
         let buf = OutputRingBuffer::new_raw(1024);
         assert_eq!(buf.written(), 0);
-        assert_eq!(buf.read_since(0), Vec::new());
+        assert_eq!(buf.read_since(0), Vec::<u8>::new());
         assert!(!buf.is_truncated(0));
-        assert_eq!(buf.tail(10), Vec::new());
+        assert_eq!(buf.tail(10), Vec::<u8>::new());
     }
 
     #[test]
