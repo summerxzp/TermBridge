@@ -19,7 +19,6 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing::{info, warn};
 
-use crate::daemonize::{daemonize, DaemonizeResult};
 use crate::protocol::{BUILD_VERSION, PROTOCOL_VERSION};
 use crate::rpc::{gen_daemon_id, RpcServer};
 use crate::session::SessionManager;
@@ -104,25 +103,38 @@ async fn bootstrap(sock: Option<PathBuf>) -> Result<()> {
         return Ok(());
     }
 
-    // daemon 未运行，fork + setsid
+    // daemon 未运行，spawn 独立 serve 进程
+    // 不用 fork+continue：在 tokio runtime 内 fork，子进程继承父进程的多线程 runtime
+    // 状态（锁、tokio 内部状态），导致死锁。spawn 全新进程有干净的 runtime。
     let daemon_id = gen_daemon_id();
-    match daemonize(&pid_path)? {
-        DaemonizeResult::Parent { child_pid: _ } => {
-            // 父进程：写 stdout 握手响应后 exit（SSH channel 关闭）
-            let resp = serde_json::json!({
-                "daemon_id": daemon_id,
-                "socket": socket_path,
-                "protocol_version": PROTOCOL_VERSION,
-                "build": BUILD_VERSION,
-            });
-            println!("{}", resp);
-            std::process::exit(0);
+    let exe = std::env::current_exe().context("获取当前 exe 路径失败")?;
+    let child = daemonize::spawn_serve_process(&exe, &socket_path.to_string_lossy(), &daemon_id)?;
+    let child_pid = child.id();
+    // detach：forget 防止 Drop kill 子进程，让 serve 进程独立存活
+    std::mem::forget(child);
+
+    // 写 pid 文件
+    std::fs::write(&pid_path, format!("{}", child_pid))
+        .with_context(|| format!("写 pid 文件失败: {:?}", pid_path))?;
+
+    // 等待子进程 socket 就绪（最多 3 秒），确保 client 连接时 daemon 已监听
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if tokio::net::UnixStream::connect(&socket_path).await.is_ok() {
+            break;
         }
-        DaemonizeResult::Child => {
-            // 子进程：继续 serve（已 setsid + 写 pid 文件）
-            serve_inner(socket_path, daemon_id).await
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+
+    // 父进程：写 stdout 握手响应后 exit（SSH channel 关闭）
+    let resp = serde_json::json!({
+        "daemon_id": daemon_id,
+        "socket": socket_path,
+        "protocol_version": PROTOCOL_VERSION,
+        "build": BUILD_VERSION,
+    });
+    println!("{}", resp);
+    std::process::exit(0);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -179,15 +191,10 @@ async fn serve(sock: Option<PathBuf>) -> Result<()> {
         std::fs::create_dir_all(parent).ok();
     }
     let session_mgr = Arc::new(SessionManager::new());
-    let server = RpcServer::new(session_mgr);
-    info!(?socket_path, "serve 模式启动（前台）");
-    server.serve(socket_path).await
-}
-
-/// 内部 serve 逻辑（bootstrap 子进程用）
-async fn serve_inner(socket_path: PathBuf, daemon_id: String) -> Result<()> {
-    let session_mgr = Arc::new(SessionManager::new());
+    // 从环境变量读 daemon_id（bootstrap spawn 时设置），没有则自动生成（手动 serve 调试用）
+    let daemon_id = std::env::var("TERMBRIDGE_DAEMON_ID").unwrap_or_else(|_| gen_daemon_id());
     let server = RpcServer::new_with_id(session_mgr, daemon_id);
+    info!(?socket_path, "serve 模式启动（前台）");
     server.serve(socket_path).await
 }
 
