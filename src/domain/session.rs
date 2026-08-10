@@ -507,4 +507,144 @@ mod tests {
         let _ = session.send_input(b"ls\n").await;
         assert_eq!(session.last_activity(), 0);
     }
+
+    // ── SessionSummary 字段变化测试（Phase 4-B） ───────────────────────
+
+    /// 辅助：打印 SessionSummary 各字段。
+    fn print_summary(label: &str, s: &SessionSummary) {
+        println!("=== {label} ===");
+        println!("  id:            {}", s.id);
+        println!("  host:          {}", s.host);
+        println!("  state:         {:?}", s.state);
+        println!("  pty_size:      {}x{}", s.pty_size.rows, s.pty_size.cols);
+        println!("  created_at:    {} (Unix ms)", s.created_at);
+        println!("  last_activity: {} (Unix s)", s.last_activity);
+        println!("  written:       {} bytes", s.written);
+        println!("  name:          {:?}", s.name);
+    }
+
+    /// 验证 SessionSummary 在 session 生命周期各阶段的字段变化。
+    ///
+    /// 覆盖 8 个字段：
+    /// - 不变字段：id / host / pty_size / created_at / name（恒 None）
+    /// - 变化字段：state（Ready→Lost→Closed）/ written（read task 灌入增长）/ last_activity（read_output 更新）
+    #[tokio::test]
+    async fn session_summary_fields_across_lifecycle() {
+        // FakeHandle 有 2 条数据（pop 顺序：chunk2 先，chunk1 后），然后 EOF → Lost
+        let handle = Arc::new(FakeHandle {
+            chunks: Mutex::new(vec![
+                Bytes::from_static(b"chunk1\n"), // 7 bytes
+                Bytes::from_static(b"chunk2\n"), // 7 bytes
+            ]),
+        }) as Arc<dyn TerminalHandle>;
+
+        let pty = PtySize { rows: 24, cols: 80 };
+        let session = Session::new(
+            "sess_mock_001".into(),
+            "192.168.1.171".into(),
+            pty,
+            handle,
+        );
+
+        // ── 阶段 1: 初始创建（read task 刚 spawn，可能还没写入） ──
+        let s1 = session.summary();
+        print_summary("阶段 1: 初始创建", &s1);
+
+        assert_eq!(s1.id, "sess_mock_001");
+        assert_eq!(s1.host, "192.168.1.171");
+        assert_eq!(s1.state, SessionState::Ready);
+        assert_eq!(s1.pty_size.rows, 24);
+        assert_eq!(s1.pty_size.cols, 80);
+        assert_eq!(s1.name, None);
+        let created_at = s1.created_at;
+        let initial_last_activity = s1.last_activity;
+
+        // ── 阶段 2: read task 灌入数据后 ──
+        // read task 把 chunk1 + chunk2 写入 buffer（共 16 bytes），然后 EOF → Lost
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let s2 = session.summary();
+        print_summary("阶段 2: read task 灌入数据后", &s2);
+
+        // written 应增长（read task 写入了 14 bytes: "chunk1\n" + "chunk2\n"）
+        assert!(
+            s2.written >= 14,
+            "written 应 >= 14 bytes, 实际: {}",
+            s2.written
+        );
+        assert!(s2.written >= s1.written, "written 应单调增长");
+        // read task 不更新 last_activity
+        assert_eq!(
+            s2.last_activity, initial_last_activity,
+            "read task 不应更新 last_activity"
+        );
+        // read task EOF 后 state 应为 Lost
+        assert_eq!(s2.state, SessionState::Lost);
+
+        // ── 阶段 3: read_output 更新 last_activity ──
+        // Lost 状态下 read_output 仍允许（§4.6 契约 10：disconnect 不销毁 Session）
+        let before_read = now_secs();
+        let _ = session
+            .read_output(ReadOutputParams {
+                since_cursor: Some(0),
+                max_bytes: Some(4096),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // 确保 before_read <= last_activity（touch 在 read_output 内部）
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let s3 = session.summary();
+        print_summary("阶段 3: read_output 后", &s3);
+
+        // read_output 不改变 written（written 是 buffer 写入游标，只在 read task 写时增长）
+        assert_eq!(s3.written, s2.written, "read_output 不应改变 written");
+        // read_output 更新 last_activity
+        assert!(
+            s3.last_activity >= before_read,
+            "read_output 应更新 last_activity, before={}, actual={}",
+            before_read,
+            s3.last_activity
+        );
+
+        // ── 阶段 4: close → Closed ──
+        session.close().await.unwrap();
+        let s4 = session.summary();
+        print_summary("阶段 4: close 后", &s4);
+
+        assert_eq!(s4.state, SessionState::Closed);
+        // close 不改变 written / last_activity
+        assert_eq!(s4.written, s3.written);
+        assert_eq!(s4.last_activity, s3.last_activity);
+
+        // ── 不变量校验：跨阶段不变的字段 ──
+        println!("\n=== 不变量校验 ===");
+        assert_eq!(s4.id, s1.id, "id 跨阶段不变");
+        assert_eq!(s4.host, s1.host, "host 跨阶段不变");
+        assert_eq!(s4.pty_size.rows, s1.pty_size.rows, "pty_size 跨阶段不变");
+        assert_eq!(s4.pty_size.cols, s1.pty_size.cols, "pty_size 跨阶段不变");
+        assert_eq!(s4.created_at, created_at, "created_at 跨阶段不变");
+        assert_eq!(s4.name, None, "name 恒为 None");
+
+        println!("\n=== SessionSummary 字段变化总结 ===");
+        println!("  id:            不变 \"{}\"", s1.id);
+        println!("  host:          不变 \"{}\"", s1.host);
+        println!(
+            "  state:         {:?} → {:?} → {:?} → {:?}",
+            s1.state, s2.state, s3.state, s4.state
+        );
+        println!(
+            "  pty_size:      不变 {}x{}",
+            s1.pty_size.rows, s1.pty_size.cols
+        );
+        println!("  created_at:    不变 {} ms", created_at);
+        println!(
+            "  last_activity: {} → {} → {} → {}",
+            s1.last_activity, s2.last_activity, s3.last_activity, s4.last_activity
+        );
+        println!(
+            "  written:       {} → {} → {} → {}",
+            s1.written, s2.written, s3.written, s4.written
+        );
+        println!("  name:          不变 {:?}", s1.name);
+    }
 }
