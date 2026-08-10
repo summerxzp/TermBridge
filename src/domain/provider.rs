@@ -163,6 +163,10 @@ pub trait TerminalProvider: Send + Sync {
         &self,
         request: OpenTerminalRequest,
     ) -> Result<Arc<dyn TerminalHandle>, TermError>;
+
+    /// 下转 `&self` 为 `&dyn Any`，供 SessionManager 下转到具体 Provider
+    /// 以访问 persistent 特有能力（list_remote_sessions / attach_remote_session）。
+    fn as_any(&self) -> &dyn Any;
 }
 
 /// Terminal Backend 句柄（§4.4）。

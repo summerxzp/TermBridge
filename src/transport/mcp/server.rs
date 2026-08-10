@@ -1,17 +1,20 @@
-//! rmcp MCP server —— 11 工具映射到 application 层（§6 / §7.4 Phase 1-2）
+//! rmcp MCP server —— 14 工具映射到 application 层（§6 / §7.4 Phase 1-2 / Phase 3-B）
 //!
 //! 工具：
-//! 1. `list_hosts`       → HostManager::list_hosts
-//! 2. `open_session`     → SessionManager::open_session
-//! 3. `send_input`       → SessionManager::send_input
-//! 4. `read_output`      → SessionManager::read_output
-//! 5. `send_control`     → SessionManager::send_control
-//! 6. `close_session`    → SessionManager::close_session
-//! 7. `sftp_transfer`    → SessionManager::sftp_transfer（Phase 1，upload/download）
-//! 8. `sftp_mkdir`       → SessionManager::sftp_mkdir（Phase 2）
-//! 9. `sftp_list`        → SessionManager::sftp_list（Phase 2）
-//! 10. `sftp_remove`     → SessionManager::sftp_remove（Phase 2）
-//! 11. `sftp_chmod`      → SessionManager::sftp_chmod（Phase 2）
+//! 1. `list_hosts`            → HostManager::list_hosts
+//! 2. `open_session`          → SessionManager::open_session
+//! 3. `send_input`            → SessionManager::send_input
+//! 4. `read_output`           → SessionManager::read_output
+//! 5. `send_control`          → SessionManager::send_control
+//! 6. `close_session`         → SessionManager::close_session
+//! 7. `sftp_transfer`         → SessionManager::sftp_transfer（Phase 1，upload/download）
+//! 8. `sftp_mkdir`            → SessionManager::sftp_mkdir（Phase 2）
+//! 9. `sftp_list`             → SessionManager::sftp_list（Phase 2）
+//! 10. `sftp_remove`          → SessionManager::sftp_remove（Phase 2）
+//! 11. `sftp_chmod`           → SessionManager::sftp_chmod（Phase 2）
+//! 12. `list_remote_sessions` → SessionManager::list_remote_sessions（Phase 3-B）
+//! 13. `attach_remote_session` → SessionManager::attach_remote_session（Phase 3-B）
+//! 14. `detach_session`       → SessionManager::detach_session（Phase 3-B）
 //!
 //! 错误格式（§6.1）：`CallToolResult::structured_error({code, message, retriable})`
 //! 成功格式：`CallToolResult::structured({工具特定结构})`
@@ -199,6 +202,31 @@ pub struct SftpChmodParams {
     pub mode: String,
 }
 
+/// list_remote_sessions 参数（Phase 3-B）
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ListRemoteSessionsParams {
+    /// SSH host alias (from ~/.ssh/config) or direct hostname/IP
+    pub host: String,
+}
+
+/// attach_remote_session 参数（Phase 3-B）
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct AttachRemoteSessionParams {
+    /// SSH host alias (from ~/.ssh/config) or direct hostname/IP
+    pub host: String,
+    /// Remote session ID (from list_remote_sessions) to attach to
+    pub remote_session_id: String,
+    /// Optional local label for the session (not stored on remote)
+    pub name: Option<String>,
+}
+
+/// detach_session 参数（Phase 3-B）
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct DetachSessionParams {
+    /// Session ID returned by open_session or attach_remote_session
+    pub session_id: String,
+}
+
 // ── 返回类型 ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -263,6 +291,12 @@ struct SftpListResult {
 struct SftpOkResult {
     ok: bool,
     remote_path: String,
+}
+
+/// attach_remote_session 成功返回（Phase 3-B）
+#[derive(Serialize)]
+struct AttachRemoteSessionResult {
+    session_id: String,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -562,6 +596,58 @@ impl TermBridgeServer {
                 ok: true,
                 remote_path: params.remote_path,
             }),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    /// List remote daemon sessions (Phase 3-B).
+    #[tool(description = "List all sessions on the remote daemon (including detached ones). Used to discover persistent sessions across MCP restarts. Requires persistent provider.")]
+    async fn list_remote_sessions(
+        &self,
+        Parameters(params): Parameters<ListRemoteSessionsParams>,
+    ) -> CallToolResult {
+        match self
+            .session_manager
+            .list_remote_sessions(&params.host)
+            .await
+        {
+            Ok(sessions) => ok_result(json!({ "sessions": sessions })),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    /// Attach to a remote session (Phase 3-B).
+    #[tool(description = "Attach to an existing remote daemon session (for cross-restart reconnection). The remote session must have been created by a previous open_session with persistent=true. Returns a new local session_id.")]
+    async fn attach_remote_session(
+        &self,
+        Parameters(params): Parameters<AttachRemoteSessionParams>,
+    ) -> CallToolResult {
+        match self
+            .session_manager
+            .attach_remote_session(
+                &params.host,
+                &params.remote_session_id,
+                params.name,
+            )
+            .await
+        {
+            Ok(session_id) => ok_result(AttachRemoteSessionResult { session_id }),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    /// Detach a session (Phase 3-B).
+    #[tool(description = "Detach a persistent session: keeps the remote PTY alive but releases the local connection. The session can be reconnected later via attach_remote_session. Only persistent sessions support detach.")]
+    async fn detach_session(
+        &self,
+        Parameters(params): Parameters<DetachSessionParams>,
+    ) -> CallToolResult {
+        match self
+            .session_manager
+            .detach_session(&params.session_id)
+            .await
+        {
+            Ok(()) => ok_result(OkResult { ok: true }),
             Err(e) => err_result(&e),
         }
     }

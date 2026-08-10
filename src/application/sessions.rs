@@ -25,6 +25,8 @@ use crate::domain::provider::{
     TransferDirection,
 };
 use crate::domain::session::{Session, SessionId, SessionSummary};
+use crate::infrastructure::daemon_proto::SessionInfo;
+use crate::infrastructure::persistent::{PersistentProvider, PersistentTerminalHandle};
 use crate::infrastructure::ssh::SshTerminalHandle;
 use crate::infrastructure::sshconfig;
 use crate::application::path_policy::PathPolicy;
@@ -457,6 +459,84 @@ impl SessionManager {
         self.sessions.iter().map(|r| r.value().summary()).collect()
     }
 
+    // ── Phase 3-B：跨 MCP 重启重连 ────────────────────────────────
+
+    /// 列出远端 daemon 上的所有 session（含 detached 的）。
+    ///
+    /// 用于跨 MCP 重启后发现之前创建的 persistent session。
+    /// 需要底层 provider 为 PersistentProvider。
+    pub async fn list_remote_sessions(
+        &self,
+        host_alias: &HostName,
+    ) -> Result<Vec<SessionInfo>, TermError> {
+        let host = sshconfig::resolve(host_alias).await?;
+        let provider = self.provider.as_any().downcast_ref::<PersistentProvider>()
+            .ok_or_else(|| TermError::InvalidArgument(
+                "list_remote_sessions requires persistent provider".into()
+            ))?;
+        provider.list_remote_sessions(&host).await
+    }
+
+    /// attach 到远端已有 session，返回新的 client session_id。
+    ///
+    /// 用于跨 MCP 重启后重连到之前创建（可能已 detached）的 persistent session。
+    /// 需要底层 provider 为 PersistentProvider。
+    pub async fn attach_remote_session(
+        &self,
+        host_alias: &HostName,
+        remote_session_id: &str,
+        _name: Option<String>,
+    ) -> Result<SessionId, TermError> {
+        let host = sshconfig::resolve(host_alias).await?;
+        let provider = self.provider.as_any().downcast_ref::<PersistentProvider>()
+            .ok_or_else(|| TermError::InvalidArgument(
+                "attach_remote_session requires persistent provider".into()
+            ))?;
+
+        let handle = provider.attach_remote_session(&host, remote_session_id).await?;
+
+        let id = self.next_session_id();
+        let session = Arc::new(Session::new(
+            id.clone(),
+            host.name.clone(),
+            PtySize::default(),
+            handle,
+        ));
+        self.sessions.insert(id.clone(), session);
+        tracing::info!(
+            session = %id,
+            remote_session_id,
+            host = %host.name,
+            "attach_remote_session: ready"
+        );
+        Ok(id)
+    }
+
+    /// detach session（远端 PTY 保活，本地释放连接，供后续 attach 重连）。
+    ///
+    /// 仅 persistent session 支持 detach；非 persistent handle 返回 InvalidArgument。
+    /// 调用后 session 从本地 map 移除，远端 session 转 Detached。
+    pub async fn detach_session(&self, session_id: &str) -> Result<(), TermError> {
+        let session = self
+            .sessions
+            .remove(session_id)
+            .map(|(_, v)| v)
+            .ok_or_else(|| TermError::SessionNotFound(session_id.to_string()))?;
+
+        let handle = session.handle();
+        let persistent = handle
+            .as_any()
+            .downcast_ref::<PersistentTerminalHandle>()
+            .ok_or_else(|| TermError::InvalidArgument(
+                "session does not support detach (non-persistent handle)".into()
+            ))?;
+
+        persistent.detach().await?;
+        tracing::info!(session = %session_id, "detach_session: detached, remote PTY kept alive");
+        // session drop 时 read_task 被 abort，handle drop 时 daemon 连接关闭
+        Ok(())
+    }
+
     // ── 内部辅助 ──────────────────────────────────────────────────
 
     /// 打开 SFTP channel 并返回 SftpProvider（Phase 2 提取的公共逻辑）。
@@ -674,6 +754,10 @@ mod tests {
             Ok(Arc::new(FakeHandle {
                 chunks: PLMutex::new(vec![Bytes::from_static(b"$ ")]),
             }) as Arc<dyn TerminalHandle>)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 

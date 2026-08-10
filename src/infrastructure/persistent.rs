@@ -51,7 +51,7 @@ use crate::domain::provider::{
 };
 use crate::infrastructure::daemon_proto::{
     self, events, from_value, methods, ControlKey as ProtoControlKey, ErrorDetail, Event,
-    PtySize as ProtoPtySize, ReadResult, Response, BUILD_VERSION, PROTOCOL_VERSION,
+    PtySize as ProtoPtySize, ReadResult, Response, SessionInfo, BUILD_VERSION, PROTOCOL_VERSION,
 };
 use crate::infrastructure::ssh::{SshProvider, SshTerminalHandle};
 
@@ -382,6 +382,16 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// session.list → 返回 daemon 侧所有 session 的信息（含 detached 的）
+    pub async fn session_list(&self) -> Result<Vec<SessionInfo>, TermError> {
+        let result = self.call(methods::SESSION_LIST, serde_json::json!({})).await?;
+        let sessions = result.get("sessions").ok_or_else(|| {
+            TermError::ChannelError("session.list: missing sessions field".into())
+        })?;
+        from_value(sessions)
+            .map_err(|e| TermError::ChannelError(format!("session.list parse: {e}")))
+    }
+
     /// 订阅 pty_data 流。reader task 解码 pty_data 事件的 base64 data 后推入此 channel。
     ///
     /// 返回 `mpsc::Receiver<Bytes>`。daemon 断开时 reader task 清空 subscriber 列表，
@@ -611,6 +621,18 @@ impl PersistentTerminalHandle {
             initial_data: TokioMutex::new(initial_data),
         }
     }
+
+    /// detach：调 daemon.session_detach（远端 PTY 保活），不调 session_close。
+    /// 调用后 handle 应被 drop，daemon 侧 session 转 Detached，供后续 attach 重连。
+    /// 幂等：已 closed/detached 直接返回。
+    pub async fn detach(&self) -> Result<(), TermError> {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.daemon
+            .session_detach(&self.remote_session_id)
+            .await
+    }
 }
 
 #[async_trait]
@@ -789,6 +811,10 @@ impl TerminalProvider for PersistentProvider {
         )) as Arc<dyn TerminalHandle>;
         Ok(handle)
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -799,6 +825,61 @@ impl PersistentProvider {
     /// 远端路径约定（ADR-0004 §2）
     const REMOTE_BIN: &'static str = "~/.local/share/termbridge/termbridge-agentd";
     const REMOTE_VERSION: &'static str = "~/.local/share/termbridge/agentd.version";
+
+    /// 列出远端 daemon 上的所有 session（含 detached 的，用于跨 MCP 重启重连）。
+    ///
+    /// 流程：bootstrap_daemon（幂等）→ connect → session.list。
+    /// daemon drop 时 SSH proxy channel 关闭。
+    pub async fn list_remote_sessions(
+        &self,
+        host: &Host,
+    ) -> Result<Vec<SessionInfo>, TermError> {
+        let socket_path = self.bootstrap_daemon(host).await?;
+        let daemon = DaemonClient::connect(&self.ssh, host, &socket_path).await?;
+        daemon.session_list().await
+    }
+
+    /// attach 到远端已有的 session（跨 MCP 重启重连）。
+    ///
+    /// 流程（复用 open 的 handle 构造逻辑）：
+    /// 1. bootstrap_daemon → connect
+    /// 2. subscribe_pty_data（attach 前订阅，避免 event_pump 启动后漏增量）
+    /// 3. session_attach(remote_session_id, 0) → 初始 buffer 快照
+    /// 4. PersistentTerminalHandle::new
+    ///
+    /// 远端 session 必须已存在（由之前 open_session persistent=true 创建，可能已 detached）。
+    pub async fn attach_remote_session(
+        &self,
+        host: &Host,
+        remote_session_id: &str,
+    ) -> Result<Arc<dyn TerminalHandle>, TermError> {
+        let socket_path = self.bootstrap_daemon(host).await?;
+        let daemon = DaemonClient::connect(&self.ssh, host, &socket_path).await?;
+
+        // 订阅 pty_data（attach 前订阅，确保 event_pump 启动后不漏增量推送）
+        let pty_data_rx = daemon.subscribe_pty_data();
+
+        // attach：启动 daemon 侧 event_pump + 取初始 buffer 快照 [0, cursor_end]
+        let initial = daemon.session_attach(remote_session_id, 0).await?;
+        let initial_data = match BASE64_STANDARD.decode(&initial.data) {
+            Ok(bytes) if !bytes.is_empty() => Some(Bytes::from(bytes)),
+            _ => None,
+        };
+        tracing::info!(
+            remote_session_id,
+            cursor_end = initial.cursor_end,
+            initial_bytes = initial_data.as_ref().map(|b| b.len()).unwrap_or(0),
+            "daemon session re-attached"
+        );
+
+        let handle = Arc::new(PersistentTerminalHandle::new(
+            daemon,
+            remote_session_id.to_string(),
+            pty_data_rx,
+            initial_data,
+        )) as Arc<dyn TerminalHandle>;
+        Ok(handle)
+    }
 
     /// 探测远端 runtime 状态。
     ///

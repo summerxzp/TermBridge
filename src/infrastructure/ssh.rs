@@ -396,6 +396,10 @@ impl TerminalProvider for SshProvider {
         Ok(Arc::new(SshTerminalHandle::new(channel, session, connected.bastions))
             as Arc<dyn TerminalHandle>)
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
