@@ -4,6 +4,7 @@
 - **Date**: 2026-08-09
 - **Phase**: 1
 - **Supersedes**: —
+- **Amended by**: [ADR-0009](0009-bootstrap-host-and-credential-provider.md) §1（"Phase 6 HITL" 具体化为 `CredentialProvider + bootstrap_host`，密码经独立 helper prompt，不进 MCP schema）
 
 ## Context
 
