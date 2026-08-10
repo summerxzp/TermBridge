@@ -159,9 +159,9 @@ status: bootstrapped
 | `authentication_failed` | 密码错误 |
 | `bootstrap_failed` | 公钥已部署但 key 重连验证失败（检查 sshd 配置 / 权限 / SELinux） |
 
-## 工具列表（18 个）
+## 工具列表（19 个）
 
-TermBridge 向 MCP 客户端暴露 18 个工具，按功能分类：
+TermBridge 向 MCP 客户端暴露 19 个工具，按功能分类：
 
 ### Host 管理
 
@@ -175,9 +175,10 @@ TermBridge 向 MCP 客户端暴露 18 个工具，按功能分类：
 |---|---|---|
 | `open_session` | `host`, `persistent?` | 建立 SSH + PTY session，返回 `session_id`。`persistent=true` 启用远端 daemon 跨重启保活 |
 | `send_input` | `session_id`, `data` | 发送文本到 PTY stdin（`\n` 为回车，立即发送不等命令完成） |
-| `read_output` | `session_id`, `wait_for?`/`tail_lines?`/`since_cursor?`, `timeout_secs?` | 读取 PTY 输出，支持 4 种模式：settle / wait_for / tail_lines / since_cursor |
+| `read_output` | `session_id`, `wait_for?`/`tail_lines?`/`since_cursor?`, `timeout_secs?` | 读取 PTY 输出，支持 4 种模式：settle / wait_for / tail_lines / since_cursor。返回含 `session_state` 字段（`ready`/`lost`/`closing`/`closed`），Agent 据此感知断线 |
 | `send_control` | `session_id`, `control_key` | 发送控制键：`ctrl+c` / `ctrl+d` / `ctrl+z` / `tab` / `enter` / `escape` |
 | `close_session` | `session_id` | 关闭 session（幂等），释放 SSH channel |
+| `reconnect_session` | `session_id` | 重连 Lost 状态的 session：重建 SSH + PTY，复用原 session_id。buffer 历史不保留。仅交互式 session 支持（persistent session 用 attach_remote_session） |
 
 ### SFTP 文件操作
 
@@ -300,6 +301,7 @@ daemon 管理 PTY + OutputBuffer（Unix socket 通信）
 | [0007](docs/adr/0007-proxyjump-strategy.md) | ProxyJump Strategy | Accepted |
 | [0008](docs/adr/0008-scope-boundary.md) | Scope Boundary | Accepted |
 | [0009](docs/adr/0009-bootstrap-host-and-credential-provider.md) | bootstrap_host + CredentialProvider | Accepted |
+| [0010](docs/adr/0010-session-reconnect.md) | Session 断线感知 + 手动重连 | Accepted |
 
 ### 项目结构（概览）
 
@@ -328,6 +330,7 @@ TermBridge/
 | Phase 4 | Observability（Timeline） | ✅ 完成 |
 | Phase 5 | Remote Workspace（SFTP 目录递归 + 环境检测） | ✅ 完成 |
 | ADR-0009 | bootstrap_host + CredentialProvider | ✅ 完成 |
+| Phase 6-A | Session 断线感知 + 手动重连（ADR-0010） | ✅ 完成 |
 | 未来 | Local / Docker / WSL Provider | 规划中 |
 
 > **边界声明**（ADR-0008）：TermBridge 是 Remote Terminal Runtime，不是 AI Ops Platform。不负责 config validation / playbook / service orchestration / desired state。编排层属未来独立项目。

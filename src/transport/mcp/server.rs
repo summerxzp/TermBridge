@@ -19,6 +19,7 @@
 //! 16. `sftp_transfer_dir`    → SessionManager::sftp_transfer_dir（Phase 5-A，目录递归）
 //! 17. `detect_remote_env`    → SessionManager::detect_remote_env（Phase 5-B，远端环境检测）
 //! 18. `bootstrap_host`       → BootstrapHost::bootstrap（ADR-0009，首次 SSH key 部署）
+//! 19. `reconnect_session`    → SessionManager::reconnect_session（Phase 6-A，ADR-0010，断线重连）
 //!
 //! 错误格式（§6.1）：`CallToolResult::structured_error({code, message, retriable})`
 //! 成功格式：`CallToolResult::structured({工具特定结构})`
@@ -272,6 +273,13 @@ pub struct BootstrapHostParams {
     pub host: String,
 }
 
+/// reconnect_session 参数（Phase 6-A，ADR-0010）
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ReconnectSessionParams {
+    /// Session ID returned by open_session (must be in Lost state)
+    pub session_id: String,
+}
+
 // ── 返回类型 ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -304,6 +312,10 @@ struct ReadOutputDto {
     matched: bool,
     timed_out: bool,
     mode: String,
+    /// Phase 6-A：session 当前状态，Agent 据此判断是否断线。
+    /// `ready` = 正常；`lost` = 已断开（buffer 仍可读但 PTY 不可写）；
+    /// `closing` / `closed` = 关闭中/已关闭。
+    session_state: String,
 }
 
 /// sftp_transfer 成功返回（Phase 1）
@@ -472,6 +484,11 @@ impl TermBridgeServer {
                     crate::domain::output::ReadMode::WaitFor => "wait_for",
                     crate::domain::output::ReadMode::Settle => "settle",
                 };
+                // Phase 6-A：填充 session_state 供 Agent 感知断线
+                let session_state = self
+                    .session_manager
+                    .session_state(&params.session_id)
+                    .unwrap_or_else(|_| "unknown".to_string());
                 ok_result(ReadOutputDto {
                     output: String::from_utf8_lossy(&r.output).into_owned(),
                     cursor: r.cursor,
@@ -480,6 +497,7 @@ impl TermBridgeServer {
                     matched: r.matched,
                     timed_out: r.timed_out,
                     mode: mode.to_string(),
+                    session_state,
                 })
             }
             Err(e) => err_result(&e),
@@ -809,6 +827,23 @@ impl TermBridgeServer {
         Parameters(params): Parameters<BootstrapHostParams>,
     ) -> CallToolResult {
         match self.bootstrap_host.bootstrap(&params.host).await {
+            Ok(result) => ok_result(result),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    /// Reconnect a lost session (Phase 6-A, ADR-0010).
+    ///
+    /// Re-establishes SSH connection + PTY for a Lost session. Buffer history
+    /// is not preserved (starts fresh). Only works on Lost sessions; calling
+    /// on a Ready/Closing/Closed session returns `not_lost`. If reconnect
+    /// fails, the old session is closed and a new `open_session` is required.
+    #[tool(description = "Reconnect a lost session. Re-establishes SSH connection + PTY. Buffer history is not preserved (starts fresh). Attempts to restore previous working directory via cd. Only works on Lost sessions.")]
+    async fn reconnect_session(
+        &self,
+        Parameters(params): Parameters<ReconnectSessionParams>,
+    ) -> CallToolResult {
+        match self.session_manager.reconnect_session(&params.session_id).await {
             Ok(result) => ok_result(result),
             Err(e) => err_result(&e),
         }

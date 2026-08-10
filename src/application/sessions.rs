@@ -75,6 +75,34 @@ pub struct ToolInfo {
     pub installed: bool,
 }
 
+/// 重连结果（Phase 6-A，ADR-0010）。
+///
+/// Agent 调用 `reconnect_session` 后根据 `status` 字段判断结果：
+/// - `reconnected`：重连成功，session_id 可继续使用（buffer 从新开始）
+/// - `not_lost`：session 非 Lost 状态，无需重连
+/// - `failed`：重连失败（旧 session 已 close，需 open_session 新建）
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ReconnectResult {
+    /// 重连成功
+    Reconnected {
+        session_id: String,
+        host: String,
+        /// 是否恢复了工作目录（MVP 恒为 false，ADR-0010 §5）
+        cwd_restored: bool,
+    },
+    /// session 非 Lost 状态
+    NotLost {
+        session_id: String,
+        current_state: String,
+    },
+    /// 重连失败
+    Failed {
+        session_id: String,
+        reason: String,
+    },
+}
+
 /// SessionManager：管理所有活跃 Session。
 ///
 /// 持有 `Arc<dyn TerminalProvider>`（通常是 `SshProvider`），
@@ -695,6 +723,136 @@ impl SessionManager {
         Ok(())
     }
 
+    // ── Phase 6-A：断线感知 + 手动重连 ────────────────────────────
+
+    /// 查询 session 当前状态（ADR-0010）。
+    ///
+    /// 供 Agent 通过 read_output 返回的 `session_state` 字段外的独立查询。
+    /// 返回小写字符串：`ready` / `closing` / `closed` / `lost`。
+    pub fn session_state(&self, session_id: &str) -> Result<String, TermError> {
+        let session = self.get_session(session_id)?;
+        Ok(format!("{:?}", session.state()).to_lowercase())
+    }
+
+    /// 重连 Lost session（ADR-0010）。
+    ///
+    /// 流程：
+    /// 1. 取出旧 session，检查 state == Lost
+    /// 2. 记录 host + pty_size
+    /// 3. close 旧 session（清理 handle + read task）
+    /// 4. provider.open() 新建 handle
+    /// 5. 新建 Session（新 buffer），复用旧 session_id
+    /// 6. DashMap.insert 替换
+    ///
+    /// **约束**：
+    /// - 仅交互式 session（persistent=false）支持重连
+    /// - buffer 历史不保留（从新开始）
+    /// - 不恢复 shell 状态（cwd/env/history）
+    /// - 重连失败后旧 session 已 close，需 open_session 新建
+    pub async fn reconnect_session(
+        &self,
+        session_id: &str,
+    ) -> Result<ReconnectResult, TermError> {
+        tracing::info!(session = %session_id, "reconnect_session: starting");
+
+        // 1. 取出旧 session
+        let old_session = self.get_session(session_id)?;
+
+        // 2. 检查 state（仅 Lost 允许重连）
+        let current_state = old_session.state();
+        if current_state != crate::domain::session::SessionState::Lost {
+            tracing::info!(
+                session = %session_id,
+                state = ?current_state,
+                "reconnect_session: not lost, skipping"
+            );
+            return Ok(ReconnectResult::NotLost {
+                session_id: session_id.to_string(),
+                current_state: format!("{:?}", current_state).to_lowercase(),
+            });
+        }
+
+        // 3. 记录 host + pty_size（close 前取出，close 后 session 不可用）
+        let host_name = old_session.host().to_string();
+        let pty_size = old_session.pty_size();
+        let session_id_owned = session_id.to_string();
+
+        // 4. close 旧 session（清理 handle + abort read task）
+        //    注意：close 后旧 session 仍在 DashMap 中（state=Closed），
+        //    我们用 insert 覆盖它。
+        if let Err(e) = old_session.close().await {
+            tracing::warn!(
+                session = %session_id,
+                error = %e,
+                "reconnect_session: old session close failed (continuing)"
+            );
+        }
+
+        // 5. 重新解析 ssh config
+        let host = match sshconfig::resolve(&host_name).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(
+                    session = %session_id,
+                    error = %e,
+                    "reconnect_session: ssh config resolve failed"
+                );
+                return Ok(ReconnectResult::Failed {
+                    session_id: session_id_owned,
+                    reason: format!("ssh config resolve: {e}"),
+                });
+            }
+        };
+
+        // 6. provider.open 新建 handle（交互式 session，persistent=false）
+        let handle = match self
+            .provider
+            .open(OpenTerminalRequest {
+                host: host.clone(),
+                pty_size,
+                persistent: false,
+                name: None,
+            })
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::warn!(
+                    session = %session_id,
+                    error = %e,
+                    "reconnect_session: provider.open failed"
+                );
+                return Ok(ReconnectResult::Failed {
+                    session_id: session_id_owned,
+                    reason: format!("{e}"),
+                });
+            }
+        };
+
+        // 7. 新建 Session，复用旧 session_id（新 buffer）
+        let new_session = Arc::new(Session::new(
+            session_id_owned.clone(),
+            host.name.clone(),
+            pty_size,
+            handle,
+        ));
+
+        // 8. 替换 DashMap entry
+        self.sessions.insert(session_id_owned.clone(), new_session);
+
+        tracing::info!(
+            session = %session_id,
+            host = %host.name,
+            "reconnect_session: reconnected"
+        );
+
+        Ok(ReconnectResult::Reconnected {
+            session_id: session_id_owned,
+            host: host.name,
+            cwd_restored: false, // MVP 不恢复 cwd（ADR-0010 §5）
+        })
+    }
+
     // ── 内部辅助 ──────────────────────────────────────────────────
 
     /// 打开 SFTP channel 并返回 SftpProvider（Phase 2 提取的公共逻辑）。
@@ -731,16 +889,17 @@ impl SessionManager {
     }
 
     /// 当 send_input / read_output / send_control 返回 SessionClosed 时，
-    /// 若 session 状态为 Lost/Closed（is_detached），从 map 移除防泄漏。
+    /// 若 session 状态为 Closed，从 map 移除防泄漏。
     ///
-    /// Phase 1 MVP：不自动重连（Phase 3 Persistent Session 再做），
-    /// 仅记录 WARN 日志提示 agent 应通过 open_session 重新打开。
+    /// **ADR-0010 修正**：Lost session 不在此移除——保留供 `reconnect_session`
+    /// 恢复。Lost session 的兜底清理由 idleReaper（30min 超时）负责。
+    /// 仅 Closed（已显式关闭，不可恢复）立即移除。
     fn cleanup_detached_session(&self, session_id: &str, session: &Arc<Session>) {
-        if session.state().is_detached() {
+        if session.state().is_closed() {
             tracing::warn!(
                 session = %session_id,
                 state = ?session.state(),
-                "session lost/closed, removing from map; agent should reopen via open_session"
+                "session closed, removing from map"
             );
             self.sessions.remove(session_id);
         }
@@ -1250,10 +1409,12 @@ mod tests {
         .expect("并发读写不应死锁");
     }
 
-    // ── Phase 1：Lost session 清理测试 ──────────────────────────────
+    // ── Phase 1 / Phase 6-A：session 清理测试 ──────────────────────
 
+    /// ADR-0010：Lost session 不被 send_input 移除，保留供 reconnect_session 恢复。
+    /// Lost session 的兜底清理由 idleReaper（30min 超时）负责。
     #[tokio::test]
-    async fn cleanup_detached_session_removes_lost_from_map() {
+    async fn cleanup_detached_session_preserves_lost_for_reconnect() {
         let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
 
         // 手动构造一个 Lost session 插入 map（FakeHandle 立即 EOF → read task 退出 → Lost）
@@ -1264,15 +1425,176 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_eq!(session.state(), SessionState::Lost);
 
-        // send_input 应返回 SessionClosed，且从 map 移除
+        // send_input 应返回 SessionClosed
         let err = mgr.send_input("sess_lost", b"ls\n").await.unwrap_err();
         assert_eq!(err.code(), "SESSION_CLOSED");
 
-        // map 中应已移除
+        // ADR-0010：Lost session 应保留在 map 中供 reconnect
         assert!(
-            !mgr.sessions.contains_key("sess_lost"),
-            "Lost session 应从 map 移除"
+            mgr.sessions.contains_key("sess_lost"),
+            "Lost session 应保留在 map 供 reconnect_session 恢复"
         );
+    }
+
+    /// Closed session（已显式关闭，不可恢复）应被 send_input 移除防泄漏。
+    #[tokio::test]
+    async fn cleanup_detached_session_removes_closed_from_map() {
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+
+        // 构造 session → 等 Lost → close() → Closed
+        let session = make_fake_session("sess_closed");
+        mgr.sessions.insert("sess_closed".into(), session.clone());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(session.state(), SessionState::Lost);
+        session.close().await.unwrap();
+        assert_eq!(session.state(), SessionState::Closed);
+
+        // send_input 应返回 SessionClosed，且从 map 移除（Closed 不可恢复）
+        let err = mgr.send_input("sess_closed", b"ls\n").await.unwrap_err();
+        assert_eq!(err.code(), "SESSION_CLOSED");
+        assert!(
+            !mgr.sessions.contains_key("sess_closed"),
+            "Closed session 应从 map 移除防泄漏"
+        );
+    }
+
+    // ── Phase 6-B：Lost 状态边界行为测试（ADR-0010 §4.6 契约 10） ──────
+
+    /// FakeHandle 变体：read 永不返回（read task 挂起，session 保持 Ready）。
+    /// 用于测试非 Lost 状态下的行为（如 reconnect 返回 NotLost）。
+    struct FakeHandleNeverEof;
+
+    #[async_trait]
+    impl TerminalHandle for FakeHandleNeverEof {
+        async fn read(&self) -> Result<Option<Bytes>, TermError> {
+            std::future::pending().await
+        }
+        async fn write(&self, _data: &[u8]) -> Result<(), TermError> {
+            Ok(())
+        }
+        async fn send_control(&self, _c: ControlKey) -> Result<(), TermError> {
+            Ok(())
+        }
+        async fn resize(&self, _size: PtySize) -> Result<(), TermError> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), TermError> {
+            Ok(())
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// 构造一个已进入 Lost 状态的 session 并插入 mgr，返回 session_id。
+    /// chunks 会被 read task 消费完，然后 read 返回 None → Lost（§4.6 契约 10）。
+    async fn make_lost_session(mgr: &SessionManager, chunks: Vec<Bytes>) -> String {
+        let id = mgr.next_session_id();
+        let handle = Arc::new(FakeHandle {
+            chunks: PLMutex::new(chunks),
+        }) as Arc<dyn TerminalHandle>;
+        let session = Arc::new(Session::new(
+            id.clone(),
+            "testhost".into(),
+            PtySize::default(),
+            handle,
+        ));
+        mgr.sessions.insert(id.clone(), session.clone());
+        // 等 read task 消费完 chunks 并 EOF → Lost
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(session.state(), SessionState::Lost, "session 应进入 Lost 状态");
+        id
+    }
+
+    /// 契约 10：Session 进入 Lost 后，buffer 仍可读（disconnect 不销毁 Session）。
+    #[tokio::test]
+    async fn lost_state_buffer_still_readable() {
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let id = make_lost_session(
+            &mgr,
+            vec![Bytes::from_static(b"hello lost session\n")],
+        )
+        .await;
+
+        let result = mgr
+            .read_output(
+                &id,
+                ReadOutputParams {
+                    since_cursor: Some(0),
+                    max_bytes: Some(4096),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Lost 状态 read_output 应成功");
+        assert!(
+            !result.output.is_empty(),
+            "Lost 状态 buffer 应仍有数据可读"
+        );
+    }
+
+    /// Lost 状态下 send_input 返回 SESSION_CLOSED（连接已断，不可写）。
+    #[tokio::test]
+    async fn lost_state_send_input_returns_session_closed() {
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let id = make_lost_session(&mgr, vec![Bytes::from_static(b"$ ")]).await;
+
+        let err = mgr.send_input(&id, b"ls\n").await.unwrap_err();
+        assert_eq!(err.code(), "SESSION_CLOSED");
+    }
+
+    /// Lost 状态下 send_control 返回 SESSION_CLOSED（连接已断，不可写）。
+    #[tokio::test]
+    async fn lost_state_send_control_returns_session_closed() {
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let id = make_lost_session(&mgr, vec![Bytes::from_static(b"$ ")]).await;
+
+        let err = mgr.send_control(&id, ControlKey::CtrlC).await.unwrap_err();
+        assert_eq!(err.code(), "SESSION_CLOSED");
+    }
+
+    /// Lost 状态下 close_session 幂等：首次成功（Lost → Closed），再次 SESSION_NOT_FOUND。
+    #[tokio::test]
+    async fn close_session_on_lost_state_is_idempotent() {
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let id = make_lost_session(&mgr, vec![Bytes::from_static(b"$ ")]).await;
+
+        // 首次 close：Lost → Closed，从 map 移除
+        mgr.close_session(&id)
+            .await
+            .expect("Lost 状态 close_session 应成功");
+
+        // 再次 close：已从 map 移除 → SESSION_NOT_FOUND
+        let err = mgr.close_session(&id).await.unwrap_err();
+        assert_eq!(err.code(), "SESSION_NOT_FOUND");
+    }
+
+    /// 非 Lost 状态调 reconnect_session 返回 NotLost（current_state="ready"）。
+    #[tokio::test]
+    async fn reconnect_on_non_lost_returns_not_lost() {
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let id = mgr.next_session_id();
+        let handle = Arc::new(FakeHandleNeverEof) as Arc<dyn TerminalHandle>;
+        let session = Arc::new(Session::new(
+            id.clone(),
+            "testhost".into(),
+            PtySize::default(),
+            handle,
+        ));
+        mgr.sessions.insert(id.clone(), session.clone());
+        assert_eq!(session.state(), SessionState::Ready);
+
+        let result = mgr.reconnect_session(&id).await.unwrap();
+        match result {
+            ReconnectResult::NotLost {
+                session_id,
+                current_state,
+            } => {
+                assert_eq!(session_id, id);
+                assert_eq!(current_state, "ready");
+            }
+            other => panic!("期望 NotLost，实际: {:?}", other),
+        }
     }
 
     // ── Phase 2：Policy 集成测试 ─────────────────────────────────────
