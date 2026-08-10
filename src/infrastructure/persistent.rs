@@ -244,7 +244,10 @@ impl DaemonClient {
             }
             Err(_) => {
                 self.inner.pending.lock().remove(&id);
-                return Err(TermError::OperationTimeout);
+                return Err(TermError::OperationTimeout {
+                    operation: method.to_string(),
+                    session_id: None,
+                });
             }
         };
 

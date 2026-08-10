@@ -189,6 +189,10 @@ impl SessionManager {
         session_id: &str,
         data: &[u8],
     ) -> Result<(), TermError> {
+        // Phase 4-B：tracing（debug 级别，截断长命令 + 转义换行，避免日志爆炸）
+        let data_display = truncate_for_log(data, 200);
+        tracing::debug!(session = %session_id, input = %data_display, "send_input");
+
         // Phase 2：Policy 拦截（PLAN.md §8）
         // 字节按 UTF-8 lossy 转字符串供 Policy 文本检查（best-effort）
         let data_str = String::from_utf8_lossy(data).into_owned();
@@ -216,6 +220,9 @@ impl SessionManager {
         session_id: &str,
         params: ReadOutputParams,
     ) -> Result<ReadOutputResult, TermError> {
+        // Phase 4-B：tracing（debug 级别，记录读取模式）
+        let mode = read_mode_name(&params);
+        tracing::debug!(session = %session_id, mode = %mode, "read_output");
         let session = self.get_session(session_id)?;
         match session.read_output(params).await {
             Ok(r) => Ok(r),
@@ -233,6 +240,8 @@ impl SessionManager {
         session_id: &str,
         key: ControlKey,
     ) -> Result<(), TermError> {
+        // Phase 4-B：tracing（info 级别，低频重要操作）
+        tracing::info!(session = %session_id, control = ?key, "send_control");
         let session = self.get_session(session_id)?;
         match session.send_control(key).await {
             Ok(()) => Ok(()),
@@ -247,6 +256,8 @@ impl SessionManager {
     /// 关闭 Session（§4.6 契约 9：Session close 才结束远端 shell）。
     /// 幂等：已关闭的 session 直接移除并返回 Ok。
     pub async fn close_session(&self, session_id: &str) -> Result<(), TermError> {
+        // Phase 4-B：tracing（info 级别，低频重要操作）
+        tracing::info!(session = %session_id, "close_session");
         // DashMap::remove 返回 Option<(K, V)>，取 value
         let session = self
             .sessions
@@ -501,6 +512,8 @@ impl SessionManager {
         remote_session_id: &str,
         _name: Option<String>,
     ) -> Result<SessionId, TermError> {
+        // Phase 4-B：tracing（info 级别，低频重要操作）
+        tracing::info!(host = %host_alias, remote_session_id, "attach_remote_session");
         let host = sshconfig::resolve(host_alias).await?;
         let provider = self.provider.as_any().downcast_ref::<PersistentProvider>()
             .ok_or_else(|| TermError::InvalidArgument(
@@ -531,6 +544,8 @@ impl SessionManager {
     /// 仅 persistent session 支持 detach；非 persistent handle 返回 InvalidArgument。
     /// 调用后 session 从本地 map 移除，远端 session 转 Detached。
     pub async fn detach_session(&self, session_id: &str) -> Result<(), TermError> {
+        // Phase 4-B：tracing（info 级别，低频重要操作）
+        tracing::info!(session = %session_id, "detach_session");
         let session = self
             .sessions
             .remove(session_id)
@@ -741,6 +756,39 @@ fn policy_reason(action: &Action, status: &str) -> String {
         Action::SftpChmod { remote, mode } => {
             format!("sftp chmod {mode} {status}: {remote}")
         }
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Phase 4-B：tracing 辅助
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 将输入字节按 UTF-8 lossy 转字符串，截断到 `max_chars` 字符并转义换行，
+/// 供 send_input 的 debug tracing 使用（防止日志爆炸）。
+fn truncate_for_log(data: &[u8], max_chars: usize) -> String {
+    let s = String::from_utf8_lossy(data);
+    let mut out: String = if s.chars().count() > max_chars {
+        let mut t: String = s.chars().take(max_chars).collect();
+        t.push_str("...");
+        t
+    } else {
+        s.into_owned()
+    };
+    out = out.replace('\n', "\\n").replace('\r', "\\r");
+    out
+}
+
+/// 从 ReadOutputParams 提取模式名（与 OutputEngine 优先级一致：
+/// since_cursor > tail_lines > wait_for > 默认 settle）。
+fn read_mode_name(params: &ReadOutputParams) -> &'static str {
+    if params.since_cursor.is_some() {
+        "since_cursor"
+    } else if params.tail_lines.is_some() {
+        "tail"
+    } else if params.wait_for.is_some() {
+        "wait_for"
+    } else {
+        "settle"
     }
 }
 

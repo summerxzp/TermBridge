@@ -234,8 +234,14 @@ pub enum TermError {
     #[error("session already closed: {0}")]
     SessionClosed(String),
 
-    #[error("operation timed out")]
-    OperationTimeout,
+    /// 操作超时（Phase 4-B：携带上下文，便于排障定位是哪个操作 / 哪个 session）。
+    #[error("operation timeout: {operation} (session: {session_id:?})")]
+    OperationTimeout {
+        /// 哪个操作超时（如 "read_output", "wait_for", "session.attach"）
+        operation: String,
+        /// 哪个 session（如果没有上下文则为 None）
+        session_id: Option<String>,
+    },
 
     /// Host key 校验失败（Phase 1，§5.5）。
     /// 携带拒绝原因（key 不匹配 / host 未知 / known_hosts 读取失败等）。
@@ -322,7 +328,7 @@ impl TermError {
             Self::SessionNotFound(_) => "SESSION_NOT_FOUND",
             Self::SessionClosed(_) => "SESSION_CLOSED",
             Self::ConnectFailed(_) => "CONNECT_FAILED",
-            Self::OperationTimeout => "OPERATION_TIMEOUT",
+            Self::OperationTimeout { .. } => "OPERATION_TIMEOUT",
             Self::ChannelError(_) => "CONNECT_FAILED",
             Self::HostKeyRejected(_) => "HOST_KEY_REJECTED",
             Self::InvalidArgument(_) => "INVALID_ARGUMENT",
@@ -359,7 +365,7 @@ impl TermError {
             | Self::DaemonProtocolMismatch { .. }
             | Self::RuntimeDeployFailed(_) => false,
             Self::ConnectFailed(_)
-            | Self::OperationTimeout
+            | Self::OperationTimeout { .. }
             | Self::ChannelError(_)
             | Self::SftpError(_)
             | Self::RuntimeMissing(_)

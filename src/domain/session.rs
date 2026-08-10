@@ -34,6 +34,14 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// 获取当前 Unix 时间戳（毫秒）。系统时钟异常时返回 0。
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // SessionId / SessionState
 // ───────────────────────────────────────────────────────────────────────────
@@ -97,6 +105,8 @@ pub struct Session {
     last_activity: AtomicU64,
     /// 执行事件时间线（Phase 4-A）。记录命令/输出/控制/状态事件元数据。
     timeline: Timeline,
+    /// Session 创建时间（Unix 毫秒，Phase 4-B）。
+    created_at: u64,
 }
 
 impl Session {
@@ -160,6 +170,7 @@ impl Session {
             read_task: Mutex::new(Some(read_task)),
             last_activity: AtomicU64::new(now_secs()),
             timeline,
+            created_at: now_millis(),
         }
     }
 
@@ -182,6 +193,11 @@ impl Session {
     /// 最近一次活动时间（Unix 秒）。
     pub fn last_activity(&self) -> u64 {
         self.last_activity.load(Ordering::Relaxed)
+    }
+
+    /// Session 创建时间（Unix 毫秒，Phase 4-B）。
+    pub fn created_at(&self) -> u64 {
+        self.created_at
     }
 
     /// 是否空闲超过 `threshold_secs` 秒。供 idleReaper 判定（§7.4 Phase 1）。
@@ -310,6 +326,14 @@ pub struct SessionSummary {
     pub host: HostName,
     pub state: SessionState,
     pub pty_size: PtySize,
+    /// Session 创建时间（Unix 毫秒，Phase 4-B）。
+    pub created_at: u64,
+    /// 最近一次活动时间（Unix 秒，Phase 4-B 复用 last_activity 字段）。
+    pub last_activity: u64,
+    /// OutputEngine 当前 written cursor（Phase 4-B）。
+    pub written: u64,
+    /// Session 名称（Phase 4-B：client 侧 Session 暂无 name 字段，恒为 None）。
+    pub name: Option<String>,
 }
 
 impl Session {
@@ -319,6 +343,10 @@ impl Session {
             host: self.host.clone(),
             state: self.state(),
             pty_size: self.pty_size,
+            created_at: self.created_at,
+            last_activity: self.last_activity.load(Ordering::Relaxed),
+            written: self.output.buffer().written(),
+            name: None,
         }
     }
 }
