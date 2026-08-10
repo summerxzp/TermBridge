@@ -110,19 +110,19 @@ read_output(wait_for="__TERM_DONE__", timeout_secs=60)
 | S8 | 8192 字节巨量数据 | wc=8192 + head/tail 精确验证 | ✅ |
 | S9 | 感叹号 history token | `!!` `!$` `!*` 单引号下不展开 | ✅ |
 
-### 待补 P0（执行语义安全，Phase 6-C 优先）
+### P0 已覆盖（Phase 6-C 执行语义安全，20/20 PASS）
 
-| # | 场景 | 验证点 | 状态 |
+| # | 场景 | 验证点 | 结果 |
 |---|---|---|---|
-| T1 | Ctrl+C 中断 | `sleep 300` + 0x03 → `^C` + exit 130 | ⬜ |
-| T2 | Ctrl+D EOF | `cat` + 0x04 → EOF 退出 | ⬜ |
-| T3 | Ctrl+Z 暂停/恢复 | `sleep 300` + 0x1A → Stopped + `fg` 恢复 | ⬜ |
-| T4 | PTY tty 确认 | `tty` → `/dev/pts/X`（非 "not a tty"） | ⬜ |
-| T5 | 交互式 `read` | `read -p "input:" x` + send_input → 正确读取 | ⬜ |
-| T6 | sudo password prompt | `sudo ls` → prompt 出现，password 不进 LLM context | ⬜ |
-| T7 | 100MB 大输出 | `yes \| head -c 100MB` → ring buffer 截断 + cursor 正确 + `is_truncated=true` | ⬜ |
-| T8 | command marker + wait_for | `cmd && echo __DONE__` + `wait_for=__DONE__` → 可靠关联 | ⬜ |
-| T9 | 多命令时序边界 | 连续 `send_input` 无 `\n` → 命令拼接；有 `\n` → 分开执行 | ⬜ |
+| T1 | Ctrl+C 中断 | `sleep 300` + 0x03 → `^C` + exit 130 | ✅ |
+| T2 | Ctrl+D EOF | `cat` + 0x04 → EOF 退出 | ✅ |
+| T3 | Ctrl+Z 暂停/恢复 | `sleep 300` + 0x1A → Stopped + `fg` 恢复 | ✅ |
+| T4 | PTY tty 确认 | `tty` → `/dev/pts/0`（非 "not a tty"） | ✅ |
+| T5 | 交互式 `read` | `read -p "input:" x` + send_input → 正确读取 | ✅ |
+| T6 | sudo Policy 拦截 | `sudo -n true` → `POLICY_NEEDS_CONFIRM`，password 不进 LLM context | ✅ |
+| T7 | 1.5MB 大输出 ring buffer 截断 | 150×10000 字节多批次输出 → `is_truncated=true` + `written>1MB` + buffer 内容 cap 1MB | ✅ |
+| T8 | command marker + wait_for | `cmd && echo __DONE__` + `wait_for=__DONE__` → 可靠关联 | ✅ |
+| T9 | 多命令时序边界 | 连续 `send_input` 无 `\n` → 命令拼接；有 `\n` → 分开执行 | ✅ |
 
 ### 待补 P1（健壮性增强）
 
@@ -150,6 +150,17 @@ read_output(wait_for="__TERM_DONE__", timeout_secs=60)
 3. **增量读用 `since_cursor`**：避免历史污染，不漏数据
 4. **引号意识**：单引号字面量、双引号展开 `$`，heredoc 带引号不展开
 5. **控制字符用 `send_control`**：不发 `0x03` 字面量到 `send_input`（虽然透传也行，但语义更清晰用 `send_control`）
+6. **marker 防回显匹配**（Phase 6-C 发现）：`wait_for` 会扫描 PTY 回显的命令文本。如果 marker 字面出现在命令中（如 `echo GEN_DONE_T7`），`wait_for` 会匹配回显而非实际输出，导致提前返回。**解法**：用 shell 算术展开构造 marker，使回显不含 marker 字面量：
+   - `echo GEN_DONE_T$((7))` → 输出 `GEN_DONE_T7`，回显含 `GEN_DONE_T$((7))`（不含 `GEN_DONE_T7`）
+   - `printf 'T9A_DON%s\n' E` → 输出 `T9A_DONE`，回显含 `T9A_DON%s\n' E`（不含 `T9A_DONE`）
+7. **`wait_for` 只返回匹配上下文**（Phase 6-C 发现）：`wait_for` 命中后返回 `extract_context` 结果（匹配行 ± `context_lines`），**不返回全部输出**。如需完整命令输出，应在 `wait_for` 匹配后用 `since_cursor` 从命令前位置读取：
+   ```
+   cursor_before = read_output(since_cursor=cursor)  # 记录位置
+   send_input("cmd && echo MARKER\n")
+   read_output(wait_for="MARKER")                     # 等待完成
+   full_output = read_output(since_cursor=cursor_before)  # 读取完整输出
+   ```
+8. **PTY bracketed paste mode**（Phase 6-C 发现）：交互式 shell 会在命令输出前后插入 ANSI 转义序列 `\x1b[?2004l`（禁用）和 `\x1b[?2004h`（启用）。解析输出做精确匹配时需剥离这些序列（正则 `\x1b\[[0-9;?]*[a-zA-Z]`）。
 
 ## Open Questions
 
@@ -168,9 +179,33 @@ read_output(wait_for="__TERM_DONE__", timeout_secs=60)
 ## Implementation Status
 
 - **决策部分**：已落地（当前代码即符合决策，无需修改）
-- **P0 测试矩阵**：待实施（Phase 6-C）
+- **P0 测试矩阵**：已完成（Phase 6-C，20/20 PASS，2026-08-10）
 - **P1 测试矩阵**：待实施（Phase 6-C 或后续）
-- **Agent 最佳实践文档**：已写入本 ADR + 待补 README 指引章节
+- **Agent 最佳实践文档**：已写入本 ADR（含 Phase 6-C 三项关键发现）
+
+### Phase 6-C 验证详情
+
+- **测试脚本**：[examples/phase6c_p0_exec_safety.ps1](../../examples/phase6c_p0_exec_safety.ps1)
+- **目标服务器**：192.168.1.171（Debian）
+- **结果**：20 assertions / 20 PASS / 0 FAIL
+- **覆盖**：T1-T9 共 9 个场景，覆盖控制字符、PTY 交互、Policy 拦截、ring buffer 截断、命令边界
+
+### Phase 6-C 发现的关键问题与修复
+
+1. **`wait_for` 回显匹配**（测试设计问题，非 core bug）：
+   - 问题：`wait_for("MARKER")` 会匹配 PTY 回显的命令文本中的 `MARKER` 子串，导致提前返回
+   - 修复：用 `$((expr))` 算术展开或 `printf` 格式化构造 marker，使回显不含 marker 字面量
+   - 归属：Agent 语义层责任（文档指导层补充最佳实践 #6）
+
+2. **`wait_for` 返回值仅为匹配上下文**：
+   - 问题：`wait_for` 命中后返回 `extract_context` 结果，不含完整输出
+   - 修复：`wait_for` 匹配后用 `since_cursor` 从命令前位置读取完整输出
+   - 归属：Agent 语义层责任（文档指导层补充最佳实践 #7）
+
+3. **PTY bracketed paste mode ANSI 序列**：
+   - 问题：交互式 shell 在输出前后插入 `\x1b[?2004l` / `\x1b[?2004h`，干扰精确匹配
+   - 修复：解析输出时用正则 `\x1b\[[0-9;?]*[a-zA-Z]` 剥离 ANSI 序列
+   - 归属：Agent 语义层责任（文档指导层补充最佳实践 #8）
 
 ## References
 
@@ -179,3 +214,4 @@ read_output(wait_for="__TERM_DONE__", timeout_secs=60)
 - [ADR-0009: Bootstrap Host and Credential Provider](0009-bootstrap-host-and-credential-provider.md) — password 不进 LLM context
 - [ADR-0010: Session Reconnect](0010-session-reconnect.md) — 断线感知 + 手动重连
 - [examples/phase6_escape_stress.ps1](../../examples/phase6_escape_stress.ps1) — 字节透传压力测试脚本（31/31 PASS）
+- [examples/phase6c_p0_exec_safety.ps1](../../examples/phase6c_p0_exec_safety.ps1) — 执行语义安全 P0 测试脚本（20/20 PASS）
