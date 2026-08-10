@@ -25,6 +25,7 @@ use crate::domain::provider::{
     TransferDirection,
 };
 use crate::domain::session::{Session, SessionId, SessionSummary};
+use crate::domain::timeline::TimelineEvent;
 use crate::infrastructure::daemon_proto::SessionInfo;
 use crate::infrastructure::persistent::{PersistentProvider, PersistentTerminalHandle};
 use crate::infrastructure::ssh::SshTerminalHandle;
@@ -457,6 +458,19 @@ impl SessionManager {
     /// 列出所有 Session 摘要。
     pub fn list_sessions(&self) -> Vec<SessionSummary> {
         self.sessions.iter().map(|r| r.value().summary()).collect()
+    }
+
+    /// 返回 session 的 timeline 事件（最近 limit 条，Phase 4-A）。
+    ///
+    /// 用于排障和 AI 上下文：结构化展示"发了什么命令→返回什么输出→发了什么控制键"。
+    /// `limit=None` 返回全部（受 timeline 环形淘汰上限约束，默认 1000 条）。
+    pub fn get_session_timeline(
+        &self,
+        session_id: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<TimelineEvent>, TermError> {
+        let session = self.get_session(session_id)?;
+        Ok(session.timeline().events(limit))
     }
 
     // ── Phase 3-B：跨 MCP 重启重连 ────────────────────────────────

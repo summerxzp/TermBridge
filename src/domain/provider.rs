@@ -120,6 +120,18 @@ impl ControlKey {
             _ => None,
         }
     }
+
+    /// ControlKey → 规范字符串名（`from_name` 的逆映射，timeline 记录用）
+    pub fn as_name(&self) -> &'static str {
+        match self {
+            Self::CtrlC => "ctrl+c",
+            Self::CtrlD => "ctrl+d",
+            Self::CtrlZ => "ctrl+z",
+            Self::Tab => "tab",
+            Self::Enter => "enter",
+            Self::Escape => "escape",
+        }
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────

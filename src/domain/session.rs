@@ -24,6 +24,7 @@ use tokio::task::JoinHandle;
 
 use super::output::{OutputEngine, ReadOutputParams, ReadOutputResult, DEFAULT_BUFFER_SIZE};
 use super::provider::{ControlKey, HostName, PtySize, TerminalHandle, TermError};
+use super::timeline::Timeline;
 
 /// 获取当前 Unix 时间戳（秒）。系统时钟异常时返回 0。
 fn now_secs() -> u64 {
@@ -94,6 +95,8 @@ pub struct Session {
     /// 最近一次活动时间（Unix 秒）。send_input / read_output / send_control 调用时更新。
     /// idleReaper 据此判定是否空闲超时（§7.4 Phase 1）。
     last_activity: AtomicU64,
+    /// 执行事件时间线（Phase 4-A）。记录命令/输出/控制/状态事件元数据。
+    timeline: Timeline,
 }
 
 impl Session {
@@ -110,6 +113,11 @@ impl Session {
         let state = Arc::new(Mutex::new(SessionState::Ready));
         let buffer = output.buffer().clone();
 
+        // Phase 4-A：初始化 timeline，记录 Creating→Ready 转换
+        let timeline = Timeline::new();
+        timeline.record_state_change("creating", "ready");
+        let read_timeline = timeline.clone();
+
         // spawn PTY read task：handle.read() → output.buffer().write()
         let read_handle = Arc::clone(&handle);
         let read_state = Arc::clone(&state);
@@ -117,7 +125,13 @@ impl Session {
         let read_task = tokio::spawn(async move {
             loop {
                 match read_handle.read().await {
-                    Ok(Some(data)) => buffer.write(&data),
+                    Ok(Some(data)) => {
+                        // Phase 4-A：记录 output 事件（write 前后 cursor + bytes）
+                        let cursor_start = buffer.written();
+                        buffer.write(&data);
+                        let cursor_end = buffer.written();
+                        read_timeline.record_output(cursor_start, cursor_end, data.len());
+                    }
                     Ok(None) => {
                         tracing::info!(session=%read_id, "pty read task: EOF");
                         break;
@@ -145,6 +159,7 @@ impl Session {
             handle,
             read_task: Mutex::new(Some(read_task)),
             last_activity: AtomicU64::new(now_secs()),
+            timeline,
         }
     }
 
@@ -193,6 +208,11 @@ impl Session {
         &self.handle
     }
 
+    /// 返回执行事件时间线引用（Phase 4-A）。
+    pub fn timeline(&self) -> &Timeline {
+        &self.timeline
+    }
+
     /// 读取输出（§5.3 三模式 + §4.6 契约 3/4/5/11）。
     ///
     /// 仅 `Closed` 拒绝；`Lost` 仍可读 buffer 剩余数据（§4.6 契约 10：disconnect 不销毁 Session）。
@@ -214,6 +234,9 @@ impl Session {
             return Err(TermError::SessionClosed(self.id.clone()));
         }
         self.touch_last_activity();
+        // Phase 4-A：记录命令事件（发送前的 written cursor 作为 cursor_before）
+        let cursor_before = self.output.buffer().written();
+        self.timeline.record_command(data, cursor_before);
         self.handle.write(data).await
     }
 
@@ -223,6 +246,8 @@ impl Session {
             return Err(TermError::SessionClosed(self.id.clone()));
         }
         self.touch_last_activity();
+        // Phase 4-A：记录控制键事件
+        self.timeline.record_control(key.as_name());
         self.handle.send_control(key).await
     }
 
@@ -242,6 +267,9 @@ impl Session {
         if self.state().is_closed() {
             return Ok(());
         }
+        // Phase 4-A：记录 Ready/Lost → Closing 转换
+        let from_state = format!("{:?}", self.state()).to_ascii_lowercase();
+        self.timeline.record_state_change(&from_state, "closing");
         // 标记 Closing，阻止并发写
         *self.state.lock() = SessionState::Closing;
 
@@ -255,6 +283,8 @@ impl Session {
 
         // 3. 置 Closed（无论 handle.close 是否成功，Session 视角已关闭）
         *self.state.lock() = SessionState::Closed;
+        // Phase 4-A：记录 Closing → Closed 转换
+        self.timeline.record_state_change("closing", "closed");
 
         res
     }

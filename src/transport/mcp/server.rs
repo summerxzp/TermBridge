@@ -1,4 +1,4 @@
-//! rmcp MCP server —— 14 工具映射到 application 层（§6 / §7.4 Phase 1-2 / Phase 3-B）
+//! rmcp MCP server —— 15 工具映射到 application 层（§6 / §7.4 Phase 1-2 / Phase 3-B / Phase 4-A）
 //!
 //! 工具：
 //! 1. `list_hosts`            → HostManager::list_hosts
@@ -15,6 +15,7 @@
 //! 12. `list_remote_sessions` → SessionManager::list_remote_sessions（Phase 3-B）
 //! 13. `attach_remote_session` → SessionManager::attach_remote_session（Phase 3-B）
 //! 14. `detach_session`       → SessionManager::detach_session（Phase 3-B）
+//! 15. `get_session_timeline` → SessionManager::get_session_timeline（Phase 4-A）
 //!
 //! 错误格式（§6.1）：`CallToolResult::structured_error({code, message, retriable})`
 //! 成功格式：`CallToolResult::structured({工具特定结构})`
@@ -34,6 +35,7 @@ use crate::application::hosts::HostManager;
 use crate::application::sessions::SessionManager;
 use crate::domain::output::ReadOutputParams;
 use crate::domain::provider::{ControlKey, PtySize, TermError, TransferDirection};
+use crate::domain::timeline::TimelineEvent;
 
 // ───────────────────────────────────────────────────────────────────────────
 // ToolError —— §6.1 统一错误格式
@@ -227,6 +229,15 @@ pub struct DetachSessionParams {
     pub session_id: String,
 }
 
+/// get_session_timeline 参数（Phase 4-A）
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct GetSessionTimelineParams {
+    /// Session ID returned by open_session
+    pub session_id: String,
+    /// Return only the most recent N events. Omit to return all (up to ring capacity, default 1000).
+    pub limit: Option<usize>,
+}
+
 // ── 返回类型 ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -297,6 +308,12 @@ struct SftpOkResult {
 #[derive(Serialize)]
 struct AttachRemoteSessionResult {
     session_id: String,
+}
+
+/// get_session_timeline 成功返回（Phase 4-A）
+#[derive(Serialize)]
+struct GetSessionTimelineResult {
+    events: Vec<TimelineEvent>,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -648,6 +665,21 @@ impl TermBridgeServer {
             .await
         {
             Ok(()) => ok_result(OkResult { ok: true }),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    /// Get session execution timeline (Phase 4-A).
+    #[tool(description = "Get session execution timeline: ordered list of command/output/control/state events with timestamps and cursor metadata. Used for debugging (what was sent, what came back) and AI context. Output content stays in RingBuffer; timeline only records byte ranges.")]
+    async fn get_session_timeline(
+        &self,
+        Parameters(params): Parameters<GetSessionTimelineParams>,
+    ) -> CallToolResult {
+        match self
+            .session_manager
+            .get_session_timeline(&params.session_id, params.limit)
+        {
+            Ok(events) => ok_result(GetSessionTimelineResult { events }),
             Err(e) => err_result(&e),
         }
     }
