@@ -9,6 +9,7 @@
 //!
 //! 关键解耦（PLAN.md §4）：Application 层定义业务接口，MCP transport 只是调用方之一。
 
+pub mod bootstrap;
 pub mod hosts;
 pub mod path_policy;
 pub mod policy;

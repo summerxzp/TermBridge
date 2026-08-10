@@ -120,7 +120,7 @@ impl Default for SshProvider {
 ///
 /// 拒绝原因通过 `rejection` 共享给 `SshProvider::open`，用于映射为
 /// `TermError::HostKeyRejected(String)`（而非普通 ConnectFailed）。
-pub(crate) struct SshClientHandler {
+pub struct SshClientHandler {
     /// `UserKnownHostsFile` 路径列表（已展开 ~，保留全部空格分隔路径）。
     /// 空 Vec 表示 ssh -G 未输出该字段，strict 模式下拒绝。
     known_hosts_paths: Vec<PathBuf>,
@@ -599,9 +599,9 @@ impl SshProvider {
 /// `handle` 是目标主机的已认证 SSH session（未开 PTY/shell）。
 /// `bastions` 是跳板机 session 链（从外层到内层），直连时为空。
 /// **必须保持 bastions 存活**到 session 关闭 —— drop 会断开隧道导致目标 session 失活。
-struct ConnectResult {
-    handle: Handle<SshClientHandler>,
-    bastions: Vec<Handle<SshClientHandler>>,
+pub struct ConnectResult {
+    pub(crate) handle: Handle<SshClientHandler>,
+    pub(crate) bastions: Vec<Handle<SshClientHandler>>,
 }
 
 /// 连接 SSH session 并认证（不开 PTY/shell）。
@@ -746,6 +746,45 @@ async fn connect_session(host: &Host, depth: usize) -> Result<ConnectResult, Ter
     })
 }
 
+/// 建立 SSH 连接但不认证（供 bootstrap_host 使用，ADR-0009）。
+///
+/// 与 `connect_session` 的区别：不调用 `authenticate_session`，仅完成 TCP 连接 + host key 校验。
+/// 调用方负责后续认证（可先尝试 key，失败再密码）。
+///
+/// **不支持 ProxyJump**：bootstrap 场景假设直连目标主机。
+/// 如果 host 配置了 proxy_jump，返回 `TermError::InvalidArgument`。
+pub async fn connect_unauthenticated(host: &Host) -> Result<ConnectResult, TermError> {
+    if host.proxy_jump.is_some() {
+        return Err(TermError::InvalidArgument(
+            "bootstrap does not support ProxyJump".to_string(),
+        ));
+    }
+
+    let addr = (host.hostname.as_str(), host.port);
+    let config = Arc::new(client::Config::default());
+    let (handler, rejection) = SshClientHandler::new(
+        host.user_known_hosts_files.clone(),
+        host.strict_host_key_checking.clone(),
+        host.hostname.clone(),
+        host.port,
+    );
+    let session = client::connect(config, addr, handler)
+        .await
+        .map_err(|e| {
+            if let Some(reason) = rejection.lock().take() {
+                tracing::warn!(host = %host.name, reason = %reason, "host key rejected");
+                TermError::HostKeyRejected(reason)
+            } else {
+                map_connect_err(e, &host.name)
+            }
+        })?;
+
+    Ok(ConnectResult {
+        handle: session,
+        bastions: vec![],
+    })
+}
+
 /// 在已连接的 session 上认证（凭据优先级 SSH Agent > IdentityFile > HITL(Phase 6)）。
 ///
 /// 1. 尝试 ssh-agent → 成功则跳过 IdentityFile
@@ -753,7 +792,7 @@ async fn connect_session(host: &Host, depth: usize) -> Result<ConnectResult, Ter
 /// 3. 都失败 → Err(AuthFailed)
 ///
 /// 返回认证方式（"ssh-agent" / "identity_file"）用于日志。
-async fn authenticate_session(
+pub(crate) async fn authenticate_session(
     session: &mut Handle<SshClientHandler>,
     user: &str,
     identity_files: &[PathBuf],
@@ -771,6 +810,24 @@ async fn authenticate_session(
     };
     tracing::info!(user = %user, auth_via = %via, "ssh authenticated");
     Ok(via)
+}
+
+/// 用密码认证（仅 bootstrap_host 使用，ADR-0009）。
+///
+/// 正常 SSH 认证流程不调用此函数。bootstrap_host 在 key 认证失败后，
+/// 通过 CredentialProvider 获取密码，调用此函数完成一次性密码登录。
+///
+/// 返回 true 表示认证成功，false 表示密码错误（认证拒绝）。
+pub async fn authenticate_with_password(
+    session: &mut Handle<SshClientHandler>,
+    user: &str,
+    password: &str,
+) -> Result<bool, TermError> {
+    let auth_res = session
+        .authenticate_password(user, password)
+        .await
+        .map_err(|e| TermError::ChannelError(format!("authenticate_password: {e}")))?;
+    Ok(auth_res.success())
 }
 
 /// 用 IdentityFile 公钥认证。

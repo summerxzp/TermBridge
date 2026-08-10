@@ -1,4 +1,4 @@
-//! rmcp MCP server —— 17 工具映射到 application 层（§6 / §7.4 Phase 1-2 / Phase 3-B / Phase 4-A / Phase 5-A-B）
+//! rmcp MCP server —— 18 工具映射到 application 层（§6 / §7.4 Phase 1-2 / Phase 3-B / Phase 4-A / Phase 5-A-B / ADR-0009）
 //!
 //! 工具：
 //! 1. `list_hosts`            → HostManager::list_hosts
@@ -18,6 +18,7 @@
 //! 15. `get_session_timeline` → SessionManager::get_session_timeline（Phase 4-A）
 //! 16. `sftp_transfer_dir`    → SessionManager::sftp_transfer_dir（Phase 5-A，目录递归）
 //! 17. `detect_remote_env`    → SessionManager::detect_remote_env（Phase 5-B，远端环境检测）
+//! 18. `bootstrap_host`       → BootstrapHost::bootstrap（ADR-0009，首次 SSH key 部署）
 //!
 //! 错误格式（§6.1）：`CallToolResult::structured_error({code, message, retriable})`
 //! 成功格式：`CallToolResult::structured({工具特定结构})`
@@ -33,6 +34,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::application::bootstrap::BootstrapHost;
 use crate::application::hosts::HostManager;
 use crate::application::sessions::{RemoteEnvInfo, SessionManager};
 use crate::domain::output::ReadOutputParams;
@@ -260,6 +262,16 @@ pub struct DetectRemoteEnvParams {
     pub session_id: String,
 }
 
+/// bootstrap_host 工具参数（ADR-0009）。
+///
+/// **安全约束**：schema 中无 password / secret / passphrase 字段。
+/// 密码经独立 CredentialProvider out-of-band 输入，不进 MCP arguments。
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct BootstrapHostParams {
+    /// SSH host alias (from ~/.ssh/config) or direct hostname/IP
+    pub host: String,
+}
+
 // ── 返回类型 ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -359,16 +371,21 @@ struct DetectRemoteEnvResult {
 
 /// TermBridge MCP Server。
 ///
-/// 持有 HostManager + SessionManager（Arc 共享，Clone 供 rmcp serve）。
+/// 持有 HostManager + SessionManager + BootstrapHost（Arc 共享，Clone 供 rmcp serve）。
 #[derive(Clone)]
 pub struct TermBridgeServer {
     host_manager: Arc<HostManager>,
     session_manager: Arc<SessionManager>,
+    bootstrap_host: Arc<BootstrapHost>,
 }
 
 impl TermBridgeServer {
-    pub fn new(host_manager: Arc<HostManager>, session_manager: Arc<SessionManager>) -> Self {
-        Self { host_manager, session_manager }
+    pub fn new(
+        host_manager: Arc<HostManager>,
+        session_manager: Arc<SessionManager>,
+        bootstrap_host: Arc<BootstrapHost>,
+    ) -> Self {
+        Self { host_manager, session_manager, bootstrap_host }
     }
 
     /// 启动 stdio MCP server（阻塞直到连接关闭）。
@@ -773,6 +790,26 @@ impl TermBridgeServer {
             .await
         {
             Ok(env) => ok_result(DetectRemoteEnvResult { env }),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    /// Bootstrap SSH key authentication for a host (ADR-0009).
+    ///
+    /// If the host already has working key authentication (via SSH Agent or
+    /// IdentityFile), returns `already_configured`. Otherwise, prompts the user
+    /// for a password via an out-of-band credential prompt (never via MCP
+    /// arguments), uses the password to deploy the public key to the remote
+    /// `~/.ssh/authorized_keys`, then reconnects to verify key authentication
+    /// works. After bootstrap, subsequent `open_session` calls use key auth
+    /// exclusively — the password is discarded.
+    #[tool(description = "Bootstrap SSH key authentication for a host. Deploys public key to remote authorized_keys via one-time password prompt (password never passed via MCP args). Returns status: already_configured / bootstrapped / cancelled / authentication_failed / bootstrap_failed.")]
+    async fn bootstrap_host(
+        &self,
+        Parameters(params): Parameters<BootstrapHostParams>,
+    ) -> CallToolResult {
+        match self.bootstrap_host.bootstrap(&params.host).await {
+            Ok(result) => ok_result(result),
             Err(e) => err_result(&e),
         }
     }

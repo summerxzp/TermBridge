@@ -9,8 +9,11 @@
 
 use std::sync::Arc;
 
+use termbridge::application::bootstrap::BootstrapHost;
 use termbridge::application::hosts::HostManager;
 use termbridge::application::sessions::SessionManager;
+use termbridge::domain::credential::{CredentialProvider, NoopCredentialProvider};
+use termbridge::infrastructure::credential::HelperCredentialProvider;
 use termbridge::infrastructure::redact::RedactingMakeWriter;
 use termbridge::infrastructure::persistent::PersistentProvider;
 use termbridge::transport::mcp::server::TermBridgeServer;
@@ -32,7 +35,26 @@ async fn main() -> anyhow::Result<()> {
     let session_manager = Arc::new(SessionManager::new(provider));
     let host_manager = Arc::new(HostManager::new());
 
-    let server = TermBridgeServer::new(host_manager, session_manager);
+    // ADR-0009：CredentialProvider —— 优先 HelperCredentialProvider（spawn 独立 helper
+    // process 弹 Windows native dialog），找不到 helper exe 时 fallback NoopCredentialProvider
+    //（bootstrap_host 调用时返回 Unsupported 错误）
+    let credential_provider: Arc<dyn CredentialProvider> =
+        match HelperCredentialProvider::new() {
+            Ok(helper) => {
+                tracing::info!("credential provider: HelperCredentialProvider (helper resolved)");
+                Arc::new(helper)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "credential provider: HelperCredentialProvider unavailable, falling back to Noop (bootstrap_host will return Unsupported)"
+                );
+                Arc::new(NoopCredentialProvider)
+            }
+        };
+    let bootstrap_host = Arc::new(BootstrapHost::new(credential_provider));
+
+    let server = TermBridgeServer::new(host_manager, session_manager, bootstrap_host);
     server.serve_stdio().await?;
 
     tracing::info!("termbridge: server stopped");

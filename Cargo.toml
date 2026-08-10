@@ -1,6 +1,6 @@
 # Phase 3-A W2：agentd + cli 作为 workspace 成员（远端 daemon + 测试 client，仅 Linux 编译）
 [workspace]
-members = ["agentd", "cli"]
+members = ["agentd", "cli", "crates/termbridge-credential-prompt"]
 
 [package]
 name = "termbridge"
@@ -66,6 +66,8 @@ regex = "1"
 parking_lot = "0.12"
 # 并发 HashMap（Phase 1：多 session 并发读写，替代 Mutex<HashMap>）
 dashmap = "6"
+# Phase 5 / ADR-0009：CredentialProvider Secret 自动清零
+zeroize = { version = "1", features = ["alloc"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
