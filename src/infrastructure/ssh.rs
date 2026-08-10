@@ -1050,6 +1050,68 @@ impl SshTerminalHandle {
         })?;
         crate::infrastructure::sftp::SftpProvider::open(session).await
     }
+
+    /// 在已建立的 SSH session 上执行一条命令（Phase 5-B）。
+    ///
+    /// 开新 channel（独立于 PTY channel）执行 `command`，收集 stdout 返回。
+    /// 不通过 PTY，不污染 session 输出。channel 执行完后关闭（session 保持存活）。
+    ///
+    /// 锁 `session` 仅在 `channel_open_session` 期间持有，exec 收数据阶段释放锁，
+    /// 不阻塞 PTY 写与 SFTP 操作。
+    pub async fn exec(&self, command: &str) -> Result<String, TermError> {
+        tracing::debug!(command, "ssh handle exec: starting");
+
+        let mut channel = {
+            let guard = self.session.lock().await;
+            let session = guard.as_ref().ok_or_else(|| {
+                TermError::SessionClosed("ssh session handle already taken".into())
+            })?;
+            session
+                .channel_open_session()
+                .await
+                .map_err(|e| TermError::ChannelError(format!("channel_open_session: {e}")))?
+        };
+
+        channel
+            .exec(true, command)
+            .await
+            .map_err(|e| TermError::ChannelError(format!("channel.exec: {e}")))?;
+
+        let mut stdout = Vec::new();
+        let mut exit_code: Option<u32> = None;
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::Data { data }) => {
+                    stdout.extend_from_slice(&data);
+                }
+                Some(ChannelMsg::ExtendedData { data, ext }) => {
+                    tracing::debug!(ext, len = data.len(), "ssh exec stderr (discarded)");
+                }
+                Some(ChannelMsg::ExitStatus { exit_status }) => {
+                    exit_code = Some(exit_status);
+                }
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                Some(_) => continue,
+            }
+        }
+
+        let _ = channel.eof().await;
+
+        let stdout = String::from_utf8_lossy(&stdout).into_owned();
+        match exit_code {
+            Some(0) => {
+                tracing::debug!(stdout_len = stdout.len(), "ssh handle exec: complete (exit 0)");
+                Ok(stdout)
+            }
+            Some(code) => Err(TermError::ChannelError(format!(
+                "command exited with code {code}"
+            ))),
+            None => {
+                tracing::warn!("ssh handle exec: channel closed without ExitStatus, treating as success");
+                Ok(stdout)
+            }
+        }
+    }
 }
 
 #[async_trait]

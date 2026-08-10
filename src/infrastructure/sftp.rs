@@ -306,6 +306,216 @@ impl SftpProvider {
         tracing::info!(remote = remote, count = entries.len(), "sftp list_dir: complete");
         Ok(entries)
     }
+
+    // ── Phase 5-A：目录递归传输 ──────────────────────────────────
+
+    /// 递归创建远端目录（`mkdir -p` 语义，Phase 5-A）。
+    ///
+    /// 逐级创建路径组件，已存在的目录跳过。`mode` 仅应用于最后一级目录。
+    pub async fn mkdir_p(&self, remote: &str, mode: u32) -> Result<(), TermError> {
+        tracing::info!(remote = remote, mode = format!("{mode:o}"), "sftp mkdir_p: starting");
+
+        let trimmed = remote.trim_end_matches('/');
+        if trimmed.is_empty() || trimmed == "/" {
+            return Ok(());
+        }
+
+        let is_absolute = trimmed.starts_with('/');
+        let components: Vec<&str> = trimmed
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        if components.is_empty() {
+            return Ok(());
+        }
+
+        let mut current = if is_absolute {
+            String::from("/")
+        } else {
+            String::new()
+        };
+        for (i, comp) in components.iter().enumerate() {
+            if i == 0 {
+                if is_absolute {
+                    current = format!("/{comp}");
+                } else {
+                    current = comp.to_string();
+                }
+            } else {
+                current.push('/');
+                current.push_str(comp);
+            }
+
+            // 用 stat（metadata）而非 canonicalize（realpath）检查存在性：
+            // realpath 只做路径字符串规范化，某些 SFTP server 不验证最终组件是否存在；
+            // stat 会真正查询 inode，不存在时返回 SSH_FX_NO_SUCH_FILE。
+            let exists = match self.sftp.metadata(&current).await {
+                Ok(_) => true,
+                Err(SftpLibError::Status(s)) if s.status_code == StatusCode::NoSuchFile => false,
+                Err(e) => {
+                    return Err(map_sftp_error(
+                        e,
+                        &format!("sftp mkdir_p stat '{current}'"),
+                    ))
+                }
+            };
+            if exists {
+                continue;
+            }
+
+            self.sftp
+                .create_dir(&current)
+                .await
+                .map_err(|e| map_sftp_error(e, &format!("sftp mkdir_p create '{current}'")))?;
+
+            if i == components.len() - 1 && mode != 0 {
+                let attrs = FileAttributes {
+                    permissions: Some(mode),
+                    ..Default::default()
+                };
+                if let Err(e) = self.sftp.set_metadata(&current, attrs).await {
+                    tracing::warn!(
+                        remote = &current,
+                        error = %e,
+                        "sftp mkdir_p: set_metadata failed (non-fatal)"
+                    );
+                }
+            }
+        }
+        tracing::info!(remote = remote, "sftp mkdir_p: complete");
+        Ok(())
+    }
+
+    /// 递归上传本地目录到远端（Phase 5-A）。
+    ///
+    /// - 自动创建远端目录（`mkdir_p` 语义）
+    /// - 跳过符号链接（不跟随，防止循环）
+    /// - 单个文件失败时 fail-fast（返回错误，不继续）
+    /// - 返回传输的文件数（不含目录）
+    pub async fn upload_dir(
+        &self,
+        local_dir: &Path,
+        remote_dir: &str,
+    ) -> Result<usize, TermError> {
+        const MAX_DEPTH: usize = 20;
+        self.upload_dir_inner(local_dir, remote_dir, 0, MAX_DEPTH).await
+    }
+
+    async fn upload_dir_inner(
+        &self,
+        local_dir: &Path,
+        remote_dir: &str,
+        depth: usize,
+        max_depth: usize,
+    ) -> Result<usize, TermError> {
+        if depth > max_depth {
+            return Err(TermError::InvalidArgument(format!(
+                "sftp upload_dir exceeded max depth {max_depth} at '{remote_dir}' \
+                 (possible symlink loop)"
+            )));
+        }
+
+        let meta = tokio::fs::symlink_metadata(local_dir)
+            .await
+            .map_err(TermError::Io)?;
+        if !meta.is_dir() {
+            return Err(TermError::InvalidArgument(format!(
+                "upload_dir: local path '{}' is not a directory",
+                local_dir.display()
+            )));
+        }
+
+        self.mkdir_p(remote_dir, 0).await?;
+
+        let mut count = 0usize;
+        let mut entries = tokio::fs::read_dir(local_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            let name = entry.file_name();
+            let local_child = entry.path();
+            let name_str = name.to_string_lossy();
+            let remote_child = if remote_dir.ends_with('/') {
+                format!("{}{name_str}", remote_dir)
+            } else {
+                format!("{remote_dir}/{name_str}")
+            };
+
+            if file_type.is_symlink() {
+                tracing::debug!(local = ?local_child, "upload_dir: skipping symlink");
+                continue;
+            } else if file_type.is_dir() {
+                count += Box::pin(self.upload_dir_inner(
+                    &local_child,
+                    &remote_child,
+                    depth + 1,
+                    max_depth,
+                ))
+                .await?;
+            } else if file_type.is_file() {
+                self.upload(&local_child, &remote_child).await?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// 递归下载远端目录到本地（Phase 5-A）。
+    ///
+    /// - 自动创建本地目录（`create_dir_all`）
+    /// - 跳过符号链接等非普通文件/目录条目（RemoteEntry.is_dir/is_file 均为 false）
+    /// - 单个文件失败时 fail-fast
+    /// - 返回传输的文件数（不含目录）
+    pub async fn download_dir(
+        &self,
+        remote_dir: &str,
+        local_dir: &Path,
+    ) -> Result<usize, TermError> {
+        const MAX_DEPTH: usize = 20;
+        self.download_dir_inner(remote_dir, local_dir, 0, MAX_DEPTH)
+            .await
+    }
+
+    async fn download_dir_inner(
+        &self,
+        remote_dir: &str,
+        local_dir: &Path,
+        depth: usize,
+        max_depth: usize,
+    ) -> Result<usize, TermError> {
+        if depth > max_depth {
+            return Err(TermError::InvalidArgument(format!(
+                "sftp download_dir exceeded max depth {max_depth} at '{remote_dir}' \
+                 (possible symlink loop)"
+            )));
+        }
+
+        tokio::fs::create_dir_all(local_dir).await?;
+
+        let entries = self.list_dir(remote_dir).await?;
+        let mut count = 0usize;
+        for entry in entries {
+            let remote_child = if remote_dir.ends_with('/') {
+                format!("{}{}", remote_dir, entry.name)
+            } else {
+                format!("{}/{}", remote_dir, entry.name)
+            };
+            let local_child = local_dir.join(&entry.name);
+
+            if entry.is_dir {
+                count += Box::pin(self.download_dir_inner(
+                    &remote_child,
+                    &local_child,
+                    depth + 1,
+                    max_depth,
+                ))
+                .await?;
+            } else if entry.is_file {
+                self.download(&remote_child, &local_child).await?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────

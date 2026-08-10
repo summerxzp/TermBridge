@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
+use serde::Serialize;
 use tokio::task::JoinHandle;
 
 use crate::domain::output::{ReadOutputParams, ReadOutputResult};
@@ -42,6 +43,37 @@ pub const IDLE_REAPER_INTERVAL_SECS: u64 = 30;
 /// Session 空闲超时（秒）。超过此时间无活动 → idleReaper 关闭并移除。
 /// 默认 1800 秒（30 分钟），借鉴 pty-mcp。
 pub const IDLE_TIMEOUT_SECS: u64 = 1800;
+
+// ───────────────────────────────────────────────────────────────────────────
+// Phase 5-B：远端环境检测 DTO
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 远端环境信息（Phase 5-B）。
+///
+/// 由 `detect_remote_env` 通过 SSH exec 探测命令收集，供 Agent 了解
+/// 远端 OS / shell / PATH / 已装工具，决定后续操作策略。
+#[derive(Debug, Clone, Serialize)]
+pub struct RemoteEnvInfo {
+    /// `uname -a` 输出（OS 内核架构等信息）
+    pub os: String,
+    /// `$SHELL` 环境变量（默认 shell 路径）
+    pub shell: String,
+    /// `$PATH` 环境变量
+    pub path: String,
+    /// 已装工具列表
+    pub tools: Vec<ToolInfo>,
+}
+
+/// 远端已装工具信息（Phase 5-B）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolInfo {
+    /// 工具名（如 "python"、"node"）
+    pub name: String,
+    /// `which` 输出的绝对路径；未安装时为空串
+    pub path: String,
+    /// 是否已安装
+    pub installed: bool,
+}
 
 /// SessionManager：管理所有活跃 Session。
 ///
@@ -466,6 +498,103 @@ impl SessionManager {
         result
     }
 
+    // ── Phase 5-A：SFTP 目录递归传输 ──────────────────────────────
+
+    /// SFTP 递归传输目录（Phase 5-A）。
+    ///
+    /// 复用 `sftp_transfer` 的 session 获取 + path policy 校验模式，
+    /// 调用 `SftpProvider::upload_dir` 或 `download_dir`。
+    /// 返回传输的文件数（不含目录）。
+    pub async fn sftp_transfer_dir(
+        &self,
+        session_id: &str,
+        direction: TransferDirection,
+        local_path: PathBuf,
+        remote_path: String,
+    ) -> Result<usize, TermError> {
+        self.check_policy(&Action::SftpTransfer {
+            direction,
+            local: local_path.to_string_lossy().into_owned(),
+            remote: remote_path.clone(),
+        })?;
+
+        let sftp = self.open_sftp_for_session(session_id).await?;
+        tracing::info!(
+            session = %session_id,
+            direction = direction.as_str(),
+            local = ?local_path,
+            remote = %remote_path,
+            "sftp_transfer_dir: starting"
+        );
+
+        let result = async {
+            match direction {
+                TransferDirection::Upload => {
+                    self.path_policy.check_local(local_path.as_path())?;
+                    self.path_policy
+                        .check_remote_allow_new(&remote_path, &sftp)
+                        .await?;
+                    sftp.upload_dir(local_path.as_path(), &remote_path).await
+                }
+                TransferDirection::Download => {
+                    self.path_policy.check_remote(&remote_path, &sftp).await?;
+                    self.path_policy.check_local(local_path.as_path())?;
+                    sftp.download_dir(&remote_path, local_path.as_path()).await
+                }
+            }
+        }
+        .await;
+
+        let _ = sftp.close().await;
+        result
+    }
+
+    // ── Phase 5-B：远端环境检测 ───────────────────────────────────
+
+    /// 检测远端环境（OS / shell / PATH / 已装工具，Phase 5-B）。
+    ///
+    /// 通过 session 的 SSH 连接 exec 一条探测命令（不开 PTY，不污染 session 输出），
+    /// 解析输出提取结构化信息。
+    pub async fn detect_remote_env(
+        &self,
+        session_id: &str,
+    ) -> Result<RemoteEnvInfo, TermError> {
+        let session = self.get_session(session_id)?;
+        let handle = session.handle();
+        let ssh_handle = handle
+            .as_any()
+            .downcast_ref::<SshTerminalHandle>()
+            .ok_or_else(|| {
+                TermError::InvalidArgument(format!(
+                    "session '{session_id}' does not support exec (non-SSH handle)"
+                ))
+            })?;
+
+        tracing::info!(session = %session_id, "detect_remote_env: starting");
+
+        let probe = concat!(
+            r#"echo "__ENV_START__"; "#,
+            r#"uname -a; "#,
+            r#"echo "SHELL=$SHELL"; "#,
+            r#"echo "PATH=$PATH"; "#,
+            r#"for cmd in python python3 node npm rustc cargo go docker git; do "#,
+            r#"p=$(which $cmd 2>/dev/null); "#,
+            r#"if [ -n "$p" ]; then echo "TOOL:$cmd:$p"; "#,
+            r#"else echo "TOOL:$cmd:"; fi; "#,
+            r#"done; "#,
+            r#"echo "__ENV_END__""#,
+        );
+
+        let output = ssh_handle.exec(probe).await?;
+        let info = parse_remote_env(&output)?;
+        tracing::info!(
+            session = %session_id,
+            tools_count = info.tools.len(),
+            "detect_remote_env: complete"
+        );
+        Ok(info)
+    }
+
     /// 列出所有 Session 摘要。
     pub fn list_sessions(&self) -> Vec<SessionSummary> {
         self.sessions.iter().map(|r| r.value().summary()).collect()
@@ -757,6 +886,69 @@ fn policy_reason(action: &Action, status: &str) -> String {
             format!("sftp chmod {mode} {status}: {remote}")
         }
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Phase 5-B：远端环境探测输出解析
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 解析 `detect_remote_env` 探测命令的 stdout 输出为 `RemoteEnvInfo`。
+///
+/// 探测命令输出格式（由 `__ENV_START__` / `__ENV_END__` 标记包裹）：
+/// ```text
+/// __ENV_START__
+/// Linux host 5.15.0-91-generic ... (uname -a)
+/// SHELL=/bin/bash
+/// PATH=/usr/local/sbin:...
+/// TOOL:python:/usr/bin/python3
+/// TOOL:node:
+/// __ENV_END__
+/// ```
+fn parse_remote_env(output: &str) -> Result<RemoteEnvInfo, TermError> {
+    const START_MARKER: &str = "__ENV_START__";
+    const END_MARKER: &str = "__ENV_END__";
+
+    let start = output
+        .find(START_MARKER)
+        .ok_or_else(|| TermError::ChannelError("detect_remote_env: start marker not found".into()))?;
+    let end_rel = output[start..]
+        .find(END_MARKER)
+        .ok_or_else(|| TermError::ChannelError("detect_remote_env: end marker not found".into()))?;
+    let body_start = start + START_MARKER.len();
+    let body_end = start + end_rel;
+    let body = &output[body_start..body_end];
+
+    let mut lines = body.lines().skip_while(|l| l.trim().is_empty());
+    let os = lines.next().unwrap_or("").trim().to_string();
+
+    let mut shell = String::new();
+    let mut path = String::new();
+    let mut tools = Vec::new();
+
+    for line in lines {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("SHELL=") {
+            shell = val.to_string();
+        } else if let Some(val) = line.strip_prefix("PATH=") {
+            path = val.to_string();
+        } else if let Some(rest) = line.strip_prefix("TOOL:") {
+            if let Some((name, tool_path)) = rest.split_once(':') {
+                let installed = !tool_path.is_empty();
+                tools.push(ToolInfo {
+                    name: name.to_string(),
+                    path: tool_path.to_string(),
+                    installed,
+                });
+            }
+        }
+    }
+
+    Ok(RemoteEnvInfo {
+        os,
+        shell,
+        path,
+        tools,
+    })
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1222,5 +1414,59 @@ mod tests {
         // 无 Policy 拦截，rm -rf / 不会被拒（但 session 不存在 → SESSION_NOT_FOUND）
         let err = mgr.send_input("any", b"rm -rf /\n").await.unwrap_err();
         assert_eq!(err.code(), "SESSION_NOT_FOUND", "空 Policy 链不拦截");
+    }
+
+    // ── Phase 5-B：parse_remote_env 单元测试 ───────────────────────
+
+    #[test]
+    fn parse_remote_env_extracts_all_fields() {
+        let output = concat!(
+            "__ENV_START__\n",
+            "Linux myhost 5.15.0-91-generic #101-Ubuntu SMP x86_64 GNU/Linux\n",
+            "SHELL=/bin/bash\n",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n",
+            "TOOL:python:/usr/bin/python3\n",
+            "TOOL:python3:/usr/bin/python3\n",
+            "TOOL:node:/usr/bin/node\n",
+            "TOOL:npm:/usr/bin/npm\n",
+            "TOOL:rustc:\n",
+            "TOOL:cargo:\n",
+            "TOOL:go:/usr/local/go/bin/go\n",
+            "TOOL:docker:/usr/bin/docker\n",
+            "TOOL:git:/usr/bin/git\n",
+            "__ENV_END__\n",
+        );
+        let info = parse_remote_env(output).unwrap();
+        assert!(info.os.contains("Linux myhost"));
+        assert_eq!(info.shell, "/bin/bash");
+        assert!(info.path.contains("/usr/bin"));
+        assert_eq!(info.tools.len(), 9);
+        assert_eq!(info.tools[0].name, "python");
+        assert_eq!(info.tools[0].path, "/usr/bin/python3");
+        assert!(info.tools[0].installed);
+        assert_eq!(info.tools[4].name, "rustc");
+        assert_eq!(info.tools[4].path, "");
+        assert!(!info.tools[4].installed);
+    }
+
+    #[test]
+    fn parse_remote_env_missing_markers_returns_error() {
+        assert!(parse_remote_env("no markers here").is_err());
+        assert!(parse_remote_env("__ENV_START__\nbut no end").is_err());
+    }
+
+    #[test]
+    fn parse_remote_env_empty_tools() {
+        let output = concat!(
+            "__ENV_START__\n",
+            "Darwin host 23.0.0 Darwin Kernel arm64\n",
+            "SHELL=/bin/zsh\n",
+            "PATH=/usr/bin:/bin\n",
+            "__ENV_END__\n",
+        );
+        let info = parse_remote_env(output).unwrap();
+        assert!(info.os.contains("Darwin"));
+        assert_eq!(info.shell, "/bin/zsh");
+        assert_eq!(info.tools.len(), 0);
     }
 }

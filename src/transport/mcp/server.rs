@@ -1,4 +1,4 @@
-//! rmcp MCP server —— 15 工具映射到 application 层（§6 / §7.4 Phase 1-2 / Phase 3-B / Phase 4-A）
+//! rmcp MCP server —— 17 工具映射到 application 层（§6 / §7.4 Phase 1-2 / Phase 3-B / Phase 4-A / Phase 5-A-B）
 //!
 //! 工具：
 //! 1. `list_hosts`            → HostManager::list_hosts
@@ -16,6 +16,8 @@
 //! 13. `attach_remote_session` → SessionManager::attach_remote_session（Phase 3-B）
 //! 14. `detach_session`       → SessionManager::detach_session（Phase 3-B）
 //! 15. `get_session_timeline` → SessionManager::get_session_timeline（Phase 4-A）
+//! 16. `sftp_transfer_dir`    → SessionManager::sftp_transfer_dir（Phase 5-A，目录递归）
+//! 17. `detect_remote_env`    → SessionManager::detect_remote_env（Phase 5-B，远端环境检测）
 //!
 //! 错误格式（§6.1）：`CallToolResult::structured_error({code, message, retriable})`
 //! 成功格式：`CallToolResult::structured({工具特定结构})`
@@ -32,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::application::hosts::HostManager;
-use crate::application::sessions::SessionManager;
+use crate::application::sessions::{RemoteEnvInfo, SessionManager};
 use crate::domain::output::ReadOutputParams;
 use crate::domain::provider::{ControlKey, PtySize, TermError, TransferDirection};
 use crate::domain::timeline::TimelineEvent;
@@ -238,6 +240,26 @@ pub struct GetSessionTimelineParams {
     pub limit: Option<usize>,
 }
 
+/// sftp_transfer_dir 参数（Phase 5-A）
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SftpTransferDirParams {
+    /// Session ID returned by open_session
+    pub session_id: String,
+    /// Transfer direction: "upload" (local→remote) or "download" (remote→local)
+    pub direction: String,
+    /// Local directory path. For upload: source (must exist). For download: destination (will be created).
+    pub local_path: String,
+    /// Remote directory path. Path policy enforced.
+    pub remote_path: String,
+}
+
+/// detect_remote_env 参数（Phase 5-B）
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct DetectRemoteEnvParams {
+    /// Session ID returned by open_session
+    pub session_id: String,
+}
+
 // ── 返回类型 ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -314,6 +336,21 @@ struct AttachRemoteSessionResult {
 #[derive(Serialize)]
 struct GetSessionTimelineResult {
     events: Vec<TimelineEvent>,
+}
+
+/// sftp_transfer_dir 成功返回（Phase 5-A）
+#[derive(Serialize)]
+struct SftpTransferDirResult {
+    direction: String,
+    local_path: String,
+    remote_path: String,
+    files_transferred: usize,
+}
+
+/// detect_remote_env 成功返回（Phase 5-B）
+#[derive(Serialize)]
+struct DetectRemoteEnvResult {
+    env: RemoteEnvInfo,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -680,6 +717,62 @@ impl TermBridgeServer {
             .get_session_timeline(&params.session_id, params.limit)
         {
             Ok(events) => ok_result(GetSessionTimelineResult { events }),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    /// Transfer a directory recursively via SFTP (Phase 5-A).
+    #[tool(description = "Transfer a directory recursively between local and remote via SFTP. Supports upload (local->remote) and download (remote->local). Creates target directories automatically. Symlinks are skipped. Returns files_transferred count. Path policy enforced.")]
+    async fn sftp_transfer_dir(
+        &self,
+        Parameters(params): Parameters<SftpTransferDirParams>,
+    ) -> CallToolResult {
+        let direction = match TransferDirection::from_name(&params.direction) {
+            Some(d) => d,
+            None => {
+                return CallToolResult::structured_error(json!(ToolError {
+                    code: "INVALID_ARGUMENT".to_string(),
+                    message: format!(
+                        "unknown direction '{}'; supported: upload, download",
+                        params.direction
+                    ),
+                    retriable: false,
+                }));
+            }
+        };
+
+        match self
+            .session_manager
+            .sftp_transfer_dir(
+                &params.session_id,
+                direction,
+                std::path::PathBuf::from(&params.local_path),
+                params.remote_path.clone(),
+            )
+            .await
+        {
+            Ok(count) => ok_result(SftpTransferDirResult {
+                direction: params.direction,
+                local_path: params.local_path,
+                remote_path: params.remote_path,
+                files_transferred: count,
+            }),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    /// Detect remote environment (Phase 5-B).
+    #[tool(description = "Detect remote environment: OS (uname -a), default shell ($SHELL), PATH, and installed tools (python, node, rustc, go, docker, git, etc.). Uses SSH exec (not PTY) to avoid polluting session output.")]
+    async fn detect_remote_env(
+        &self,
+        Parameters(params): Parameters<DetectRemoteEnvParams>,
+    ) -> CallToolResult {
+        match self
+            .session_manager
+            .detect_remote_env(&params.session_id)
+            .await
+        {
+            Ok(env) => ok_result(DetectRemoteEnvResult { env }),
             Err(e) => err_result(&e),
         }
     }
