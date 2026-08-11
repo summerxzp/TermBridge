@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build main binaries (termbridge-mcp, termbridge)
+        run: cargo build --release --bin termbridge-mcp --bin termbridge
+
+      - name: Build credential helper
+        run: cargo build --release -p termbridge-credential-prompt
+
+      - name: Build agentd (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo build --release -p termbridge-agentd
+
+      - name: Run unit tests
+        run: cargo test --lib
