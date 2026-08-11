@@ -1,6 +1,6 @@
 # ADR-0012：Execution State, Completion Protocol & Recovery Semantics
 
-- **Status**: Accepted（9 契约 + Agent Terminal Protocol + P0 测试矩阵 25/25 PASS）
+- **Status**: Accepted（9 契约 + Agent Terminal Protocol + P0 测试矩阵 33/33 PASS，含 T17 attach/cursor 边界 8/8）
 - **Date**: 2026-08-10
 - **Phase**: 6-C
 - **Supersedes**: —
@@ -347,7 +347,7 @@ Phase 6-C **不实现**，仅在 ADR 留口。未来 Phase 4 timeline / observab
 
 | # | 场景 | 验证点 | 契约 | 状态 |
 |---|---|---|---|---|
-| T17 | detach/attach cursor 精确恢复 | cmd A → detach → cmd B（daemon 继续）→ attach(since_cursor) → 恰好一次不重复 | ⑦ | ⬜ |
+| T17 | detach/attach cursor 精确恢复 | cmd A → detach → cmd B（daemon 继续）→ attach(since_cursor) → 恰好一次不重复 | ⑦ | ✅ |
 
 ### P1：PTY resize（需先实现 MCP resize 工具）
 
@@ -361,6 +361,42 @@ Phase 6-C **不实现**，仅在 ADR 留口。未来 Phase 4 timeline / observab
 - **目标服务器**：192.168.1.171（Debian）
 - **结果**：25 assertions / 25 PASS / 0 FAIL
 - **覆盖**：T10-T15 共 6 个场景，覆盖命令失败状态、marker 提前出现、timeout 后 session 状态、连续命令 cursor 隔离、并发 waiter（串行限制）、disconnect 中途写入
+
+### T17 测试执行详情（Phase 3 daemon 路径）
+
+- **测试脚本**：[examples/phase6c_p0_attach_cursor.ps1](../../examples/phase6c_p0_attach_cursor.ps1)
+- **目标服务器**：192.168.1.171（Debian，agentd v0.1.0 / protocol v1）
+- **结果**：8 assertions / 8 PASS / 0 FAIL
+- **覆盖**：T17 attach/cursor 边界，验证 detach/attach 后输出精确恢复
+- **验证点**：
+  1. open_session(persistent=true) 创建远端 daemon session
+  2. send_input echo MARKER_A → wait_for 命中（detach 前数据存在）
+  3. 后台任务 `(sleep 5; printf '\n%s\n' MARKER_DELAYED) &` 启动（不重定向 stdout，让输出进 PTY）
+  4. detach_session → 远端 PTY 保活
+  5. list_remote_sessions → session state=detached, written>0（daemon 持续捕获输出）
+  6. attach_remote_session → 新本地 session 连接远端 daemon session
+  7. read_output(wait_for=MARKER_DELAYED) → matched=True（detach 期间输出不丢失）
+  8. read_output(since_cursor=0) → 全量 193 bytes，MARKER_A / MARKER_DELAYED 独立输出行各恰好 1 次（不重复）
+  9. send_input echo MARKER_AFTER → wait_for 命中（attach 后可继续交互）
+- **关键日志**：`daemon session re-attached cursor_end=193 initial_bytes=193`（attach 精确恢复 cursor 边界）
+
+#### T17 关键测试发现
+
+1. **PTY 回显导致 marker 字面量计数翻倍**（T17 测试设计修正）：
+   - 问题：`echo MARKER_A` 会导致 buffer 中 MARKER_A 出现 2 次——回显行 `root@host:~# echo MARKER_A` + 输出行 `MARKER_A`
+   - 误判：若用字面量计数断言 "恰好 1 次"，会把回显误认为数据重复
+   - 修复：断言改为匹配 **独立输出行**（`$_.Trim() -eq $MARKER`），排除回显行中的 marker 子串
+   - 归属：测试设计责任——"不重复" 指 daemon buffer 未重复写入同一段数据，而非 marker 字符串在 buffer 中出现几次
+
+2. **后台任务输出与 shell 提示符交错**（T17 测试设计修正）：
+   - 问题：`(sleep 5; echo MARKER) &` 后台输出时，shell 已显示新提示符 `root@host:~# `，输出紧跟提示符 `root@host:~# MARKER`，marker 不独立成行
+   - 修复：用 `printf '\n%s\n' MARKER` 在 marker 前加换行，确保 marker 独立成行
+   - 归属：PTY 行为特性——后台任务输出位置不可预测，可能和提示符交错；Agent 需理解此特性
+
+3. **后台任务 stdout 重定向导致输出丢失**（T17 测试设计修正）：
+   - 问题：`nohup bash -c '...' >/dev/null 2>&1 &` 把 echo 输出重定向到 /dev/null，buffer 中只有回显，无实际输出
+   - 修复：去掉 `>/dev/null 2>&1`，用 `(sleep 5; printf ...) &` 子 shell 方式，让输出进 PTY
+   - 归属：测试设计责任——验证 "detach 期间输出不丢失" 需确保输出确实进 PTY
 
 ### 关键测试发现
 
