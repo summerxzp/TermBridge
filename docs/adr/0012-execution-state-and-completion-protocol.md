@@ -124,6 +124,35 @@ marker 字面量若出现在命令文本中，PTY 回显会触发 `wait_for` 提
 
 TermBridge 不解析 shell，不判断 marker 是否在「命令末尾」。**Completion 正确性是 Agent protocol 责任**。Agent 必须把 marker 放在命令最后，确保命令执行完毕后才输出 marker。
 
+#### Completion Protocol 适用范围
+
+Agent Terminal Protocol 的 exit-code marker completion **只适用于最终将控制权返回当前 shell 的命令序列**。
+
+适用：
+```bash
+ls
+systemctl restart xxx
+python script.py
+cargo build
+apt update
+```
+
+**不适用**（程序占用 foreground PTY，不返回 shell，marker 永远不会出现）：
+```bash
+vim / top / htop / watch / less / more
+ssh another-host
+mysql / psql
+python（REPL）
+tail -f
+```
+
+对 TUI / 交互式 / 长驻程序，Agent **不能依赖 marker completion**，必须使用：
+- `send_control`（Ctrl+C / Ctrl+D / q 等应用特定退出键）
+- 应用自身的退出条件（如 vim 的 `:q`、top 的 `q`）
+- session_state 判断（程序意外退出时 session 可能进入 Lost）
+
+**典型陷阱**：Agent 对 `top` 发送 `wait_for="__TB_DONE__:"` → 永远 timeout → 误判为"命令还在跑"或"卡死"。正确做法：识别 TUI 程序 → 用 `send_control("q")` 退出 → 等待 shell prompt 回显。
+
 ### 2.6 Disconnect 语义（契约 ⑥）
 
 ```text
@@ -157,6 +186,48 @@ After disconnect:
 | A | 数据未到达远端，命令未执行 |
 | B | 远端 shell 已接收，命令正在执行 |
 | C | 命令已执行完毕，响应丢失 |
+
+#### 执行三态模型
+
+从 Agent 视角，命令执行有三种状态：
+
+```text
+COMPLETED
+  ├─ exit_code = 0  （命令成功）
+  └─ exit_code != 0 （命令失败）
+
+RUNNING
+  └─ read_output timeout，但 session_state=ready，命令仍在远端运行
+
+UNKNOWN
+  └─ transport failure / disconnect，远端是否执行无法判断
+```
+
+**UNKNOWN 是 Agent 视角的临时状态，不是终态。** 通过重连 + 幂等检查，UNKNOWN 必须解析为终态：
+
+```text
+UNKNOWN
+  ↓ reconnect_session
+  ↓ 幂等检查（如 test -f /tmp/marker）
+  ├─ 命令确实执行 → COMPLETED（无需重试）
+  └─ 命令未执行   → NOT-RUN（可安全重试）
+```
+
+**关键**：UNKNOWN 不能永久悬置。Agent 必须主动通过幂等检查将其解析为 COMPLETED 或 NOT-RUN，否则无法做出正确的重试决策。
+
+典型场景：
+```bash
+# Agent 发送
+systemctl restart wazuh-agent
+
+# SSH 恰好在命令执行后断开
+# → TermBridge 报告 UNKNOWN（不是 FAILED）
+# → Agent 不应盲目重试，而应：
+reconnect_session
+systemctl is-active wazuh-agent   # 幂等检查
+# → active = COMPLETED，无需重试
+# → inactive = NOT-RUN，可重试
+```
 
 Agent 重试时**必须**：
 1. `reconnect_session` 恢复连接（ADR-0010）
@@ -253,6 +324,8 @@ session_state = Ready（新 buffer，旧 buffer 不保留）
 
 Phase 6-C **不实现**，仅在 ADR 留口。未来 Phase 4 timeline / observability 层可利用。
 
+**注**：marker 格式 `__TB_DONE__:<reqid>:<exit_code>` 保持三字段不变。未来若引入后台执行语义（nohup / systemd-run），进程关联（pid/pgid/job_id）作为独立问题另起 ADR，不在此预留字段。
+
 ### 6.2 SessionManager Write Mutex
 
 未来 GUI 并发调用场景下，SessionManager 可内建 per-session write mutex，自动串行化 `send_input`。当前 MCP stdio 串行处理天然满足，不实现。
@@ -304,6 +377,39 @@ Phase 6-C **不实现**，仅在 ADR 留口。未来 Phase 4 timeline / observab
 3. **`since_cursor` 与 `wait_for` 互斥**（ADR 修正）：
    - 问题：ADR-0012 初稿中 `read_output(wait_for=..., since_cursor=cursor_before)` 示例错误——since_cursor 优先级更高，wait_for 被忽略
    - 修复：ADR-0012 §2.4/§2.5 已修正为两步调用（wait_for 不带 since_cursor；命中后单独 since_cursor 读取完整输出）
+
+## 8. Execution Scope Boundary
+
+明确 TermBridge 的保证边界，防止上层（Agent / Playbook / GUI）误解"执行成功 = 任务成功"。
+
+### TermBridge 保证（Guarantees）
+
+- ✅ **Input bytes delivered to SSH transport (normal operation)**：`send_input` 成功表示字节已写入 SSH channel 发送缓冲区
+- ✅ **Output preservation**：RingBuffer 保留 raw PTY bytes，含 ANSI / `\r` / 控制字符，支持回放与分析
+- ✅ **Cursor consistency**：`written` 单调递增，`since_cursor` 精确切片，溢出时 `is_truncated=true`
+- ✅ **Completion marker observation**：`wait_for` 可靠检测 buffer 中出现的 marker 字节（不验证语义）
+- ✅ **Disconnect state reporting**：session 进入 Lost 状态，Agent 可通过 `reconnect_session` 恢复
+- ✅ **Timeout non-destructive**：`read_output` timeout 不改变远端执行状态，session 仍可操作
+
+### TermBridge 不保证（Non-Guarantees）
+
+- ❌ **End-to-end execution after transport failure**：断线后远端是否执行 = UNKNOWN，Agent 必须幂等检查
+- ❌ **Command success**：`wait_for` 命中只表示 marker 出现，exit code 需 Agent 从 marker 解析
+- ❌ **Process lifetime**：TermBridge 不追踪远端进程，后台任务（`nohup &`）的存活需 Agent 自行检查
+- ❌ **Exactly-once / at-least-once execution**：不提供任何执行次数保证，Agent 负责幂等设计
+- ❌ **Application semantics**：不解析命令含义，不判断"systemctl restart 成功 = 服务可用"
+- ❌ **Configuration correctness**：不做配置校验、不做 playbook 验证、不做运维编排（ADR-0008 边界）
+- ❌ **Marker position validation**：不验证 marker 是否在命令末尾，Completion 正确性是 Agent protocol 责任
+
+### 常见误解澄清
+
+| 误解 | 实际 |
+|---|---|
+| "send_input 成功 = 命令执行了" | ❌ 只 = 字节交给 SSH transport，断线后 unknown |
+| "wait_for 命中 = 命令成功" | ❌ 只 = marker 字节出现，exit code 需解析 |
+| "timeout = 命令卡死" | ❌ 只 = 本次 read_output 超时，命令可能仍在正常运行 |
+| "reconnect 后 session 干净" | ❌ 旧 buffer 不保留，但远端命令可能仍在执行 |
+| "TermBridge 执行成功 = 任务成功" | ❌ TermBridge 只保证字节传递，任务语义由 Agent 判断 |
 
 ## Consequences
 
