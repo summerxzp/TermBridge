@@ -1,6 +1,6 @@
 //! HelperCredentialProvider —— ADR-0009 阶段 C1。
 //!
-//! Spawn `termbridge-credential-prompt` helper process，经 stdin/stdout
+//! Spawn `termbridge-auth-helper` helper process，经 stdin/stdout
 //! JSON IPC 请求密码。helper stdout 只被 TermBridge 捕获，不经过 MCP transport。
 //!
 //! 安全约束（ADR-0009）：
@@ -50,12 +50,12 @@ enum HelperResponse {
 // HelperCredentialProvider
 // ───────────────────────────────────────────────────────────────────────────
 
-/// 通过 spawn `termbridge-credential-prompt` helper process 请求凭据。
+/// 通过 spawn `termbridge-auth-helper` helper process 请求凭据。
 ///
 /// Helper 可执行文件路径解析策略：
-/// 1. 优先环境变量 `TERMBRIDGE_CREDENTIAL_PROMPT`（测试 / 自定义路径用）
-/// 2. 回退：与 termbridge.exe 同目录的 `termbridge-credential-prompt.exe`（Windows）
-///    或 `termbridge-credential-prompt`（Unix）
+/// 1. 优先环境变量 `TERMBRIDGE_AUTH_HELPER`（测试 / 自定义路径用）
+/// 2. 回退：与 termbridge.exe 同目录的 `termbridge-auth-helper.exe`（Windows）
+///    或 `termbridge-auth-helper`（Unix）
 pub struct HelperCredentialProvider {
     helper_path: PathBuf,
 }
@@ -162,12 +162,12 @@ impl CredentialProvider for HelperCredentialProvider {
 
 /// 解析 helper 可执行文件路径。
 ///
-/// 1. 环境变量 `TERMBRIDGE_CREDENTIAL_PROMPT`
-/// 2. 当前可执行文件同目录（`termbridge-credential-prompt.exe` / `termbridge-credential-prompt`）
+/// 1. 环境变量 `TERMBRIDGE_AUTH_HELPER`
+/// 2. 当前可执行文件同目录（`termbridge-auth-helper.exe` / `termbridge-auth-helper`）
 /// 3. 都找不到 → `Err(HelperFailed)`
 fn resolve_helper_path() -> Result<PathBuf, CredentialError> {
     // 1. 环境变量
-    if let Ok(path) = std::env::var("TERMBRIDGE_CREDENTIAL_PROMPT") {
+    if let Ok(path) = std::env::var("TERMBRIDGE_AUTH_HELPER") {
         return Ok(PathBuf::from(path));
     }
 
@@ -179,9 +179,9 @@ fn resolve_helper_path() -> Result<PathBuf, CredentialError> {
         .ok_or_else(|| CredentialError::HelperFailed("current_exe has no parent dir".into()))?;
 
     let helper_name = if cfg!(windows) {
-        "termbridge-credential-prompt.exe"
+        "termbridge-auth-helper.exe"
     } else {
-        "termbridge-credential-prompt"
+        "termbridge-auth-helper"
     };
 
     let helper_path = dir.join(helper_name);

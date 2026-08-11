@@ -56,17 +56,51 @@ impl PathPolicy {
         }
     }
 
-    /// 默认策略：`allowed_local_paths=[cwd]`，`allowed_remote_paths=["/"]`。
+    /// 默认策略：`allowed_local_paths=[cwd, temp/termbridge]`，
+    /// `allowed_remote_paths=["/"]`。
+    ///
+    /// Phase 8：在 cwd 基础上增加 OS temp 下的 `termbridge` 子目录，用于 SFTP
+    /// 下载到本地的临时工作文件。MCP server 作为宿主 IDE 子进程启动时 cwd
+    /// 不可控（可能是 IDE 安装目录），temp 目录提供稳定可写的落盘点。
+    ///
+    /// 通过环境变量 `TERMBRIDGE_ALLOWED_LOCAL_PATHS` 可追加额外路径
+    ///（Windows 用 `;` 分隔，Unix 用 `:` 分隔），让宿主把 workspace 显式传入。
     pub fn default_from_cwd() -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|e| {
             tracing::warn!(error = %e, "current_dir 失败，回退到 \".\"");
             PathBuf::from(".")
         });
+
+        let mut allowed_local = vec![cwd.clone()];
+
+        // temp/termbridge 子目录：SFTP 临时工作文件落盘点
+        let temp_root = std::env::temp_dir().join("termbridge");
+        if let Err(e) = std::fs::create_dir_all(&temp_root) {
+            tracing::warn!(error = %e, ?temp_root, "创建 temp/termbridge 目录失败");
+        }
+        allowed_local.push(temp_root);
+
+        // 环境变量追加：让宿主显式传入 workspace 等额外路径
+        // （Windows 用 ; 分隔，Unix 用 : 分隔）
+        if let Ok(extra) = std::env::var("TERMBRIDGE_ALLOWED_LOCAL_PATHS") {
+            let sep = if cfg!(windows) { ';' } else { ':' };
+            for path in extra.split(sep) {
+                let p = path.trim();
+                if !p.is_empty() {
+                    allowed_local.push(PathBuf::from(p));
+                }
+            }
+        }
+
+        tracing::info!(
+            ?allowed_local,
+            "PathPolicy: allowed_local_paths = cwd + temp/termbridge + TERMBRIDGE_ALLOWED_LOCAL_PATHS"
+        );
         tracing::warn!(
             ?cwd,
             "PathPolicy: allowed_remote_paths 默认 [\"/\"]（全放行），建议收紧"
         );
-        Self::new(vec![cwd], vec!["/".to_string()])
+        Self::new(allowed_local, vec!["/".to_string()])
     }
 
     // ── 本地路径检查 ──────────────────────────────────────────────

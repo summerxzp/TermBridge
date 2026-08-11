@@ -35,7 +35,7 @@ cargo build --release
 | 文件 | 路径 | 用途 |
 |---|---|---|
 | `termbridge.exe` | `target/release/termbridge.exe` | MCP server 主进程 |
-| `termbridge-credential-prompt.exe` | `target/release/termbridge-credential-prompt.exe` | 首次认证密码输入 helper（需与主进程同目录） |
+| `termbridge-auth-helper.exe` | `target/release/termbridge-auth-helper.exe` | 首次认证密码输入 helper（需与主进程同目录） |
 
 > macOS / Linux 下产物无 `.exe` 后缀，使用方式相同。
 
@@ -71,7 +71,7 @@ Host my-server
 }
 ```
 
-> `termbridge-credential-prompt.exe` 必须与 `termbridge.exe` 在同一目录，否则首次认证会 fallback 到不支持状态。
+> `termbridge-auth-helper.exe` 必须与 `termbridge.exe` 在同一目录，否则首次认证会 fallback 到不支持状态。
 
 ### 第 3 步：首次连接新服务器
 
@@ -143,7 +143,7 @@ status: bootstrapped
 | 属性 | 实现 |
 |---|---|
 | **密码不进 LLM context** | MCP 工具 schema 中无 `password` / `secret` / `passphrase` 字段 |
-| **密码经独立通道** | 弹窗由 `termbridge-credential-prompt.exe` 独立进程处理，IPC 与 MCP stdio 完全隔离 |
+| **密码经独立通道** | 弹窗由 `termbridge-auth-helper.exe` 独立进程处理，IPC 与 MCP stdio 完全隔离 |
 | **密码不持久化** | 认证后立即 `Zeroize`，不写入文件/日志/环境变量 |
 | **host key 严格校验** | 复用 ADR-0005 known_hosts 机制，不自动接受变更 |
 | **公钥部署幂等** | 部署前 `grep` 检查公钥是否已存在，避免重复写入 |
@@ -159,9 +159,9 @@ status: bootstrapped
 | `authentication_failed` | 密码错误 |
 | `bootstrap_failed` | 公钥已部署但 key 重连验证失败（检查 sshd 配置 / 权限 / SELinux） |
 
-## 工具列表（19 个）
+## 工具列表（20 个）
 
-TermBridge 向 MCP 客户端暴露 19 个工具，按功能分类：
+TermBridge 向 MCP 客户端暴露 20 个工具，按功能分类：
 
 ### Host 管理
 
@@ -175,10 +175,11 @@ TermBridge 向 MCP 客户端暴露 19 个工具，按功能分类：
 |---|---|---|
 | `open_session` | `host`, `persistent?` | 建立 SSH + PTY session，返回 `session_id`。`persistent=true` 启用远端 daemon 跨重启保活 |
 | `send_input` | `session_id`, `data` | 发送文本到 PTY stdin（`\n` 为回车，立即发送不等命令完成） |
-| `read_output` | `session_id`, `wait_for?`/`tail_lines?`/`since_cursor?`, `timeout_secs?` | 读取 PTY 输出，支持 4 种模式：settle / wait_for / tail_lines / since_cursor。返回含 `session_state` 字段（`ready`/`lost`/`closing`/`closed`），Agent 据此感知断线 |
+| `read_output` | `session_id`, `wait_for?`/`tail_lines?`/`since_cursor?`, `timeout_secs?`, `strip_ansi?` | 读取 PTY 输出，支持 4 种模式：settle / wait_for / tail_lines / since_cursor。`strip_ansi=true` 剥离终端控制序列（CSI/OSC/DCS），RingBuffer 保留 raw bytes 不变。返回含 `session_state` 字段（`ready`/`lost`/`closing`/`closed`），Agent 据此感知断线 |
 | `send_control` | `session_id`, `control_key` | 发送控制键：`ctrl+c` / `ctrl+d` / `ctrl+z` / `tab` / `enter` / `escape` |
 | `close_session` | `session_id` | 关闭 session（幂等），释放 SSH channel |
 | `reconnect_session` | `session_id` | 重连 Lost 状态的 session：重建 SSH + PTY，复用原 session_id。buffer 历史不保留。仅交互式 session 支持（persistent session 用 attach_remote_session） |
+| `resize` | `session_id`, `cols`, `rows` | 调整 PTY 尺寸（window_change），支持 TUI 程序随窗口重绘 |
 
 ### SFTP 文件操作
 
@@ -281,7 +282,7 @@ daemon 管理 PTY + OutputBuffer（Unix socket 通信）
 | **SSH 认证** | 优先 SSH Agent / IdentityFile，密码仅 bootstrap 一次性使用（ADR-0009） |
 | **密码隔离** | 密码经独立 helper process IPC，不进 MCP arguments / LLM context |
 | **日志脱敏** | tracing 日志自动 redact 密码 / token / key 等敏感字段（ADR-0005 §3） |
-| **SFTP 路径策略** | 本地路径限制在工作目录下，远端路径 realpath 解析防 `../` 越界（ADR-0005 §4） |
+| **SFTP 路径策略** | 本地路径白名单 `[cwd, $TEMP/termbridge]` + 环境变量 `TERMBRIDGE_ALLOWED_LOCAL_PATHS` 追加；远端路径 realpath 解析防 `../` 越界（ADR-0005 §4） |
 | **下载原子写** | 临时文件 + fsync + rename，避免半写文件被误读 |
 
 ## 开发者文档
@@ -302,6 +303,12 @@ daemon 管理 PTY + OutputBuffer（Unix socket 通信）
 | [0008](docs/adr/0008-scope-boundary.md) | Scope Boundary | Accepted |
 | [0009](docs/adr/0009-bootstrap-host-and-credential-provider.md) | bootstrap_host + CredentialProvider | Accepted |
 | [0010](docs/adr/0010-session-reconnect.md) | Session 断线感知 + 手动重连 | Accepted |
+| [0011](docs/adr/0011-input-semantics-and-execution-safety.md) | send_input 语义 + 执行安全 | Accepted |
+| [0012](docs/adr/0012-execution-state-and-completion-protocol.md) | 执行语义契约（9 大契约） | Accepted |
+| [0013](docs/adr/0013-agent-terminal-protocol.md) | Agent Terminal Protocol（7 条规则） | Accepted |
+| [0014](docs/adr/0014-phase7-consumer-roadmap.md) | Phase 7 消费者路线图 | Accepted |
+| [0015](docs/adr/0015-provider-api-freeze.md) | Provider API 冻结 | Accepted |
+| [0016](docs/adr/0016-runtime-freeze.md) | Runtime Freeze | Accepted |
 
 ### 项目结构（概览）
 
@@ -313,7 +320,7 @@ TermBridge/
 │   ├── infrastructure/               # 基础设施（SSH / SFTP / Credential / DaemonProto）
 │   └── transport/mcp/                # MCP server（rmcp）
 ├── crates/
-│   └── termbridge-credential-prompt/ # 独立密码 prompt helper（跨平台）
+│   └── termbridge-auth-helper/     # 独立密码 prompt helper（跨平台）
 ├── agentd/                           # 远端 daemon（Linux only）
 ├── cli/                              # 测试用 CLI client
 └── docs/adr/                         # 架构决策记录
@@ -329,9 +336,11 @@ TermBridge/
 | Phase 3 | Remote Persistent Runtime（daemon + detach/attach） | ✅ 完成 |
 | Phase 4 | Observability（Timeline） | ✅ 完成 |
 | Phase 5 | Remote Workspace（SFTP 目录递归 + 环境检测） | ✅ 完成 |
-| ADR-0009 | bootstrap_host + CredentialProvider | ✅ 完成 |
-| Phase 6-A | Session 断线感知 + 手动重连（ADR-0010） | ✅ 完成 |
-| 未来 | Local / Docker / WSL Provider | 规划中 |
+| Phase 6 | Execution State + Reconnect + Agent Terminal Protocol | ✅ 完成 |
+| Phase 7 | CLI + 跨平台 + GUI + Provider API Freeze（ADR-0014/0015） | ✅ 完成 |
+| Phase 8 | Adoption / Bootstrap（Skill + 开箱即用 + Dogfooding） | 🔄 进行中 |
+| [ADR-0016](docs/adr/0016-runtime-freeze.md) | **Runtime Freeze** | ✅ 冻结 |
+| 未来 | Local / Docker / WSL Provider、Playbook、高级 GUI | 规划中 |
 
 > **边界声明**（ADR-0008）：TermBridge 是 Remote Terminal Runtime，不是 AI Ops Platform。不负责 config validation / playbook / service orchestration / desired state。编排层属未来独立项目。
 

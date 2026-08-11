@@ -271,6 +271,9 @@ pub struct ReadOutputParams {
     pub max_bytes: Option<usize>,
     /// wait_for 命中行前后上下文行数，上限 50
     pub context_lines: Option<usize>,
+    /// Phase 8：剥离终端控制序列（CSI/OSC/DCS/APC 等），只影响返回数据，
+    /// 不改 RingBuffer。默认 false（保持 raw byte 透明性）。
+    pub strip_ansi: bool,
 }
 
 /// read_output 返回（三模式共用）

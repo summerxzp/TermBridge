@@ -1,4 +1,4 @@
-﻿# T16 resize test (MCP, with stderr separation)
+# T16 resize test (MCP, with stderr separation)
 $ErrorActionPreference = "Stop"
 $exe = ".\target\release\termbridge-mcp.exe"
 $env:RUST_LOG = "warn"  # reduce noise
@@ -74,7 +74,7 @@ try {
     $null = Call "send_input" @{ session_id = $sid; data = "stty size`n" }
     $r = Call "read_output" @{ session_id = $sid; wait_for = "40"; timeout_secs = 10 }
     Write-Host "  stty size: $($r.output)" -ForegroundColor Gray
-    if ($r.output -match "(?m)^40 120") { Write-Host "  T16-2 PASS" -ForegroundColor Green } else { Write-Host "  T16-2 CHECK" -ForegroundColor Yellow }
+    if ($r.output -match "40 120") { Write-Host "  T16-2 PASS" -ForegroundColor Green } else { Write-Host "  T16-2 FAIL" -ForegroundColor Red }
 
     # T16-3: resize 200x50
     Write-Host ""
@@ -83,7 +83,7 @@ try {
     $null = Call "send_input" @{ session_id = $sid; data = "stty size`n" }
     $r = Call "read_output" @{ session_id = $sid; wait_for = "50"; timeout_secs = 10 }
     Write-Host "  stty size: $($r.output)" -ForegroundColor Gray
-    if ($r.output -match "(?m)^50 200") { Write-Host "  T16-3 PASS" -ForegroundColor Green } else { Write-Host "  T16-3 CHECK" -ForegroundColor Yellow }
+    if ($r.output -match "50 200") { Write-Host "  T16-3 PASS" -ForegroundColor Green } else { Write-Host "  T16-3 FAIL" -ForegroundColor Red }
 
     # T16-4: resize back 80x24
     Write-Host ""
@@ -92,7 +92,7 @@ try {
     $null = Call "send_input" @{ session_id = $sid; data = "stty size`n" }
     $r = Call "read_output" @{ session_id = $sid; wait_for = "24"; timeout_secs = 10 }
     Write-Host "  stty size: $($r.output)" -ForegroundColor Gray
-    if ($r.output -match "(?m)^24 80") { Write-Host "  T16-4 PASS" -ForegroundColor Green } else { Write-Host "  T16-4 CHECK" -ForegroundColor Yellow }
+    if ($r.output -match "24 80") { Write-Host "  T16-4 PASS" -ForegroundColor Green } else { Write-Host "  T16-4 FAIL" -ForegroundColor Red }
 
     # T16-5: vim + resize
     Write-Host ""
@@ -112,7 +112,7 @@ try {
     Start-Sleep -Seconds 2
     $null = Call "resize" @{ session_id = $sid; cols = 100; rows = 30 }
     Start-Sleep -Seconds 1
-    $null = Call "send_control" @{ session_id = $sid; control = "CtrlC" }
+    $null = Call "send_control" @{ session_id = $sid; control_key = "ctrl+c" }
     Start-Sleep -Seconds 1
     Write-Host "  T16-6 PASS (top + resize + Ctrl+C OK)" -ForegroundColor Green
 

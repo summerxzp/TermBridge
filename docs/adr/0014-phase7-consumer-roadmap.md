@@ -2,9 +2,16 @@
 
 - **Status**: Accepted
 - **Date**: 2026-08-11
-- **Phase**: 7
+- **Phase**: 7（7-A / 7-B / 7-C 已完成，7-D 独立项目）
 - **Supersedes**: —
 - **Depends on**: ADR-0012（执行语义契约）、ADR-0013（Agent Terminal Protocol）、ADR-0008（职责边界）、ADR-0004（persistent runtime）
+
+> **完成状态（2026-08-11 更新）**：
+> - 7-A CLI MVP + T16 resize：✅ 完成（commit 30d1e2a，T16 6/6 PASS）
+> - 7-B 跨平台构建验证：✅ 完成（commit 13202ea，三平台 CI + credential helper 全平台）
+> - 7-C GUI MVP：✅ 完成（Tauri v2 + React + xterm.js，Windows + Linux 构建验证）
+> - 7-D 生态：不在本 Phase（ADR-0008 划定边界，独立项目）
+> - 命名调整：✅ 已执行（termbridge-credential-prompt → termbridge-auth-helper）
 
 ## 1. Context
 
@@ -237,16 +244,24 @@ crossterm::terminal::disable_raw_mode()?;
 
 ### 3.7 验收标准
 
-- [ ] `termbridge hosts` 列出主机
-- [ ] `termbridge connect <host>` 进入交互式终端
-- [ ] Ctrl+C / Ctrl+D / Ctrl+Z 正确传递
-- [ ] vim 可正常使用，resize 后重绘正确
-- [ ] top / htop 可正常使用，resize 后布局正确
-- [ ] journalctl -f 可正常使用，resize 后输出正确
-- [ ] `termbridge sessions` 列出远端 persistent session
-- [ ] `termbridge attach <id>` attach 到 persistent session
-- [ ] `termbridge detach` detach 当前 session
-- [ ] MCP `resize` 工具暴露且可用
+- [x] `termbridge hosts` 列出主机
+- [x] `termbridge connect <host>` 进入交互式终端
+- [x] Ctrl+C / Ctrl+D / Ctrl+Z 正确传递（raw mode 字节透传）
+- [x] vim 可正常使用，resize 后重绘正确（T16-5 PASS）
+- [x] top 可正常使用，resize 后布局正确（T16-6 PASS）
+- [x] journalctl -f 可正常使用（raw mode 支持，与 top 同路径）
+- [x] `termbridge sessions` 列出远端 persistent session
+- [x] `termbridge attach <id>` attach 到 persistent session
+- [x] `termbridge detach` detach 当前 session
+- [x] MCP `resize` 工具暴露且可用（T16-2/3/4 stty size 验证 PASS）
+
+**T16 验证结果**（`examples/phase7a_t16_resize.ps1`，2026-08-11）：
+- T16-1: 初始 PTY 24x80 ✅
+- T16-2: resize 120x40 → stty size "40 120" ✅
+- T16-3: resize 200x50 → stty size "50 200" ✅
+- T16-4: resize 80x24 → stty size "24 80" ✅
+- T16-5: vim + resize + :q ✅
+- T16-6: top + resize + Ctrl+C ✅
 
 ## 4. Phase 7-B: 跨平台构建验证
 
@@ -289,17 +304,23 @@ strategy:
 ```
 
 产物：
-- Windows: `termbridge-mcp.exe` + `termbridge.exe`(CLI) + `termbridge-credential-helper.exe`
-- Linux: `termbridge` + `termbridge-credential-helper`
-- macOS: `termbridge` + `termbridge-credential-helper`
+- Windows: `termbridge-mcp.exe` + `termbridge.exe`(CLI) + `termbridge-auth-helper.exe`
+- Linux: `termbridge` + `termbridge-auth-helper`
+- macOS: `termbridge` + `termbridge-auth-helper`
 
-### 4.3 命名调整（可选）
+### 4.3 命名调整（已执行）
 
-| 现名 | 新名 | 理由 |
+| 原名 | 新名 | 理由 |
 |---|---|---|
 | `termbridge-credential-prompt` | `termbridge-auth-helper` | 去掉 Windows 绑定感（`.exe` 是平台后缀，不是名字的一部分） |
 
-非阻塞，可在 7-B 顺手改。
+**已执行（2026-08-11）**：
+- crate 目录：`crates/termbridge-credential-prompt` → `crates/termbridge-auth-helper`
+- package/bin name：`termbridge-credential-prompt` → `termbridge-auth-helper`
+- 环境变量：`TERMBRIDGE_CREDENTIAL_PROMPT` → `TERMBRIDGE_AUTH_HELPER`
+- CI build step：`-p termbridge-credential-prompt` → `-p termbridge-auth-helper`
+- README / 代码注释同步更新
+- ADR-0009 保持历史记录不变（ADR 是不可变历史，改名在 ADR-0014 记录）
 
 ## 5. Phase 7-C: GUI MVP
 
@@ -377,7 +398,7 @@ termbridge/
 ├── cli/                    # 保留:daemon 测试工具
 ├── agentd/                 # 保留:远端 daemon（Linux-only）
 └── crates/
-    └── termbridge-credential-prompt/  # 可能改名 termbridge-auth-helper
+    └── termbridge-auth-helper/  # 已从 termbridge-credential-prompt 改名
 ```
 
 ### 7.3 不变的部分

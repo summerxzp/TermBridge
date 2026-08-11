@@ -13,7 +13,7 @@
 //!     │
 //!     │ spawn + private IPC pipe
 //!     ▼
-//! termbridge-credential-prompt（workspace member crate）
+//! termbridge-auth-helper（workspace member crate）
 //!     │
 //!     ├── Windows native dialog
 //!     ├── macOS native dialog（后续）

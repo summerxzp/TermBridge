@@ -6,6 +6,11 @@ Cargo.lock.bak
 # IDE
 .vscode/
 .idea/
+.mcp.json
+
+# MCP test temp files
+mcp_stderr.txt
+mcp_stdout.txt
 *.swp
 *.swo
 
@@ -18,3 +23,9 @@ Thumbs.db
 .env.local
 *.pem
 *.key
+
+# GUI (Tauri + Node.js)
+gui/node_modules/
+gui/dist/
+gui/src-tauri/target/
+gui/src-tauri/gen/

@@ -24,15 +24,35 @@ jobs:
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Linux dependencies (Tauri)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build frontend (for Tauri asset embedding)
+        working-directory: gui
+        run: |
+          npm ci
+          npm run build
+
       - name: Build main binaries (termbridge-mcp, termbridge)
         run: cargo build --release --bin termbridge-mcp --bin termbridge
 
-      - name: Build credential helper
-        run: cargo build --release -p termbridge-credential-prompt
+      - name: Build auth helper
+        run: cargo build --release -p termbridge-auth-helper
 
       - name: Build agentd (Linux only)
         if: runner.os == 'Linux'
         run: cargo build --release -p termbridge-agentd
+
+      - name: Check GUI (Tauri)
+        run: cargo check -p termbridge-gui
 
       - name: Run unit tests
         run: cargo test --lib

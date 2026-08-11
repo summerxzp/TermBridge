@@ -137,6 +137,10 @@ pub struct ReadOutputParamsSchema {
     pub max_bytes: Option<usize>,
     /// Context lines around wait_for match (default 0, max 50)
     pub context_lines: Option<usize>,
+    /// Strip terminal control sequences (CSI/OSC/DCS/APC) from output.
+    /// Only affects returned data, not the ring buffer. Default false.
+    #[serde(default)]
+    pub strip_ansi: bool,
 }
 
 /// send_control 参数
@@ -475,7 +479,7 @@ impl TermBridgeServer {
     }
 
     /// Read output from a terminal session.
-    #[tool(description = "Read output from a terminal session. Supports 4 modes: (1) default settle - drain output until stable; (2) wait_for - block until regex/substring appears; (3) tail_lines - peek last N lines; (4) since_cursor - incremental read from cursor. Only one mode active per call.")]
+    #[tool(description = "Read output from a terminal session. Supports 4 modes: (1) default settle - drain output until stable; (2) wait_for - block until regex/substring appears; (3) tail_lines - peek last N lines; (4) since_cursor - incremental read from cursor. Only one mode active per call. Set strip_ansi=true to strip terminal control sequences (CSI/OSC/DCS) from returned output.")]
     async fn read_output(
         &self,
         Parameters(params): Parameters<ReadOutputParamsSchema>,
@@ -487,6 +491,7 @@ impl TermBridgeServer {
             since_cursor: params.since_cursor,
             max_bytes: params.max_bytes,
             context_lines: params.context_lines,
+            strip_ansi: params.strip_ansi,
         };
         match self.session_manager.read_output(&params.session_id, domain_params).await {
             Ok(r) => {
@@ -496,13 +501,19 @@ impl TermBridgeServer {
                     crate::domain::output::ReadMode::WaitFor => "wait_for",
                     crate::domain::output::ReadMode::Settle => "settle",
                 };
+                // Phase 8：按 strip_ansi 剥离终端控制序列（只改返回，不改 RingBuffer）
+                let output_bytes = if params.strip_ansi {
+                    crate::domain::ansi_strip::strip_control_sequences(&r.output)
+                } else {
+                    r.output
+                };
                 // Phase 6-A：填充 session_state 供 Agent 感知断线
                 let session_state = self
                     .session_manager
                     .session_state(&params.session_id)
                     .unwrap_or_else(|_| "unknown".to_string());
                 ok_result(ReadOutputDto {
-                    output: String::from_utf8_lossy(&r.output).into_owned(),
+                    output: String::from_utf8_lossy(&output_bytes).into_owned(),
                     cursor: r.cursor,
                     has_more: r.has_more,
                     is_truncated: r.is_truncated,

@@ -1,13 +1,14 @@
 [package]
-name = "termbridge-credential-prompt"
+name = "termbridge-auth-helper"
 version = "0.0.1"
 edition = "2021"
 publish = false
 
 # ADR-0009 阶段 B1：独立 helper process，Windows native 凭据对话框。
 # 不依赖 termbridge 主 crate，仅通过 stdin/stdout JSON IPC 通信。
+# ADR-0014 §4.3：从 termbridge-credential-prompt 改名为 termbridge-auth-helper（去 Windows 绑定感）。
 [[bin]]
-name = "termbridge-credential-prompt"
+name = "termbridge-auth-helper"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,6 +1,6 @@
 # Phase 3-A W2：agentd + cli 作为 workspace 成员（远端 daemon + 测试 client，仅 Linux 编译）
 [workspace]
-members = ["agentd", "cli", "crates/termbridge-credential-prompt"]
+members = ["agentd", "cli", "crates/termbridge-auth-helper", "gui/src-tauri"]
 
 [package]
 name = "termbridge"
