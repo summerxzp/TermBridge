@@ -262,9 +262,11 @@ async fn interactive_terminal(
     });
 
     // 6. spawn write task: 键盘输入 → write_raw → 远端 PTY
+    //    input_rx 关闭（事件线程退出 / stdin EOF）时，write_task 结束，
+    //    通过 select! 让主循环感知并退出（否则主循环会卡在 read_raw 等 PTY EOF）
     let mgr_write = Arc::clone(&mgr);
     let sid_write = session_id.to_string();
-    let write_task = tokio::spawn(async move {
+    let mut write_task = tokio::spawn(async move {
         while let Some(bytes) = input_rx.recv().await {
             if let Err(e) = mgr_write.write_raw(&sid_write, &bytes).await {
                 eprintln!("write_raw error: {e}");
@@ -285,27 +287,50 @@ async fn interactive_terminal(
     });
 
     // 8. 主循环: read_raw → stdout（PTY 输出实时显示）
+    //    用 select! 同时等 PTY 输出和 write_task 结束
+    //    write_task 结束（stdin EOF / 事件线程退出）→ 发 Ctrl+D 给远端 shell → 等 PTY EOF
     let mut stdout = tokio::io::stdout();
     let main_result = loop {
-        match mgr.read_raw(session_id).await {
-            Ok(Some(data)) => {
-                if let Err(e) = stdout.write_all(&data).await {
-                    break Err(anyhow::anyhow!("stdout write error: {e}"));
-                }
-                if let Err(e) = stdout.flush().await {
-                    break Err(anyhow::anyhow!("stdout flush error: {e}"));
+        tokio::select! {
+            // PTY → stdout
+            read_res = mgr.read_raw(session_id) => {
+                match read_res {
+                    Ok(Some(data)) => {
+                        if let Err(e) = stdout.write_all(&data).await {
+                            break Err(anyhow::anyhow!("stdout write error: {e}"));
+                        }
+                        if let Err(e) = stdout.flush().await {
+                            break Err(anyhow::anyhow!("stdout flush error: {e}"));
+                        }
+                    }
+                    Ok(None) => break Ok(()), // PTY EOF（远端 shell 退出 / 连接断开）
+                    Err(e) => break Err(anyhow::anyhow!("read_raw error: {e}")),
                 }
             }
-            Ok(None) => break Ok(()), // PTY EOF（远端 shell 退出 / 连接断开）
-            Err(e) => break Err(anyhow::anyhow!("read_raw error: {e}")),
+            // write_task 结束 → stdin EOF，发 Ctrl+D 让远端 shell 退出
+            _ = &mut write_task => {
+                // 发 Ctrl+D 触发远端 shell 退出（空行 EOF）
+                let _ = mgr.send_control(session_id, termbridge::domain::provider::ControlKey::CtrlD).await;
+                // 继续读 PTY 直到 EOF（shell 退出后的最后输出）
+                loop {
+                    match mgr.read_raw(session_id).await {
+                        Ok(Some(data)) => {
+                            let _ = stdout.write_all(&data).await;
+                            let _ = stdout.flush().await;
+                        }
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+                break Ok(());
+            }
         }
     };
 
-    // 9. 清理：停事件线程 → 禁用 raw mode → abort write/resize task
+    // 9. 清理：停事件线程 → 禁用 raw mode → abort resize task
     running.store(false, Ordering::Relaxed);
     let _ = event_thread.join(); // 等待事件线程退出（最多 100ms）
     crossterm::terminal::disable_raw_mode().ok();
-    write_task.abort();
     resize_task.abort();
 
     main_result
