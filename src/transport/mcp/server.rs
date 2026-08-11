@@ -1,4 +1,4 @@
-//! rmcp MCP server —— 18 工具映射到 application 层（§6 / §7.4 Phase 1-2 / Phase 3-B / Phase 4-A / Phase 5-A-B / ADR-0009）
+//! rmcp MCP server —— 20 工具映射到 application 层（§6 / §7.4 Phase 1-2 / Phase 3-B / Phase 4-A / Phase 5-A-B / ADR-0009）
 //!
 //! 工具：
 //! 1. `list_hosts`            → HostManager::list_hosts
@@ -20,6 +20,7 @@
 //! 17. `detect_remote_env`    → SessionManager::detect_remote_env（Phase 5-B，远端环境检测）
 //! 18. `bootstrap_host`       → BootstrapHost::bootstrap（ADR-0009，首次 SSH key 部署）
 //! 19. `reconnect_session`    → SessionManager::reconnect_session（Phase 6-A，ADR-0010，断线重连）
+//! 20. `resize`               → SessionManager::resize（调整 PTY 尺寸）
 //!
 //! 错误格式（§6.1）：`CallToolResult::structured_error({code, message, retriable})`
 //! 成功格式：`CallToolResult::structured({工具特定结构})`
@@ -145,6 +146,17 @@ pub struct SendControlParams {
     pub session_id: String,
     /// Control key: "ctrl+c" / "ctrl+d" / "ctrl+z" / "tab" / "enter" / "escape"
     pub control_key: String,
+}
+
+/// resize 参数
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ResizeParams {
+    /// Session ID returned by open_session
+    pub session_id: String,
+    /// New number of columns (width)
+    pub cols: u16,
+    /// New number of rows (height)
+    pub rows: u16,
 }
 
 /// close_session 参数
@@ -525,6 +537,22 @@ impl TermBridgeServer {
         };
         match self.session_manager.send_control(&params.session_id, key).await {
             Ok(()) => ok_result(OkResult { ok: true }),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    /// Resize a terminal session's PTY dimensions.
+    #[tool(description = "Resize a terminal session's PTY dimensions (cols x rows). Sends a window-change request to the remote PTY. Useful when the terminal UI layout changes.")]
+    async fn resize(
+        &self,
+        Parameters(params): Parameters<ResizeParams>,
+    ) -> CallToolResult {
+        match self
+            .session_manager
+            .resize(&params.session_id, params.cols, params.rows)
+            .await
+        {
+            Ok(()) => ok_result(json!({"resized": true, "cols": params.cols, "rows": params.rows})),
             Err(e) => err_result(&e),
         }
     }

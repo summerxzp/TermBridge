@@ -8,7 +8,7 @@
 # Usage: powershell -ExecutionPolicy Bypass -File .\examples\e2e_cross_restart.ps1
 
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 if (-not (Test-Path $exe)) {
     Write-Host "BUILD: release binary not found, building..." -ForegroundColor Yellow
@@ -154,7 +154,7 @@ try {
     Write-Host "========== Phase 1: MCP Process 1 (Create + Detach) ==========" -ForegroundColor Yellow
     Write-Host ""
 
-    Write-Host "--- Starting termbridge.exe process 1 ---" -ForegroundColor Yellow
+    Write-Host "--- Starting termbridge-mcp.exe process 1 ---" -ForegroundColor Yellow
     Start-TermBridge
     Write-Host "<<< process 1 started (PID=$($script:proc.Id))" -ForegroundColor Green
 
@@ -200,9 +200,9 @@ try {
     if ($null -eq $detachResult) { throw "Phase 1: detach_session failed" }
     Write-Host "<<< detach_session OK - remote PTY kept alive" -ForegroundColor Green
 
-    # 6. Close termbridge.exe process 1 (simulating MCP restart/crash)
+    # 6. Close termbridge-mcp.exe process 1 (simulating MCP restart/crash)
     Write-Host ""
-    Write-Host "--- Closing termbridge.exe process 1 (simulating MCP restart) ---" -ForegroundColor Yellow
+    Write-Host "--- Closing termbridge-mcp.exe process 1 (simulating MCP restart) ---" -ForegroundColor Yellow
     Stop-TermBridge
     Write-Host "<<< process 1 terminated" -ForegroundColor Green
 
@@ -216,7 +216,7 @@ try {
     Write-Host "========== Phase 2: MCP Process 2 (List + Attach + Verify) ==========" -ForegroundColor Yellow
     Write-Host ""
 
-    Write-Host "--- Starting termbridge.exe process 2 ---" -ForegroundColor Yellow
+    Write-Host "--- Starting termbridge-mcp.exe process 2 ---" -ForegroundColor Yellow
     Start-TermBridge
     Write-Host "<<< process 2 started (PID=$($script:proc.Id))" -ForegroundColor Green
 

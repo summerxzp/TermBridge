@@ -6,14 +6,14 @@
 # 用法：.\examples\e2e_persistent_config.ps1
 
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 if (-not (Test-Path $exe)) {
     Write-Host "BUILD: release binary not found, building..." -ForegroundColor Yellow
     cargo build --release 2>&1 | Out-Null
 }
 
-# ── 启动 termbridge.exe 子进程 ──
+# ── 启动 termbridge-mcp.exe 子进程 ──
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = (Resolve-Path $exe).Path
 $psi.RedirectStandardInput = $true

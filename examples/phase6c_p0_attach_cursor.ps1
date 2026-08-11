@@ -1,4 +1,4 @@
-﻿# Phase 6-C P0: T17 Attach/Cursor Boundary Test (ADR-0012 契约 ⑦)
+# Phase 6-C P0: T17 Attach/Cursor Boundary Test (ADR-0012 契约 ⑦)
 # Target: 192.168.1.171
 #
 # 验证：detach/attach 后输出连续不丢失、不重复、可继续交互
@@ -17,7 +17,7 @@
 #  11. close_session → 清理
 
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = (Resolve-Path $exe).Path

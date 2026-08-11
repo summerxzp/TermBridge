@@ -33,7 +33,7 @@ Runtime Contract（已冻结）
 
 | 组件 | 现状 | 缺口 |
 |---|---|---|
-| 主控端 termbridge.exe | Rust 跨平台编译 | macOS/Linux 从未实际验证 |
+| 主控端 termbridge-mcp.exe | Rust 跨平台编译 | macOS/Linux 从未实际验证 |
 | agentd | Linux-only（远端，合理） | — |
 | credential helper | 架构跨平台（platform/{windows,linux,macos}.rs） | **macOS/Linux 是 stub，返回 Unsupported** |
 | MCP resize 工具 | `TerminalHandle::resize` trait 方法已存在，两个 Provider 都实现 | MCP 未暴露 |
@@ -289,7 +289,7 @@ strategy:
 ```
 
 产物：
-- Windows: `termbridge.exe` + `termbridge-credential-helper.exe`
+- Windows: `termbridge-mcp.exe` + `termbridge.exe`(CLI) + `termbridge-credential-helper.exe`
 - Linux: `termbridge` + `termbridge-credential-helper`
 - macOS: `termbridge` + `termbridge-credential-helper`
 
@@ -369,7 +369,7 @@ GUI Process（Tauri）
 
 ```
 termbridge/
-├── Cargo.toml              # 主 crate（termbridge.exe）
+├── Cargo.toml              # 主 crate（termbridge-mcp.exe MCP server + termbridge.exe CLI）
 ├── src/
 │   ├── bin/
 │   │   └── termbridge.rs   # 新增:人类 CLI 入口

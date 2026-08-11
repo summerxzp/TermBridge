@@ -1,7 +1,7 @@
 # Phase 6-A e2e: Session 断线感知 + 手动重连（ADR-0010）
 # 验证流程：open_session → read_output(ready) → exit 触发 Lost → read_output(session_state=lost) → reconnect_session → read_output(reconnected)
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = (Resolve-Path $exe).Path

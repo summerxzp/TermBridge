@@ -1,7 +1,7 @@
 # Escaping stress test: complex/long commands on 171
 # 7 scenarios: special chars / nested quotes / $ vars / backtick / heredoc / long line / multiline
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = (Resolve-Path $exe).Path

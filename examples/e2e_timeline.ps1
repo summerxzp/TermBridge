@@ -1,7 +1,7 @@
 # Phase 4-A Timeline e2e 验证
 # 流程：open_session → send_input(echo) → read_output(wait_for) → send_control(ctrl+c) → get_session_timeline → 验证事件
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = (Resolve-Path $exe).Path

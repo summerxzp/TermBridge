@@ -2,7 +2,7 @@
 # This is INTERACTIVE: will pop up CredUI dialog for password input
 # User needs to enter password "123" in the dialog
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 Write-Host "========================================" -ForegroundColor Yellow
 Write-Host "INTERACTIVE TEST: bootstrap_host" -ForegroundColor Yellow

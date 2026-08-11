@@ -18,6 +18,7 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::Serialize;
 use tokio::task::JoinHandle;
+use bytes::Bytes;
 
 use crate::domain::output::{ReadOutputParams, ReadOutputResult};
 use crate::domain::policy::{Action, Decision};
@@ -304,6 +305,57 @@ impl SessionManager {
         tracing::info!(session = %session_id, control = ?key, "send_control");
         let session = self.get_session(session_id)?;
         match session.send_control(key).await {
+            Ok(()) => Ok(()),
+            Err(e) if matches!(e, TermError::SessionClosed(_)) => {
+                self.cleanup_detached_session(session_id, &session);
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    // ── 人类管理员 CLI raw mode（直接读写 PTY handle，绕过 OutputEngine buffer） ──
+
+    /// 让 session 进入 raw mode：中止内部 read task，让外部可独占调用 `read_raw`。
+    ///
+    /// 调用后 OutputEngine buffer 不再更新（read task 已中止），`handle.read()`
+    /// 可被 `read_raw` 独占调用，不会与内部 read_task 竞争。
+    pub fn prepare_for_raw_mode(&self, session_id: &str) -> Result<(), TermError> {
+        let session = self.get_session(session_id)?;
+        session.abort_read_task();
+        Ok(())
+    }
+
+    /// 直接从 PTY handle 读一批原始字节（供 CLI raw mode）。
+    ///
+    /// **必须先调 `prepare_for_raw_mode`**，否则会与 Session 内部 read_task 竞争
+    /// `handle.read()`（两者都是单消费者，会交替拿到数据导致输出丢失）。
+    /// `Ok(None)` = PTY EOF（远端 shell 退出 / 连接断开）。
+    pub async fn read_raw(&self, session_id: &str) -> Result<Option<Bytes>, TermError> {
+        let session = self.get_session(session_id)?;
+        session.handle().read().await
+    }
+
+    /// 直接写字节到 PTY handle（供 CLI raw mode，不经过 Policy 拦截）。
+    ///
+    /// 与 `send_input` 的区别：不经过 Policy 拦截 / 不更新 timeline / 不 touch
+    /// last_activity。CLI 是人类管理员工具，管理员自行承担命令风险。
+    pub async fn write_raw(&self, session_id: &str, data: &[u8]) -> Result<(), TermError> {
+        let session = self.get_session(session_id)?;
+        session.handle().write(data).await
+    }
+
+    /// 调整 PTY 尺寸（window_change）。
+    pub async fn resize(
+        &self,
+        session_id: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), TermError> {
+        // Phase 4-B：tracing（info 级别，低频重要操作）
+        tracing::info!(session = %session_id, cols, rows, "resize");
+        let session = self.get_session(session_id)?;
+        match session.resize(PtySize { rows, cols }).await {
             Ok(()) => Ok(()),
             Err(e) if matches!(e, TermError::SessionClosed(_)) => {
                 self.cleanup_detached_session(session_id, &session);

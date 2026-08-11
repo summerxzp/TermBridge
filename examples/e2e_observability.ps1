@@ -1,7 +1,7 @@
 # Phase 4-B Observability e2e (non-destructive)
 # Verify: timeline events work after observability changes
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = (Resolve-Path $exe).Path

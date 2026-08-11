@@ -8,7 +8,7 @@
 #   T14 - concurrent waiter (MCP stdio is serial; document limitation + verify sequential non-interference)
 #   T15 - disconnect mid-write (kill sshd session -> lost -> reconnect -> idempotency check)
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = (Resolve-Path $exe).Path

@@ -1,7 +1,7 @@
 # ADR-0009 e2e: verify bootstrap_host tool registered + helper resolved
 # Non-interactive: only checks tool list and helper resolution log
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = (Resolve-Path $exe).Path

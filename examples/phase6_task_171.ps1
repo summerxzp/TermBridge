@@ -1,7 +1,7 @@
 # Task: connect 171 - neofetch + wazuh resource query (since_cursor incremental read)
 # Improvement: use since_cursor, only read new output since last read, no history
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = (Resolve-Path $exe).Path

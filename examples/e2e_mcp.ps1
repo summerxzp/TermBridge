@@ -10,7 +10,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 if (-not (Test-Path $exe)) {
     Write-Host "BUILD: release binary not found, building..." -ForegroundColor Yellow

@@ -13,8 +13,12 @@ name = "termbridge"
 path = "src/lib.rs"
 
 [[bin]]
-name = "termbridge"
+name = "termbridge-mcp"
 path = "src/main.rs"
+
+[[bin]]
+name = "termbridge"
+path = "src/bin/termbridge.rs"
 
 # Phase 0 原型用 examples/ 验证各 crate，不污染主二进制
 [[example]]
@@ -62,6 +66,8 @@ async-trait = "0.1"
 # Phase 3-A W3：daemon protocol 的 data 字段是 base64 编码（send_input 编码 / pty_data 解码）
 base64 = "0.23"
 clap = { version = "4", features = ["derive"] }
+# 人类管理员 CLI（src/bin/termbridge.rs）：raw mode + 终端 resize
+crossterm = "0.28"
 regex = "1"
 parking_lot = "0.12"
 # 并发 HashMap（Phase 1：多 session 并发读写，替代 Mutex<HashMap>）

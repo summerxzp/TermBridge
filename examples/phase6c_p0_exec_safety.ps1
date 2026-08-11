@@ -1,7 +1,7 @@
 # Phase 6-C P0: execution semantic safety tests (T1-T9 per ADR-0011)
 # All commands on remote 192.168.1.171 via termbridge MCP stdio
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = (Resolve-Path $exe).Path

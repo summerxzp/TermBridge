@@ -2,7 +2,7 @@
 # 验证：kill sshd session → read task Err → Lost → reconnect_session → ready
 # 目标：192.168.1.171
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = (Resolve-Path $exe).Path

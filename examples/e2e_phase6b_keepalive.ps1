@@ -3,7 +3,7 @@
 # 如果 keepalive 不工作，30s 后会 disconnect → Lost
 # 目标：192.168.1.171
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = (Resolve-Path $exe).Path

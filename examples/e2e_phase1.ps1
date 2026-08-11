@@ -1,4 +1,4 @@
-﻿# Phase 1 端到端集成测试
+# Phase 1 端到端集成测试
 # 覆盖：长任务中断 / SFTP upload-download / 错误主机连接 / 日志脱敏
 #
 # 用法：
@@ -18,7 +18,7 @@ $ErrorActionPreference = "Stop"
 # ── 路径常量 ──────────────────────────────────────────────────────
 # 项目根目录（脚本在 examples/ 下，向上一级即为根）
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$exe = Join-Path $ProjectRoot "target\release\termbridge.exe"
+$exe = Join-Path $ProjectRoot "target\release\termbridge-mcp.exe"
 # SFTP 本地临时目录（必须在 cwd 白名单内，即项目根目录下）
 $TmpDir = Join-Path $ProjectRoot ".e2e_tmp"
 

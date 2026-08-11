@@ -1,7 +1,7 @@
 # Phase 5 e2e (non-destructive)
 # Verify: detect_remote_env + sftp_transfer_dir (upload test dir, then cleanup)
 $ErrorActionPreference = "Stop"
-$exe = ".\target\release\termbridge.exe"
+$exe = ".\target\release\termbridge-mcp.exe"
 
 $psi = [System.Diagnostics.ProcessStartInfo]::new()
 $psi.FileName = (Resolve-Path $exe).Path

@@ -224,6 +224,16 @@ impl Session {
         &self.handle
     }
 
+    /// 中止内部 PTY read task（供 CLI raw mode 接管读取循环）。
+    ///
+    /// 调用后 OutputEngine buffer 不再更新，但 `handle.read()` 可被外部独占调用，
+    /// 不会与内部 read_task 竞争。Session 状态不变（仍为 Ready）。
+    pub fn abort_read_task(&self) {
+        if let Some(task) = self.read_task.lock().take() {
+            task.abort();
+        }
+    }
+
     /// 返回执行事件时间线引用（Phase 4-A）。
     pub fn timeline(&self) -> &Timeline {
         &self.timeline
