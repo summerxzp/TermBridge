@@ -6,7 +6,7 @@
 
 为 AI Agent 提供持久、可恢复、具有明确执行语义的远程终端运行时
 
-[![release](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/summerxzp/TermBridge/releases/tag/v0.1.0)
+[![release](https://img.shields.io/badge/release-v0.1.1-blue)](https://github.com/summerxzp/TermBridge/releases/tag/v0.1.1)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#)
 
@@ -33,20 +33,20 @@ TermBridge 是一个 MCP（Model Context Protocol）server，通过 stdio 与 AI
 
 ### 方式一：下载预构建二进制（推荐）
 
-从 [GitHub Release v0.1.0](https://github.com/summerxzp/TermBridge/releases/tag/v0.1.0) 下载对应平台的压缩包：
+从 [GitHub Release v0.1.1](https://github.com/summerxzp/TermBridge/releases/tag/v0.1.1) 下载对应平台的压缩包：
 
 | 平台 | 文件 |
 |------|------|
-| Windows x86_64 | `termbridge-v0.1.0-windows-x86_64.zip` |
-| Linux x86_64 | `termbridge-v0.1.0-linux-x86_64.tar.gz` |
-| macOS Apple Silicon (M1/M2/M3) | `termbridge-v0.1.0-macos-arm64.tar.gz` |
+| Windows x86_64 | `termbridge-v0.1.1-windows-x86_64.zip` |
+| Linux x86_64 | `termbridge-v0.1.1-linux-x86_64.tar.gz` |
+| macOS Apple Silicon (M1/M2/M3) | `termbridge-v0.1.1-macos-arm64.tar.gz` |
 
 > macOS Intel 用户：暂无预构建包，可通过 Rosetta 2 运行 arm64 版本，或自行 `cargo build --release`。
 
 解压后包含：
 
 ```
-termbridge-v0.1.0-<platform>-<arch>/
+termbridge-v0.1.1-<platform>-<arch>/
 ├── termbridge-mcp            MCP server 主入口
 ├── termbridge                CLI（人类管理员工具，可选）
 ├── termbridge-auth-helper    凭据 helper（必须与 mcp 同目录）

@@ -5,6 +5,25 @@ All notable changes to TermBridge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-08-12
+
+### Changed
+
+**Release pipeline**
+- New `release.yml` workflow: automated 4-target build on `v*` tag push, packages with templates + sha256, uploads to GitHub Release
+- Add macOS Apple Silicon (`aarch64-apple-darwin`) pre-built binary — macOS users no longer need to build from source
+- Embed `termbridge-agentd` (Linux x86_64) into all host packages under `resources/agentd/linux-x86_64/`; `bootstrap_host` auto-deploys it, users no longer need to manually download the remote daemon
+- New `packaging/` directory: `README.txt` + `mcp-config.json` templates tracked in git (previously in gitignored `release-artifacts/`, unavailable to CI)
+
+### Fixed
+
+- `CHANGELOG.md`: correct stale "macOS Keychain" credential description to "POSIX tty" (matches actual `termbridge-auth-helper` implementation on macOS)
+
+### Notes
+
+- macOS Intel (x86_64) pre-built binary intentionally not published — Intel Mac users can run the arm64 build via Rosetta 2 or build from source. Rationale: prioritize 95% user coverage over 100% arch coverage (see `docs/internal/打包建议.md`).
+- Release matrix reduced to 3 host packages: `windows-x86_64`, `linux-x86_64`, `macos-arm64`.
+
 ## [0.1.0] - 2026-08-12
 
 First public release. TermBridge Core is frozen (ADR-0016).
