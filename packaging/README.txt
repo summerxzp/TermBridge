@@ -15,11 +15,13 @@ Quick Start
 Files
 -----
 
-termbridge-mcp          MCP server binary (main entry point)
-termbridge              CLI binary (human admin tool, optional)
-termbridge-auth-helper  Credential helper (must be in same directory as termbridge-mcp)
-mcp-config.json         MCP server configuration template
-SKILL.md                Agent Terminal Protocol operational guide
+termbridge-mcp            MCP server binary (main entry point)
+termbridge                CLI binary (human admin tool, optional)
+termbridge-auth-helper    Credential helper (must be in same directory as termbridge-mcp)
+mcp-config.json           MCP server configuration template
+SKILL.md                  Agent Terminal Protocol operational guide
+resources/agentd/         Remote daemon binary (auto-deployed to target host by
+                          bootstrap_host, do not run locally; Linux x86_64 only)
 
 First Connection
 ----------------

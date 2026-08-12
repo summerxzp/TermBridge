@@ -1,12 +1,19 @@
 name: Release
 
-# 触发：推送 v* tag 时构建 4 个平台的 release 资产并上传到 GitHub Release
-# 平台矩阵：
+# 触发：推送 v* tag 时构建 release 资产并上传到 GitHub Release
+#
+# 发布矩阵（3 个主控包 + 1 个内嵌 runtime 组件）：
 #   windows-x86_64  (windows-latest,  MSVC)
 #   linux-x86_64    (ubuntu-latest,   GNU)
-#   macos-x86_64    (macos-13,        Intel runner 原生)
-#   macos-aarch64   (macos-latest,    Apple Silicon runner 原生)
+#   macos-arm64     (macos-latest,    Apple Silicon 原生)
+#
+# agentd (Linux x86_64 远端 daemon) 单独构建一次，嵌入所有主控包的
+# resources/agentd/linux-x86_64/，由 bootstrap_host 自动部署到远端，
+# 用户无需单独下载（参考 docs/internal/打包建议.md §推荐模型）
+#
 # 打包格式：Windows .zip，其他 .tar.gz；每个 archive 配 .sha256
+# macOS Intel (x86_64) 暂不发布：Intel Mac 用户可通过 Rosetta 2 运行 arm64 包
+# 的主控端（agentd 只跑远端 Linux，不影响）
 
 on:
   push:
@@ -19,9 +26,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # agentd 是 Linux-only 远端 daemon（依赖 nix crate），只能在 Linux runner 上构建
+  # 构建一次后作为 artifact 分发给 3 个主控 build job 嵌入
+  build-agentd:
+    name: Build agentd (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build agentd
+        run: cargo build --release -p termbridge-agentd
+
+      - name: Upload agentd artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentd-linux-x86_64
+          path: target/release/termbridge-agentd
+
   build:
     name: Build (${{ matrix.asset }})
     runs-on: ${{ matrix.runner }}
+    needs: build-agentd
     strategy:
       fail-fast: false
       matrix:
@@ -29,19 +56,12 @@ jobs:
           - asset: windows-x86_64
             runner: windows-latest
             target: x86_64-pc-windows-msvc
-            archive: zip
           - asset: linux-x86_64
             runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            archive: tar.gz
-          - asset: macos-x86_64
-            runner: macos-13
-            target: x86_64-apple-darwin
-            archive: tar.gz
-          - asset: macos-aarch64
+          - asset: macos-arm64
             runner: macos-latest
             target: aarch64-apple-darwin
-            archive: tar.gz
 
     steps:
       - uses: actions/checkout@v4
@@ -49,6 +69,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Download agentd artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: agentd-linux-x86_64
+          path: agentd-artifact
 
       - name: Build main binaries
         run: cargo build --release --target ${{ matrix.target }} --bin termbridge-mcp --bin termbridge
@@ -70,6 +96,9 @@ jobs:
           Copy-Item "packaging/mcp-config.json" "$dir/"
           Copy-Item "skills/termbridge/SKILL.md" "$dir/"
           Copy-Item "packaging/README.txt" "$dir/"
+          # 嵌入 agentd（Linux 远端 runtime 组件，由 bootstrap_host 自动部署）
+          New-Item -ItemType Directory -Path "$dir/resources/agentd/linux-x86_64" -Force | Out-Null
+          Copy-Item "agentd-artifact/termbridge-agentd" "$dir/resources/agentd/linux-x86_64/"
           Compress-Archive -Path "$dir/*" -DestinationPath "$dir.zip"
           $hash = (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $dir.zip" | Out-File -Encoding ascii "$dir.zip.sha256"
@@ -88,6 +117,9 @@ jobs:
           cp "packaging/mcp-config.json" "$dir/"
           cp "skills/termbridge/SKILL.md" "$dir/"
           cp "packaging/README.txt" "$dir/"
+          # 嵌入 agentd（Linux 远端 runtime 组件，由 bootstrap_host 自动部署）
+          mkdir -p "$dir/resources/agentd/linux-x86_64"
+          cp "agentd-artifact/termbridge-agentd" "$dir/resources/agentd/linux-x86_64/"
           tar czf "$dir.tar.gz" "$dir"
           shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"
 

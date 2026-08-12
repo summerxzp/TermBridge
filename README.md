@@ -26,7 +26,7 @@ TermBridge 是一个 MCP（Model Context Protocol）server，通过 stdio 与 AI
 - **SFTP 文件/目录传输**：单文件原子写、目录递归、路径策略防越界
 - **Persistent Runtime（可选）**：opt-in 部署远端 daemon，支持 session 跨 MCP 重启保活、detach/attach
 - **Agent Terminal Protocol**：ADR-0013 定义的 7 条规则，确保 Agent 正确处理 completion / timeout / disconnect / TUI
-- **跨平台**：Windows / Linux / macOS 全平台预构建二进制（macOS 同时支持 Intel + Apple Silicon），CLI + GUI + MCP 三种消费者
+- **跨平台**：Windows / Linux / macOS 预构建二进制（macOS Apple Silicon 原生，Intel Mac 可走 Rosetta 2），CLI + GUI + MCP 三种消费者
 - **安全边界严格**：host key 严格校验、密码脱敏日志、SFTP 路径策略、凭据不进 MCP schema
 
 ## 安装
@@ -39,8 +39,9 @@ TermBridge 是一个 MCP（Model Context Protocol）server，通过 stdio 与 AI
 |------|------|
 | Windows x86_64 | `termbridge-v0.1.0-windows-x86_64.zip` |
 | Linux x86_64 | `termbridge-v0.1.0-linux-x86_64.tar.gz` |
-| macOS Intel (x86_64) | `termbridge-v0.1.0-macos-x86_64.tar.gz` |
-| macOS Apple Silicon (M1/M2/M3) | `termbridge-v0.1.0-macos-aarch64.tar.gz` |
+| macOS Apple Silicon (M1/M2/M3) | `termbridge-v0.1.0-macos-arm64.tar.gz` |
+
+> macOS Intel 用户：暂无预构建包，可通过 Rosetta 2 运行 arm64 版本，或自行 `cargo build --release`。
 
 解压后包含：
 
@@ -51,7 +52,9 @@ termbridge-v0.1.0-<platform>-<arch>/
 ├── termbridge-auth-helper    凭据 helper（必须与 mcp 同目录）
 ├── mcp-config.json           MCP 配置模板
 ├── SKILL.md                  Agent Skill
-└── README.txt                快速开始
+├── README.txt                快速开始
+└── resources/agentd/
+    └── linux-x86_64/         远端 daemon（bootstrap_host 自动部署，无需手动操作）
 ```
 
 ### 方式二：从源码构建
