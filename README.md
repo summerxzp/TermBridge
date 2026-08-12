@@ -374,7 +374,7 @@ TermBridge/
 | Phase 5 | Remote Workspace（SFTP 目录递归 + 环境检测） | ✅ 完成 |
 | Phase 6 | Execution State + Reconnect + Agent Terminal Protocol | ✅ 完成 |
 | Phase 7 | CLI + 跨平台 + GUI + Provider API Freeze | ✅ 完成 |
-| Phase 8 | Adoption / Bootstrap（Skill + 开箱即用 + Dogfooding） | 🔄 进行中 |
+| Phase 8 | Adoption / Bootstrap（Skill + 开箱即用 + Dogfooding） | ✅ 完成 |
 | [ADR-0016](docs/adr/0016-runtime-freeze.md) | **Runtime Freeze** | ✅ 冻结 |
 | 未来 | Local / Docker / WSL Provider、Playbook、高级 GUI | 规划中 |
 
