@@ -207,7 +207,7 @@ bootstrap_host(host)
 无 IdentityFile → 自动生成 ed25519 keypair（~/.ssh/id_ed25519）
     │
     ▼
-弹出原生凭据对话框（Windows CredUI / Linux tty / macOS Keychain）
+弹出凭据输入（Windows CredUI / POSIX tty）
     ├── 用户取消 → status: cancelled
     │
     ▼

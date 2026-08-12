@@ -207,7 +207,7 @@ Try IdentityFile authentication
 No IdentityFile → auto-generate ed25519 keypair (~/.ssh/id_ed25519)
     │
     ▼
-Pop up native credential dialog (Windows CredUI / Linux tty / macOS Keychain)
+Pop up credential input (Windows CredUI / POSIX tty)
     ├── User cancels → status: cancelled
     │
     ▼
