@@ -8,7 +8,7 @@ A persistent, recoverable remote terminal runtime with explicit execution semant
 
 [![release](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/summerxzp/TermBridge/releases/tag/v0.1.0)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)](#)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#)
 
 [简体中文](README.md) | **English**
 
@@ -26,7 +26,7 @@ TermBridge is an MCP (Model Context Protocol) server that communicates with AI c
 - **SFTP File/Directory Transfer**: Atomic single-file writes, recursive directories, path policy protection
 - **Persistent Runtime (optional)**: Opt-in remote daemon for sessions surviving MCP restarts, detach/attach
 - **Agent Terminal Protocol**: 7 rules defined in ADR-0013 ensuring Agents handle completion / timeout / disconnect / TUI correctly
-- **Cross-Platform**: Windows / Linux / macOS build support, three consumers (CLI + GUI + MCP)
+- **Cross-Platform**: Windows / Linux / macOS pre-built binaries for all platforms (macOS supports both Intel and Apple Silicon), three consumers (CLI + GUI + MCP)
 - **Strict Security Boundary**: Host key strict checking, password redaction in logs, SFTP path policy, credentials excluded from MCP schema
 
 ## Installation
@@ -39,12 +39,13 @@ Download the archive for your platform from [GitHub Release v0.1.0](https://gith
 |----------|------|
 | Windows x86_64 | `termbridge-v0.1.0-windows-x86_64.zip` |
 | Linux x86_64 | `termbridge-v0.1.0-linux-x86_64.tar.gz` |
-| macOS | Not pre-built (build from source below) |
+| macOS Intel (x86_64) | `termbridge-v0.1.0-macos-x86_64.tar.gz` |
+| macOS Apple Silicon (M1/M2/M3) | `termbridge-v0.1.0-macos-aarch64.tar.gz` |
 
 Archive contents:
 
 ```
-termbridge-v0.1.0-<platform>-x86_64/
+termbridge-v0.1.0-<platform>-<arch>/
 ├── termbridge-mcp            MCP server main entry
 ├── termbridge                CLI (human admin tool, optional)
 ├── termbridge-auth-helper    Credential helper (must be in same directory as mcp)
@@ -65,8 +66,6 @@ git clone https://github.com/summerxzp/TermBridge.git
 cd TermBridge
 cargo build --release -p termbridge -p termbridge-auth-helper --bins
 ```
-
-> **macOS Note**: No macOS pre-build environment available. Users can build via `cargo build --release`. Code has passed macOS `cargo check` verification with no platform-specific API blockers.
 
 ## Quick Start
 

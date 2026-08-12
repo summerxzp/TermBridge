@@ -24,7 +24,7 @@ First public release. TermBridge Core is frozen (ADR-0016).
 
 **Bootstrap & Security** (ADR-0009)
 - `bootstrap_host` one-time SSH key deployment
-- Credential isolation via platform-native `termbridge-auth-helper` (Windows CredUI / Linux tty / macOS Keychain)
+- Credential isolation via platform-native `termbridge-auth-helper` (Windows CredUI / POSIX tty)
 - Password never enters LLM context
 
 **Consumers**

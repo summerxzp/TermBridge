@@ -8,7 +8,7 @@
 
 [![release](https://img.shields.io/badge/release-v0.1.0-blue)](https://github.com/summerxzp/TermBridge/releases/tag/v0.1.0)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey)](#)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#)
 
 **简体中文** | [English](README.en.md)
 
@@ -26,7 +26,7 @@ TermBridge 是一个 MCP（Model Context Protocol）server，通过 stdio 与 AI
 - **SFTP 文件/目录传输**：单文件原子写、目录递归、路径策略防越界
 - **Persistent Runtime（可选）**：opt-in 部署远端 daemon，支持 session 跨 MCP 重启保活、detach/attach
 - **Agent Terminal Protocol**：ADR-0013 定义的 7 条规则，确保 Agent 正确处理 completion / timeout / disconnect / TUI
-- **跨平台**：Windows / Linux / macOS 编译支持，CLI + GUI + MCP 三种消费者
+- **跨平台**：Windows / Linux / macOS 全平台预构建二进制（macOS 同时支持 Intel + Apple Silicon），CLI + GUI + MCP 三种消费者
 - **安全边界严格**：host key 严格校验、密码脱敏日志、SFTP 路径策略、凭据不进 MCP schema
 
 ## 安装
@@ -39,12 +39,13 @@ TermBridge 是一个 MCP（Model Context Protocol）server，通过 stdio 与 AI
 |------|------|
 | Windows x86_64 | `termbridge-v0.1.0-windows-x86_64.zip` |
 | Linux x86_64 | `termbridge-v0.1.0-linux-x86_64.tar.gz` |
-| macOS | 无预构建（见下方自行构建） |
+| macOS Intel (x86_64) | `termbridge-v0.1.0-macos-x86_64.tar.gz` |
+| macOS Apple Silicon (M1/M2/M3) | `termbridge-v0.1.0-macos-aarch64.tar.gz` |
 
 解压后包含：
 
 ```
-termbridge-v0.1.0-<platform>-x86_64/
+termbridge-v0.1.0-<platform>-<arch>/
 ├── termbridge-mcp            MCP server 主入口
 ├── termbridge                CLI（人类管理员工具，可选）
 ├── termbridge-auth-helper    凭据 helper（必须与 mcp 同目录）
@@ -65,8 +66,6 @@ git clone https://github.com/summerxzp/TermBridge.git
 cd TermBridge
 cargo build --release -p termbridge -p termbridge-auth-helper --bins
 ```
-
-> **macOS 说明**：当前无 macOS 预构建环境，用户可 `cargo build --release` 自行构建。代码已通过 macOS `cargo check` 验证，无平台特定 API 阻塞。
 
 ## 快速开始
 
