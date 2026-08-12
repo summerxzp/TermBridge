@@ -29,3 +29,6 @@ gui/node_modules/
 gui/dist/
 gui/src-tauri/target/
 gui/src-tauri/gen/
+
+# Internal development docs (phase reports, plans, etc.)
+docs/internal/
