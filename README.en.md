@@ -6,7 +6,7 @@
 
 A persistent, recoverable remote terminal runtime with explicit execution semantics for AI Agents
 
-[![release](https://img.shields.io/github/v/release/summerxzp/TermBridge?label=release)](https://github.com/summerxzp/TermBridge/releases/latest)
+[![release](https://img.shields.io/github/v/release/summerxzp/TermBridge?label=release&colorB=blue)](https://github.com/summerxzp/TermBridge/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue)](https://github.com/summerxzp/TermBridge)
 
@@ -37,9 +37,9 @@ Download the archive for your platform from [GitHub Release](https://github.com/
 
 | Platform | File |
 |----------|------|
-| Windows x86_64 | `termbridge-v0.1.1-windows-x86_64.zip` |
-| Linux x86_64 | `termbridge-v0.1.1-linux-x86_64.tar.gz` |
-| macOS Apple Silicon (M1/M2/M3) | `termbridge-v0.1.1-macos-arm64.tar.gz` |
+| Windows x86_64 | `termbridge-windows-x86_64.zip` |
+| Linux x86_64 | `termbridge-linux-x86_64.tar.gz` |
+| macOS Apple Silicon (M1/M2/M3...) | `termbridge-macos-arm64.tar.gz` |
 
 > macOS Intel users: no pre-built package. Run arm64 build via Rosetta 2, or build from source with `cargo build --release`.
 

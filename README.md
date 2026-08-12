@@ -6,7 +6,7 @@
 
 为 AI Agent 提供持久、可恢复、具有明确执行语义的远程终端运行时
 
-[![release](https://img.shields.io/github/v/release/summerxzp/TermBridge?label=release)](https://github.com/summerxzp/TermBridge/releases/latest)
+[![release](https://img.shields.io/github/v/release/summerxzp/TermBridge?label=release&colorB=blue)](https://github.com/summerxzp/TermBridge/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue)](https://github.com/summerxzp/TermBridge)
 
@@ -37,9 +37,9 @@ TermBridge 是一个 MCP（Model Context Protocol）server，通过 stdio 与 AI
 
 | 平台 | 文件 |
 |------|------|
-| Windows x86_64 | `termbridge-v0.1.1-windows-x86_64.zip` |
-| Linux x86_64 | `termbridge-v0.1.1-linux-x86_64.tar.gz` |
-| macOS Apple Silicon (M1/M2/M3) | `termbridge-v0.1.1-macos-arm64.tar.gz` |
+| Windows x86_64 | `termbridge-windows-x86_64.zip` |
+| Linux x86_64 | `termbridge-linux-x86_64.tar.gz` |
+| macOS Apple Silicon (M1/M2/M3...) | `termbridge-macos-arm64.tar.gz` |
 
 > macOS Intel 用户：暂无预构建包，可通过 Rosetta 2 运行 arm64 版本，或自行 `cargo build --release`。
 

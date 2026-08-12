@@ -86,9 +86,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $ver = "${{ github.ref_name }}"
           $asset = "${{ matrix.asset }}"
-          $dir = "termbridge-$ver-$asset"
+          $dir = "termbridge-$asset"
           New-Item -ItemType Directory -Path $dir | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/termbridge-mcp.exe" "$dir/"
           Copy-Item "target/${{ matrix.target }}/release/termbridge.exe" "$dir/"
@@ -107,9 +106,8 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          ver="${{ github.ref_name }}"
           asset="${{ matrix.asset }}"
-          dir="termbridge-$ver-$asset"
+          dir="termbridge-$asset"
           mkdir -p "$dir"
           cp "target/${{ matrix.target }}/release/termbridge-mcp" "$dir/"
           cp "target/${{ matrix.target }}/release/termbridge" "$dir/"
