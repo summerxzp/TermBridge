@@ -8,7 +8,7 @@
 
 [![release](https://img.shields.io/badge/release-v0.1.1-blue)](https://github.com/summerxzp/TermBridge/releases/tag/v0.1.1)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](#)
+[![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue)](https://github.com/summerxzp/TermBridge)
 
 **简体中文** | [English](README.en.md)
 
