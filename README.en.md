@@ -41,7 +41,7 @@ Download the archive for your platform from [GitHub Release](https://github.com/
 | Linux x86_64 | `termbridge-linux-x86_64.tar.gz` |
 | macOS Apple Silicon (M1/M2/M3...) | `termbridge-macos-arm64.tar.gz` |
 
-> macOS Intel users: no pre-built package. Run arm64 build via Rosetta 2, or build from source with `cargo build --release`.
+> macOS Intel users: no pre-built package yet. Please build from source, or wait for a future x86_64 macOS release.
 
 Archive contents:
 

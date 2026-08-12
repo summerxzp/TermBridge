@@ -41,7 +41,7 @@ TermBridge 是一个 MCP（Model Context Protocol）server，通过 stdio 与 AI
 | Linux x86_64 | `termbridge-linux-x86_64.tar.gz` |
 | macOS Apple Silicon (M1/M2/M3...) | `termbridge-macos-arm64.tar.gz` |
 
-> macOS Intel 用户：暂无预构建包，可通过 Rosetta 2 运行 arm64 版本，或自行 `cargo build --release`。
+> macOS Intel 用户：当前暂无预构建包，请自行从源码构建，或等待后续 x86_64 macOS release。
 
 解压后包含：
 
