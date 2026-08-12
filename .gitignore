@@ -32,3 +32,6 @@ gui/src-tauri/gen/
 
 # Internal development docs (phase reports, plans, etc.)
 docs/internal/
+
+# Release artifacts (built binaries, not source)
+release-artifacts/
