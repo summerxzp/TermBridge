@@ -332,7 +332,7 @@ pub enum ReconnectResult {
 ### 验证
 
 - **单元测试**：33 个 sessions::tests 全通过，含 5 个 Lost 状态边界测试 + 2 个 cleanup 行为测试
-- **e2e 验证**（`examples/e2e_phase6_reconnect.ps1`，目标 192.168.1.171）：8 步全 PASS
+- **e2e 验证**（`examples/e2e_phase6_reconnect.ps1`，目标 192.0.2.171）：8 步全 PASS
   1. open_session → session_state=ready
   2. send "exit" 触发 Lost
   3. read_output → session_state=lost（Agent 感知断线）
@@ -341,7 +341,7 @@ pub enum ReconnectResult {
   6. reconnect 后 read_output → session_state=ready
   7. reconnect 后执行 echo 命令成功
   8. Ready 状态 reconnect → not_lost
-- **Phase 6-B 可靠性加固 e2e**（2026-08-10，目标 192.168.1.171）：
+- **Phase 6-B 可靠性加固 e2e**（2026-08-10，目标 192.0.2.171）：
   - 场景 1（`examples/e2e_phase6b_kill_sshd.ps1`）：远端 `pkill -9 sshd session` → read task EOF → Lost → reconnect → ready。7 步全 PASS，验证 sshd 进程强杀后重连
   - 场景 2（`examples/e2e_phase6b_keepalive.ps1`）：连接空闲 40s（超过 keepalive 3×10s miss 阈值）→ 仍 ready → 命令成功。4 步全 PASS，验证 keepalive 维持空闲连接活性
 

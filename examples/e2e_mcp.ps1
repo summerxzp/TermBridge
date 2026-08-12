@@ -3,10 +3,10 @@
 #
 # 用法：
 #   .\examples\e2e_mcp.ps1
-#   .\examples\e2e_mcp.ps1 -Host "root@192.168.88.200"
+#   .\examples\e2e_mcp.ps1 -Host "root@203.0.113.200"
 
 param(
-    [string]$Host_ = "root@192.168.88.200"
+    [string]$Host_ = "root@203.0.113.200"
 )
 
 $ErrorActionPreference = "Stop"

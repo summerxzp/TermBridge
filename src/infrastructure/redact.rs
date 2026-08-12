@@ -158,8 +158,8 @@ mod tests {
         assert_eq!(redact("echo hello"), "echo hello");
         // 普通日志不应被误脱敏：host= 不在 key 名单内
         assert_eq!(
-            redact("ssh connecting host=192.168.88.200"),
-            "ssh connecting host=192.168.88.200"
+            redact("ssh connecting host=203.0.113.200"),
+            "ssh connecting host=203.0.113.200"
         );
     }
 

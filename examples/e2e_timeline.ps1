@@ -59,7 +59,7 @@ try {
     Write-Host "<<< initialized" -ForegroundColor Green
 
     # 2. open_session
-    $open = Call-Tool 2 "open_session" @{ host = "192.168.1.180" }
+    $open = Call-Tool 2 "open_session" @{ host = "192.0.2.180" }
     $sid = $open.session_id
     Write-Host "<<< session_id = $sid" -ForegroundColor Green
 

@@ -238,7 +238,7 @@ mod tests {
     static HOME_ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     const SAMPLE_G: &str = r#"user testuser
-hostname 192.168.88.140
+hostname 203.0.113.140
 port 22
 identityfile ~/.ssh/id_ed25519
 identityfile ~/.ssh/id_rsa
@@ -252,7 +252,7 @@ proxyjump none
     fn parse_basic_fields() {
         let host = parse_ssh_g("testhost", SAMPLE_G).unwrap();
         assert_eq!(host.name, "testhost");
-        assert_eq!(host.hostname, "192.168.88.140");
+        assert_eq!(host.hostname, "203.0.113.140");
         assert_eq!(host.user, "testuser");
         assert_eq!(host.port, 22);
         assert_eq!(host.proxy_jump, None);
@@ -268,7 +268,7 @@ proxyjump none
         std::fs::write(&temp_key_b, "dummy_key_content_b").unwrap();
 
         let g = format!(
-            "user testuser\nhostname 192.168.88.140\nport 22\nidentityfile {}\nidentityfile {}\nidentityfile /nonexistent_key\n",
+            "user testuser\nhostname 203.0.113.140\nport 22\nidentityfile {}\nidentityfile {}\nidentityfile /nonexistent_key\n",
             temp_key_a.display(),
             temp_key_b.display()
         );
@@ -289,7 +289,7 @@ proxyjump none
     #[test]
     fn parse_identityfile_empty_when_none_exist() {
         // 全部 identityfile 都不存在 → 空 Vec
-        let g = "user testuser\nhostname 192.168.88.140\nport 22\nidentityfile /nonexistent_a\nidentityfile /nonexistent_b\n";
+        let g = "user testuser\nhostname 203.0.113.140\nport 22\nidentityfile /nonexistent_a\nidentityfile /nonexistent_b\n";
         let host = parse_ssh_g("testhost", g).unwrap();
         assert!(host.identity_files.is_empty());
     }

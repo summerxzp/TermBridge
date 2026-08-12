@@ -1,5 +1,5 @@
 # Phase 6-C P0: Execution State / Concurrency / Recovery tests (T10-T15 per ADR-0012)
-# Target: 192.168.1.171
+# Target: 192.0.2.171
 # Tests:
 #   T10 - command failure status (marker + exit code)
 #   T11 - marker appears before command completes (TermBridge does not validate marker position)
@@ -146,13 +146,13 @@ function Assert-Eq($name, $actual, $expected, $detail = "") {
 try {
     Write-Host "============================================================" -ForegroundColor Green
     Write-Host "Phase 6-C P0: Execution State / Concurrency / Recovery" -ForegroundColor Green
-    Write-Host "Target: 192.168.1.171" -ForegroundColor Green
+    Write-Host "Target: 192.0.2.171" -ForegroundColor Green
     Write-Host "============================================================" -ForegroundColor Green
 
     $null = Send-Request 1 "initialize" @{ protocolVersion = "2024-11-05"; capabilities = @{}; clientInfo = @{ name = "p0-state-test"; version = "0.1.0" } }
     Send-Notification "notifications/initialized" @{}
 
-    $open = Call-Tool 2 "open_session" @{ host = "192.168.1.171" }
+    $open = Call-Tool 2 "open_session" @{ host = "192.0.2.171" }
     $sid = $open.session_id
     Write-Host "<<< session = $sid" -ForegroundColor Green
     Start-Sleep -Milliseconds 500

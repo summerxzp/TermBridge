@@ -186,7 +186,7 @@ read_output(wait_for="__TERM_DONE__", timeout_secs=60)
 ### Phase 6-C 验证详情
 
 - **测试脚本**：[examples/phase6c_p0_exec_safety.ps1](../../examples/phase6c_p0_exec_safety.ps1)
-- **目标服务器**：192.168.1.171（Debian）
+- **目标服务器**：192.0.2.171（Debian）
 - **结果**：20 assertions / 20 PASS / 0 FAIL
 - **覆盖**：T1-T9 共 9 个场景，覆盖控制字符、PTY 交互、Policy 拦截、ring buffer 截断、命令边界
 

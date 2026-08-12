@@ -3,14 +3,14 @@
 #
 # 用法：
 #   .\examples\e2e_phase1.ps1
-#   .\examples\e2e_phase1.ps1 -Host_ "root@192.168.88.200"
+#   .\examples\e2e_phase1.ps1 -Host_ "root@203.0.113.200"
 #
 # 前提：
 #   - SSH 主机已配 ~/.ssh/config（ed25519 免密）
 #   - cargo build --release 已完成（脚本会自动检测并构建）
 
 param(
-    [string]$Host_ = "192.168.88.200"
+    [string]$Host_ = "203.0.113.200"
 )
 
 $ErrorActionPreference = "Stop"
@@ -285,8 +285,8 @@ try {
     Write-Host ""
     Write-Host "========== Scenario C: bad host connection error ==========" -ForegroundColor Yellow
 
-    # 用一个不存在的主机（192.168.88.999 是无效 IP）
-    $badHost = "192.168.88.999"
+    # 用一个不存在的主机（203.0.113.999 是无效 IP）
+    $badHost = "203.0.113.999"
     $rC1 = Send-Request 30 "tools/call" @{
         name = "open_session"
         arguments = @{ host = $badHost }

@@ -171,7 +171,7 @@ try {
     Write-Host ""
     Write-Host "--- open_session (persistent=true, name=$sessionName) ---" -ForegroundColor Yellow
     $openResult = Call-Tool "open_session" @{
-        host = "192.168.1.180"
+        host = "192.0.2.180"
         persistent = $true
         name = $sessionName
     }
@@ -232,7 +232,7 @@ try {
     # 2. list_remote_sessions
     Write-Host ""
     Write-Host "--- list_remote_sessions ---" -ForegroundColor Yellow
-    $listResult = Call-Tool "list_remote_sessions" @{ host = "192.168.1.180" }
+    $listResult = Call-Tool "list_remote_sessions" @{ host = "192.0.2.180" }
     if ($null -eq $listResult) { throw "Phase 2: list_remote_sessions failed" }
 
     Write-Host "<<< Remote sessions:" -ForegroundColor Green
@@ -264,7 +264,7 @@ try {
     Write-Host ""
     Write-Host "--- attach_remote_session ---" -ForegroundColor Yellow
     $attachResult = Call-Tool "attach_remote_session" @{
-        host = "192.168.1.180"
+        host = "192.0.2.180"
         remote_session_id = $remoteSessionId
         name = "reattached"
     }

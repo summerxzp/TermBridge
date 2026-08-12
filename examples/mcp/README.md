@@ -72,7 +72,7 @@ TermBridge MCP server 通过 stdio 通信，所有 MCP 客户端配置格式一�
       "command": "termbridge-mcp",
       "args": [],
       "env": {
-        "TERMBRIDGE_ALLOWED_LOCAL_PATHS": "e:\\Code\\TermBridge;C:\\Users\\SUMMER\\tmp"
+        "TERMBRIDGE_ALLOWED_LOCAL_PATHS": "e:\\Code\\TermBridge;C:\\Users\\you\\tmp"
       }
     }
   }

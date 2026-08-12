@@ -358,14 +358,14 @@ Phase 6-C **不实现**，仅在 ADR 留口。未来 Phase 4 timeline / observab
 ### 测试执行详情
 
 - **测试脚本**：[examples/phase6c_p0_exec_state.ps1](../../examples/phase6c_p0_exec_state.ps1)
-- **目标服务器**：192.168.1.171（Debian）
+- **目标服务器**：192.0.2.171（Debian）
 - **结果**：25 assertions / 25 PASS / 0 FAIL
 - **覆盖**：T10-T15 共 6 个场景，覆盖命令失败状态、marker 提前出现、timeout 后 session 状态、连续命令 cursor 隔离、并发 waiter（串行限制）、disconnect 中途写入
 
 ### T17 测试执行详情（Phase 3 daemon 路径）
 
 - **测试脚本**：[examples/phase6c_p0_attach_cursor.ps1](../../examples/phase6c_p0_attach_cursor.ps1)
-- **目标服务器**：192.168.1.171（Debian，agentd v0.1.0 / protocol v1）
+- **目标服务器**：192.0.2.171（Debian，agentd v0.1.0 / protocol v1）
 - **结果**：8 assertions / 8 PASS / 0 FAIL
 - **覆盖**：T17 attach/cursor 边界，验证 detach/attach 后输出精确恢复
 - **验证点**：

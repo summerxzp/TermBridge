@@ -43,7 +43,7 @@ termbridge --version
 
 ```sshconfig
 Host my-server
-    HostName 192.168.1.171
+    HostName 192.0.2.171
     User root
     Port 22
     IdentityFile ~/.ssh/id_ed25519
@@ -53,7 +53,7 @@ Host my-server
 
 ```bash
 termbridge hosts
-# 应输出：my-server  192.168.1.171
+# 应输出：my-server  192.0.2.171
 ```
 
 > 如果没有 `~/.ssh/id_ed25519`，`bootstrap_host` 会自动生成。

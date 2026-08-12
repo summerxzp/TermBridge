@@ -5,7 +5,7 @@
 //
 // 用法：
 //   cargo run --example p0_ssh_config -- <host>
-//   cargo run --example p0_ssh_config -- 192.168.88.140
+//   cargo run --example p0_ssh_config -- 203.0.113.140
 //
 // 验证点：
 //   1. 能调用 `ssh -G <host>` 子进程并拿到 stdout

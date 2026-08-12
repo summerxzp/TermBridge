@@ -719,7 +719,7 @@ async fn connect_session(host: &Host, depth: usize) -> Result<ConnectResult, Ter
     let config = Arc::new(client::Config::default());
     // 构造 handler：传入 known_hosts 路径列表 + strict 模式 + host 信息。
     // 用 host.hostname（纯 IP/域名）而非 host.name（可能含 "root@" 前缀），
-    // 因为 known_hosts 条目按纯主机名存储（如 "192.168.88.200" 而非 "root@192.168.88.200"）。
+    // 因为 known_hosts 条目按纯主机名存储（如 "203.0.113.200" 而非 "root@203.0.113.200"）。
     let (handler, rejection) = SshClientHandler::new(
         host.user_known_hosts_files.clone(),
         host.strict_host_key_checking.clone(),

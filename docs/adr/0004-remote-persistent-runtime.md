@@ -420,7 +420,7 @@ Phase 3-C：MCP 工具 + e2e
         + Phase 3 报告 + git 提交
 ```
 
-**W2 先在 Linux 主机（`192.168.88.200`）原生编译 daemon + CLI client 跑通本地集成测试**，验证 PTY lifecycle / RPC / detach-attach / daemon 独立存活。这一步不需要 Windows client，最大限度降低风险。W3 再做 Windows cross-compile + SSH proxy 接入。
+**W2 先在 Linux 主机（`203.0.113.200`）原生编译 daemon + CLI client 跑通本地集成测试**，验证 PTY lifecycle / RPC / detach-attach / daemon 独立存活。这一步不需要 Windows client，最大限度降低风险。W3 再做 Windows cross-compile + SSH proxy 接入。
 
 ### 11. Daemon crash 语义（Phase 3 不恢复）
 

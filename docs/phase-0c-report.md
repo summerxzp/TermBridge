@@ -47,14 +47,14 @@
 - **单元测试**：36 个全通过（output 18 + sshconfig 5 + sessions 3 + hosts 4 + 其他 6）
 - **MCP smoke test**：stdin 喂 JSON-RPC，验证 initialize / tools/list / list_hosts 协议链路
 - **端到端 vertical slice**（`examples/e2e_mcp.ps1`）：
-  - 目标：Windows → Debian 12 (192.168.88.200, root, ed25519 免密)
+  - 目标：Windows → Debian 12 (203.0.113.200, root, ed25519 免密)
   - 流程：open_session → settle read（MOTD+prompt）→ send_input(echo) → wait_for 匹配 → send_control(ctrl+c) → tail read → close_session
   - 结果：**ALL PASSED**，6 工具完整链路验证通过
 
 ## 端到端测试结果
 
 ```
->>> open_session host=192.168.88.200
+>>> open_session host=203.0.113.200
 <<< session_id = sess_0                          (~200ms: ssh -G + connect + auth + pty + shell)
 
 >>> read_output (settle, timeout=3s)

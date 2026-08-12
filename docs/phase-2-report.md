@@ -79,7 +79,7 @@ russh 0.62 无原生 ProxyJump，采用手动隧道：`connect_session` 递归 �
 
 **单元测试 200 个全通过**（见测试统计）。Policy 拦截、ProxyJump 解析、SFTP 错误映射、路径策略 `check_remote_allow_new` 等核心逻辑均有单测覆盖。
 
-**真实 SSH 端到端**：开发环境 `192.168.88.200` 主机可能不可达（网络环境依赖），未跑完整 e2e slice。ProxyJump / SFTP 新工具的集成验证依赖可达的 bastion + 目标主机环境，留待用户在真实企业网络中验证。Phase 1 既有 6 工具的 e2e 行为契约不受 Phase 2 改动影响（`SshTerminalHandle` 接口签名未变，仅新增 `bastion_sessions` 字段）。
+**真实 SSH 端到端**：开发环境 `203.0.113.200` 主机可能不可达（网络环境依赖），未跑完整 e2e slice。ProxyJump / SFTP 新工具的集成验证依赖可达的 bastion + 目标主机环境，留待用户在真实企业网络中验证。Phase 1 既有 6 工具的 e2e 行为契约不受 Phase 2 改动影响（`SshTerminalHandle` 接口签名未变，仅新增 `bastion_sessions` 字段）。
 
 单元测试验证的关键路径：
 
@@ -118,7 +118,7 @@ check_remote_allow_new("/") → REMOTE_PATH_NOT_ALLOWED（根无父目录）
 5. **不支持 ProxyJump 逗号多跳语法**：`bastion1,bastion2` 显式拒绝；多跳由 ssh config 嵌套 `ProxyJump` + 递归 `connect_session` 表达。
 6. **known_hosts hash 写入未实现**：TOFU 写入用明文主机名，hash 写入（`|1|<salt>|<hash>`）留 Phase 3+ 配置项。读取已支持。
 7. **SFTP channel 不池化**：每次 `sftp_*` 操作开新 channel，频繁小文件传输有开销。Phase 1 遗留，Phase 2 未改。
-8. **`192.168.88.200` 主机可能不可达**：真实 SSH e2e 验证依赖网络环境，单元测试已覆盖核心逻辑。
+8. **`203.0.113.200` 主机可能不可达**：真实 SSH e2e 验证依赖网络环境，单元测试已覆盖核心逻辑。
 
 ## 下一步（Phase 3）
 

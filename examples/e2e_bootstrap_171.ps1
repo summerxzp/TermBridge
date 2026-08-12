@@ -1,4 +1,4 @@
-# ADR-0009 e2e: full bootstrap_host flow against 192.168.1.171
+# ADR-0009 e2e: full bootstrap_host flow against 192.0.2.171
 # This is INTERACTIVE: will pop up CredUI dialog for password input
 # User needs to enter password "123" in the dialog
 $ErrorActionPreference = "Stop"
@@ -60,9 +60,9 @@ try {
     Write-Host "<<< initialized" -ForegroundColor Green
 
     Write-Host ""
-    Write-Host ">>> Calling bootstrap_host for 192.168.1.171" -ForegroundColor Cyan
+    Write-Host ">>> Calling bootstrap_host for 192.0.2.171" -ForegroundColor Cyan
     Write-Host ">>> WATCH FOR CREDUI DIALOG POPUP!" -ForegroundColor Yellow
-    $r = Send-Request 2 "tools/call" @{ name = "bootstrap_host"; arguments = @{ host = "192.168.1.171" } }
+    $r = Send-Request 2 "tools/call" @{ name = "bootstrap_host"; arguments = @{ host = "192.0.2.171" } }
 
     if ($null -eq $r) {
         Write-Host "  [FAIL] no response (timeout 120s)" -ForegroundColor Red

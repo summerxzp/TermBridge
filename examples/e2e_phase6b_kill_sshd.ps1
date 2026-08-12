@@ -1,6 +1,6 @@
 # Phase 6-B 场景 1: SSH 服务端 session 进程强杀后重连
 # 验证：kill sshd session → read task Err → Lost → reconnect_session → ready
-# 目标：192.168.1.171
+# 目标：192.0.2.171
 $ErrorActionPreference = "Stop"
 $exe = ".\target\release\termbridge-mcp.exe"
 
@@ -60,7 +60,7 @@ try {
     Write-Host "<<< initialized" -ForegroundColor Green
 
     # 1. open_session 连 171
-    $open = Call-Tool 2 "open_session" @{ host = "192.168.1.171" }
+    $open = Call-Tool 2 "open_session" @{ host = "192.0.2.171" }
     $sid = $open.session_id
     Write-Host "<<< session_id = $sid" -ForegroundColor Green
 

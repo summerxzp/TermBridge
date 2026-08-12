@@ -1,5 +1,5 @@
 # Phase 6-C P0: execution semantic safety tests (T1-T9 per ADR-0011)
-# All commands on remote 192.168.1.171 via termbridge MCP stdio
+# All commands on remote 192.0.2.171 via termbridge MCP stdio
 $ErrorActionPreference = "Stop"
 $exe = ".\target\release\termbridge-mcp.exe"
 
@@ -124,13 +124,13 @@ function Assert-True($name, $cond, $detail = "") {
 try {
     Write-Host "============================================================" -ForegroundColor Green
     Write-Host "Phase 6-C P0: Execution Semantic Safety (T1-T9)" -ForegroundColor Green
-    Write-Host "Target: 192.168.1.171" -ForegroundColor Green
+    Write-Host "Target: 192.0.2.171" -ForegroundColor Green
     Write-Host "============================================================" -ForegroundColor Green
 
     $null = Send-Request 1 "initialize" @{ protocolVersion = "2024-11-05"; capabilities = @{}; clientInfo = @{ name = "p0-test"; version = "0.1.0" } }
     Send-Notification "notifications/initialized" @{}
 
-    $open = Call-Tool 2 "open_session" @{ host = "192.168.1.171" }
+    $open = Call-Tool 2 "open_session" @{ host = "192.0.2.171" }
     $sid = $open.session_id
     Write-Host "<<< session = $sid" -ForegroundColor Green
     Start-Sleep -Milliseconds 500

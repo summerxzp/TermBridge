@@ -8,7 +8,7 @@
 
 ## Context
 
-Phase 5 完成后，TermBridge 已具备 Remote Workspace 能力（SFTP 递归 / 环境检测），但在切换到新目标服务器（192.168.1.171）测试时暴露了一个长期欠账：**首次连接无可用 SSH key 时无法登录**。
+Phase 5 完成后，TermBridge 已具备 Remote Workspace 能力（SFTP 递归 / 环境检测），但在切换到新目标服务器（192.0.2.171）测试时暴露了一个长期欠账：**首次连接无可用 SSH key 时无法登录**。
 
 ADR-0005 §1 已确立凭据优先级 `SSH Agent > IdentityFile > HITL(Phase 6)`，其中密码 / passphrase 标记为 "Phase 6 HITL UI，secret 直接写 PTY，不经 LLM context"。但实战发现这个方向需要更具体的架构设计，而非笼统的"HITL"。
 
@@ -136,7 +136,7 @@ cargo build --target x86_64-unknown-linux-gnu → termbridge-credential-prompt
 
 ```text
 TermBridge → helper (stdin):
-  { "type": "password_request", "host": "192.168.1.171", "user": "root", "reason": "..." }
+  { "type": "password_request", "host": "192.0.2.171", "user": "root", "reason": "..." }
 
 helper → TermBridge (stdout):
   { "type": "password", "value": "..." }     // 成功
@@ -345,7 +345,7 @@ Host
 4. **SSH 密码认证**：`authenticate_session` 增加 password 降级路径（仅 bootstrap 调用）
 5. **BootstrapHost 业务**：完整流程（解析 / key 尝试 / 生成 key / 密码认证 / 部署公钥 / 重连验证）
 6. **MCP 工具**：注册 `bootstrap_host`
-7. **e2e 验证**：用 192.168.1.171 测试完整 bootstrap 流程
+7. **e2e 验证**：用 192.0.2.171 测试完整 bootstrap 流程
 
 ## Alternatives Considered
 

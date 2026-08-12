@@ -120,7 +120,7 @@ try {
     Write-Host ""
     Write-Host "--- open_session (persistent=true) ---" -ForegroundColor Yellow
     $openResult = Call-Tool "open_session" @{
-        host = "192.168.1.180"
+        host = "192.0.2.180"
         persistent = $true
         name = "wazuh-config-task"
     }

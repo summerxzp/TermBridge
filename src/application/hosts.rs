@@ -122,8 +122,8 @@ mod tests {
     #[test]
     fn parse_basic_config() {
         let config = r#"
-Host 192.168.1.200
-    HostName 192.168.1.200
+Host 192.0.2.200
+    HostName 192.0.2.200
     User root
 
 Host gitee.com
@@ -135,8 +135,8 @@ Host *
 "#;
         let entries = parse_host_entries(config);
         assert_eq!(entries.len(), 2); // 通配符 * 被过滤
-        assert_eq!(entries[0].alias, "192.168.1.200");
-        assert_eq!(entries[0].hostname.as_deref(), Some("192.168.1.200"));
+        assert_eq!(entries[0].alias, "192.0.2.200");
+        assert_eq!(entries[0].hostname.as_deref(), Some("192.0.2.200"));
         assert_eq!(entries[1].alias, "gitee.com");
     }
 

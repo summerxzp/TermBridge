@@ -49,7 +49,7 @@ try {
     $null = Send-Request 1 "initialize" @{ protocolVersion = "2024-11-05"; capabilities = @{}; clientInfo = @{ name = "test"; version = "0.1.0" } }
     Send-Notification "notifications/initialized" @{}
 
-    $open = Call-Tool 2 "open_session" @{ host = "192.168.1.180" }
+    $open = Call-Tool 2 "open_session" @{ host = "192.0.2.180" }
     $sid = $open.session_id
 
     # Test 1: sftp_mkdir single level

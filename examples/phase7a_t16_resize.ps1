@@ -54,7 +54,7 @@ try {
 
     Write-Host ""
     Write-Host "--- open_session ---" -ForegroundColor Yellow
-    $open = Call "open_session" @{ host = "192.168.1.171"; persistent = $true; name = "t16-resize" }
+    $open = Call "open_session" @{ host = "192.0.2.171"; persistent = $true; name = "t16-resize" }
     if ($null -eq $open) { throw "open_session failed" }
     $sid = $open.session_id
     Write-Host "session_id = $sid" -ForegroundColor Green

@@ -30,7 +30,7 @@ function Send-Notification($method, $params) {
 
 $null = Send-Request 1 "initialize" @{ protocolVersion = "2024-11-05"; capabilities = @{}; clientInfo = @{ name = "debug"; version = "0.1.0" } }
 Send-Notification "notifications/initialized" @{}
-$r = Send-Request 2 "tools/call" @{ name = "open_session"; arguments = @{ host = "192.168.1.171" } }
+$r = Send-Request 2 "tools/call" @{ name = "open_session"; arguments = @{ host = "192.0.2.171" } }
 Write-Host "RAW RESPONSE:" -ForegroundColor Yellow
 Write-Host $r -ForegroundColor White
 Write-Host ""

@@ -88,7 +88,7 @@
 e2e vertical slice 持续通过（Phase 0-C 既有用例 + Phase 1 增强）：
 
 ```
->>> open_session host=192.168.88.200       # ssh-agent 降级到 IdentityFile + known_hosts 校验通过
+>>> open_session host=203.0.113.200       # ssh-agent 降级到 IdentityFile + known_hosts 校验通过
 <<< session_id = sess_0                    # keepalive task 后台 spawn，不影响 open 延迟
 >>> read_output (settle)                   # MOTD + prompt
 >>> send_input "echo HELLO_TERMBRIDGE\n"

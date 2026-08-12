@@ -47,7 +47,7 @@ cargo build --release
 
 ```sshconfig
 Host my-server
-    HostName 192.168.1.171
+    HostName 192.0.2.171
     User root
     Port 22
     IdentityFile ~/.ssh/id_ed25519
@@ -230,7 +230,7 @@ TermBridge 通过 `ssh -G` 解析系统 `~/.ssh/config`，支持常用指令：
 ```sshconfig
 # 基本配置
 Host prod-server
-    HostName 192.168.1.171
+    HostName 192.0.2.171
     User root
     Port 22
     IdentityFile ~/.ssh/id_ed25519

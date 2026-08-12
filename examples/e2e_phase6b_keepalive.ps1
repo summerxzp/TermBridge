@@ -1,7 +1,7 @@
 # Phase 6-B 场景 2: keepalive 维持空闲连接（正向验证）
 # 验证：连接空闲 40s（超过 keepalive 3×10s miss 阈值）→ 仍 ready → 命令成功
 # 如果 keepalive 不工作，30s 后会 disconnect → Lost
-# 目标：192.168.1.171
+# 目标：192.0.2.171
 $ErrorActionPreference = "Stop"
 $exe = ".\target\release\termbridge-mcp.exe"
 
@@ -61,7 +61,7 @@ try {
     Write-Host "<<< initialized" -ForegroundColor Green
 
     # 1. open_session 连 171
-    $open = Call-Tool 2 "open_session" @{ host = "192.168.1.171" }
+    $open = Call-Tool 2 "open_session" @{ host = "192.0.2.171" }
     $sid = $open.session_id
     Write-Host "<<< session_id = $sid" -ForegroundColor Green
 

@@ -1,5 +1,5 @@
 # Phase 6-C P0: T17 Attach/Cursor Boundary Test (ADR-0012 契约 ⑦)
-# Target: 192.168.1.171
+# Target: 192.0.2.171
 #
 # 验证：detach/attach 后输出连续不丢失、不重复、可继续交互
 #
@@ -144,7 +144,7 @@ function Drain-Output($sid) {
 try {
     Write-Host "============================================================" -ForegroundColor Green
     Write-Host "Phase 6-C P0: T17 Attach/Cursor Boundary Test" -ForegroundColor Green
-    Write-Host "Target: 192.168.1.171" -ForegroundColor Green
+    Write-Host "Target: 192.0.2.171" -ForegroundColor Green
     Write-Host "Contract 7: attach 后输出精确恢复，恰好一次不重复不遗漏" -ForegroundColor Green
     Write-Host "============================================================" -ForegroundColor Green
 
@@ -162,7 +162,7 @@ try {
     Write-Host ""
     Write-Host "[Step 1] open_session(persistent=true, name=$sessionName)" -ForegroundColor Yellow
     $openId = $script:gId++
-    $open = Call-Tool $openId "open_session" @{ host = "192.168.1.171"; persistent = $true; name = $sessionName }
+    $open = Call-Tool $openId "open_session" @{ host = "192.0.2.171"; persistent = $true; name = $sessionName }
     $sid = $open.session_id
     Write-Host "<<< session_id = $sid" -ForegroundColor Green
     Start-Sleep -Milliseconds 500
@@ -202,7 +202,7 @@ try {
     Write-Host ""
     Write-Host "[Step 6] list_remote_sessions (verify session exists + written grew)" -ForegroundColor Yellow
     $listId = $script:gId++
-    $list = Call-Tool $listId "list_remote_sessions" @{ host = "192.168.1.171" }
+    $list = Call-Tool $listId "list_remote_sessions" @{ host = "192.0.2.171" }
 
     $remoteSessionId = $null
     $remoteWritten = 0
@@ -220,7 +220,7 @@ try {
     Write-Host ""
     Write-Host "[Step 7] attach_remote_session (reconnect to remote session)" -ForegroundColor Yellow
     $attachId = $script:gId++
-    $attach = Call-Tool $attachId "attach_remote_session" @{ host = "192.168.1.171"; remote_session_id = $remoteSessionId }
+    $attach = Call-Tool $attachId "attach_remote_session" @{ host = "192.0.2.171"; remote_session_id = $remoteSessionId }
     $sid2 = $attach.session_id
     Write-Host "<<< new local session_id = $sid2" -ForegroundColor Green
     Start-Sleep -Milliseconds 500

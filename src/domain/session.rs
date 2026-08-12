@@ -551,7 +551,7 @@ mod tests {
         let pty = PtySize { rows: 24, cols: 80 };
         let session = Session::new(
             "sess_mock_001".into(),
-            "192.168.1.171".into(),
+            "192.0.2.171".into(),
             pty,
             handle,
         );
@@ -561,7 +561,7 @@ mod tests {
         print_summary("阶段 1: 初始创建", &s1);
 
         assert_eq!(s1.id, "sess_mock_001");
-        assert_eq!(s1.host, "192.168.1.171");
+        assert_eq!(s1.host, "192.0.2.171");
         assert_eq!(s1.state, SessionState::Ready);
         assert_eq!(s1.pty_size.rows, 24);
         assert_eq!(s1.pty_size.cols, 80);
