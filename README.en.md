@@ -6,7 +6,7 @@
 
 A persistent, recoverable remote terminal runtime with explicit execution semantics for AI Agents
 
-[![release](https://img.shields.io/badge/release-v0.1.1-blue)](https://github.com/summerxzp/TermBridge/releases/tag/v0.1.1)
+[![release](https://img.shields.io/github/v/release/summerxzp/TermBridge?label=release)](https://github.com/summerxzp/TermBridge/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue)](https://github.com/summerxzp/TermBridge)
 
@@ -33,7 +33,7 @@ TermBridge is an MCP (Model Context Protocol) server that communicates with AI c
 
 ### Option 1: Download Pre-built Binaries (Recommended)
 
-Download the archive for your platform from [GitHub Release v0.1.1](https://github.com/summerxzp/TermBridge/releases/tag/v0.1.1):
+Download the archive for your platform from [GitHub Release](https://github.com/summerxzp/TermBridge/releases/latest):
 
 | Platform | File |
 |----------|------|
@@ -46,7 +46,7 @@ Download the archive for your platform from [GitHub Release v0.1.1](https://gith
 Archive contents:
 
 ```
-termbridge-v0.1.1-<platform>-<arch>/
+termbridge-v<version>-<platform>-<arch>/
 ├── termbridge-mcp            MCP server main entry
 ├── termbridge                CLI (human admin tool, optional)
 ├── termbridge-auth-helper    Credential helper (must be in same directory as mcp)

@@ -6,7 +6,7 @@
 
 为 AI Agent 提供持久、可恢复、具有明确执行语义的远程终端运行时
 
-[![release](https://img.shields.io/badge/release-v0.1.1-blue)](https://github.com/summerxzp/TermBridge/releases/tag/v0.1.1)
+[![release](https://img.shields.io/github/v/release/summerxzp/TermBridge?label=release)](https://github.com/summerxzp/TermBridge/releases/latest)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-blue)](https://github.com/summerxzp/TermBridge)
 
@@ -33,7 +33,7 @@ TermBridge 是一个 MCP（Model Context Protocol）server，通过 stdio 与 AI
 
 ### 方式一：下载预构建二进制（推荐）
 
-从 [GitHub Release v0.1.1](https://github.com/summerxzp/TermBridge/releases/tag/v0.1.1) 下载对应平台的压缩包：
+从 [GitHub Release](https://github.com/summerxzp/TermBridge/releases/latest) 下载对应平台的压缩包：
 
 | 平台 | 文件 |
 |------|------|
@@ -46,7 +46,7 @@ TermBridge 是一个 MCP（Model Context Protocol）server，通过 stdio 与 AI
 解压后包含：
 
 ```
-termbridge-v0.1.1-<platform>-<arch>/
+termbridge-v<version>-<platform>-<arch>/
 ├── termbridge-mcp            MCP server 主入口
 ├── termbridge                CLI（人类管理员工具，可选）
 ├── termbridge-auth-helper    凭据 helper（必须与 mcp 同目录）

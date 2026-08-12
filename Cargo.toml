@@ -2,9 +2,12 @@
 [workspace]
 members = ["agentd", "cli", "crates/termbridge-auth-helper", "gui/src-tauri"]
 
+[workspace.package]
+version = "0.1.1"
+
 [package]
 name = "termbridge"
-version = "0.0.1"
+version.workspace = true
 edition = "2021"
 publish = false
 
