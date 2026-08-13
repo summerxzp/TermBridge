@@ -185,6 +185,7 @@ impl HostPolicyResolver {
 
         match toml::from_str::<HostPolicyConfig>(&content) {
             Ok(cfg) => {
+                warn_on_nested_dotted_host_keys(&content);
                 tracing::info!(
                     path = %path.display(),
                     host_count = cfg.hosts.len(),
@@ -205,16 +206,16 @@ impl HostPolicyResolver {
         }
     }
 
-    /// 用空配置创建（所有 host 走 system default，测试用）。
-    pub fn empty() -> Self {
-        Self {
-            config: HostPolicyConfig::default(),
-        }
+/// 用空配置创建（所有 host 走 system default，测试用）。
+pub fn empty() -> Self {
+    Self {
+        config: HostPolicyConfig::default(),
     }
+}
 
-    /// 用预加载的配置创建（测试用）。
-    pub fn with_config(config: HostPolicyConfig) -> Self {
-        Self { config }
+/// 用预加载的配置创建（测试用）。
+pub fn with_config(config: HostPolicyConfig) -> Self {
+    Self { config }
     }
 
     /// 解析某 host 的最终策略（ADR-0017 §2.4 优先级）。
@@ -255,6 +256,37 @@ impl HostPolicyResolver {
     /// 列出所有已配置的 host 别名。
     pub fn list_configured_hosts(&self) -> Vec<&str> {
         self.config.hosts.keys().map(|s| s.as_str()).collect()
+    }
+}
+
+/// 防静默失效：`[hosts.192.168.1.180]` 在 TOML 里会把点号解析为**嵌套表**
+/// （hosts → 192 → 168 → 1 → 180），serde 忽略未知字段后得到垃圾条目
+/// `hosts.192 = {}`，用户以为配了 `192.168.1.180` 实际没有 —— IP 别名 host
+/// 是常见用法，必须显式警告。正确写法：`[hosts."192.168.1.180"]`（引号）。
+fn warn_on_nested_dotted_host_keys(content: &str) {
+    let Ok(v) = toml::from_str::<toml::Value>(content) else {
+        return;
+    };
+    let Some(hosts) = v.get("hosts").and_then(|h| h.as_table()) else {
+        return;
+    };
+    for (alias, entry) in hosts {
+        let Some(table) = entry.as_table() else {
+            continue;
+        };
+        let bad: Vec<&String> = table
+            .keys()
+            .filter(|k| k.as_str() != "auth" && k.as_str() != "session")
+            .collect();
+        if !bad.is_empty() {
+            tracing::warn!(
+                alias = %alias,
+                fields = ?bad,
+                "host entry contains non-policy fields: likely an unquoted dotted alias \
+                 (e.g. [hosts.192.168.1.180] parses as nested tables). Use quoted key: \
+                 [hosts.\"{alias}\"]"
+            );
+        }
     }
 }
 
@@ -623,6 +655,53 @@ auth = "biometric"
 
         let p = resolver.resolve("prod", None, None);
         assert_eq!(p, ResolvedPolicy::default_policy());
+    }
+
+    // ── TOML 点号别名防护（IP 别名必须加引号）────────────────────────
+
+    #[test]
+    fn unquoted_dotted_alias_parses_as_nested_junk() {
+        // [hosts.192.168.1.180] → TOML 嵌套表 → hosts 表出现 "192" 垃圾条目。
+        // 这是 silent no-op 陷阱，warn_on_nested_dotted_host_keys 应识别。
+        let toml = r#"
+[hosts.192.168.1.180]
+auth = "key"
+"#;
+        let cfg = toml::from_str::<HostPolicyConfig>(toml).unwrap();
+        // 垃圾条目:hosts.192 = {}（"168" 被当作未知字段忽略）
+        assert!(cfg.hosts.contains_key("192"));
+        assert!(!cfg.hosts.contains_key("192.168.1.180"));
+    }
+
+    #[test]
+    fn quoted_dotted_alias_parses_correctly() {
+        // 正确写法:[hosts."192.168.1.180"] → 单 key "192.168.1.180"
+        let toml = r#"
+[hosts."192.168.1.180"]
+auth = "key"
+"#;
+        let cfg = toml::from_str::<HostPolicyConfig>(toml).unwrap();
+        assert!(cfg.hosts.contains_key("192.168.1.180"));
+        assert_eq!(cfg.hosts["192.168.1.180"].auth, Some(AuthMode::Key));
+    }
+
+    #[test]
+    fn load_from_warns_on_unquoted_dotted_alias_but_keeps_valid_entries() {
+        // 防护:脏条目 + 合法条目并存时,合法条目仍生效(WARN 不阻断)
+        let toml = r#"
+[hosts.192.168.1.180]
+auth = "key"
+
+[hosts.prod]
+auth = "password"
+"#;
+        let tmp = temp_file(toml);
+        let resolver = HostPolicyResolver::load_from(&tmp);
+        // prod 正常生效
+        assert_eq!(
+            resolver.resolve("prod", None, None).auth,
+            AuthMode::Password
+        );
     }
 
     // ── 查询接口 ─────────────────────────────────────────────────────

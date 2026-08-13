@@ -153,7 +153,7 @@ fn cmd_policy(host: Option<&str>) -> Result<()> {
             if hosts.is_empty() {
                 println!("(no hosts.toml — all hosts use system defaults: auth = auto, session = standard)");
                 println!(
-                    "hint: create {} to configure per-host policies: [hosts.<alias>] auth = \"key\" | \"password\" | \"auto\", session = \"standard\" | \"persistent\"",
+                    "hint: create {} to configure per-host policies: [hosts.<alias>] auth = \"key\" | \"password\" | \"auto\", session = \"standard\" | \"persistent\" (IP 类别名必须加引号: [hosts.\"192.168.1.180\"])",
                     path.display()
                 );
                 return Ok(());

@@ -225,6 +225,8 @@ ADR-0013 Agent Terminal Protocol 的隐含契约（"open_session 即时返回"�
 
 平台路径解析用 `dirs` crate，不在代码里硬编码。这是实现细节，不进 ADR 决策。
 
+> **IP / 点号别名必须加引号**：TOML 的 `[hosts.192.168.1.180]` 会把点号解析为嵌套表（静默产生垃圾条目，策略不生效）。正确写法 `[hosts."192.168.1.180"]`。加载器检测到非 `auth`/`session` 字段会 WARN 提示。
+
 ### 2.10 配置文件最小化
 
 第一版 `hosts.toml` 只有两个字段（auth / session）。**不**加入：
