@@ -13,12 +13,14 @@
 //!   ├── deploy_public_key（幂等写入 authorized_keys）
 //!   ├── 重连 + key 认证验证
 //!   │   └── 失败 → BootstrapFailed
-//!   └── Bootstrapped
+//!   └── Bootstrapped（含 hint：建议用户手动改 hosts.toml 的 auth=key，ADR-0017 §2.8）
 //! ```
 //!
-//! 关键约束（ADR-0009）：
+//! 关键约束（ADR-0009 / ADR-0017 §2.2）：
 //! - 密码经 `CredentialProvider` 获取，仅在 SSH 认证瞬间 `reveal()`，用完立即 drop（Zeroize）
 //! - 公钥部署幂等（`grep -qF` 检查已存在，避免重复写入）
+//! - **不修改 hosts.toml**：bootstrap 只改变 Remote State（authorized_keys），
+//!   Host Policy 是用户意图，配置修改由用户显式完成（hint 仅为建议）
 //! - 不修改 `ssh.rs` 逻辑，仅复用 `connect_unauthenticated` / `authenticate_session` /
 //!   `authenticate_with_password` 三个公开函数
 
@@ -34,7 +36,7 @@ use crate::domain::provider::{Host, TermError};
 use crate::infrastructure::ssh::{self, SshClientHandler};
 use crate::infrastructure::sshconfig;
 
-/// bootstrap_host 结果（ADR-0009 §3）。
+/// bootstrap_host 结果（ADR-0009 §3 / ADR-0017 §2.8）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum BootstrapResult {
@@ -49,6 +51,11 @@ pub enum BootstrapResult {
         host: String,
         authentication: String,  // "public_key"
         identity_source: String, // "identity_file"
+        /// 非阻塞提示（ADR-0017 §2.8）：host 现已支持 key 认证，建议用户手动
+        /// 把 hosts.toml 的 `auth` 改为 `key`。TermBridge **不**自动修改配置
+        /// （§2.2 不可变原则）。用 `hint` 而非 `auth` 字段承载——避免调用方
+        /// 误以为 TermBridge 已修改 host policy。
+        hint: String,
     },
     /// 用户取消密码输入。
     Cancelled { host: String },
@@ -57,6 +64,14 @@ pub enum BootstrapResult {
     /// 公钥部署成功但 key 重连验证失败。
     BootstrapFailed { host: String, reason: String },
 }
+
+/// bootstrap 成功后的 hint 文本（ADR-0017 §2.8）。
+///
+/// bootstrap 只改变 Remote State（authorized_keys 增加了公钥），**不修改**
+/// Host Policy（hosts.toml 是用户意图，§2.2 不可变原则）。配置修改必须由
+/// 用户显式完成——hint 只是非阻塞建议。
+pub const BOOTSTRAP_HINT: &str =
+    "Host now supports key authentication; consider changing host policy to auth=key in hosts.toml.";
 
 /// BootstrapHost：把 Host 初始化为长期可 key 认证的 SSH 主机（ADR-0009）。
 ///
@@ -172,6 +187,8 @@ impl BootstrapHost {
             host: host_alias.into(),
             authentication: "public_key".into(),
             identity_source: via.to_string(),
+            // ADR-0017 §2.8：hint 非阻塞提示，不修改 hosts.toml
+            hint: BOOTSTRAP_HINT.into(),
         })
     }
 }
@@ -272,5 +289,45 @@ async fn deploy_public_key(
         Some(code) => Err(TermError::ChannelError(format!(
             "deploy public key failed: exit code {code}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── ADR-0017 §2.8：bootstrap 成功后的 hint 合同 ────────────────────
+
+    #[test]
+    fn bootstrapped_serializes_with_hint_and_without_auth() {
+        // §2.8：hint 承载"考虑改 host policy"建议；用 hint 而非 auth 字段，
+        // 避免调用方误以为 TermBridge 已修改 hosts.toml（§2.2 不可变原则）
+        let result = BootstrapResult::Bootstrapped {
+            host: "prod".into(),
+            authentication: "public_key".into(),
+            identity_source: "identity_file".into(),
+            hint: BOOTSTRAP_HINT.into(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["status"], "bootstrapped");
+        assert_eq!(json["authentication"], "public_key");
+        let hint = json["hint"].as_str().unwrap();
+        assert!(hint.contains("auth=key"), "hint 应建议改 auth=key: {hint}");
+        assert!(hint.contains("hosts.toml"), "hint 应指向 hosts.toml: {hint}");
+        // 无 auth 字段——TermBridge 没有修改 host policy，只是给了建议
+        assert!(json.get("auth").is_none(), "hint 不得出现在 auth 字段: {json}");
+    }
+
+    #[test]
+    fn bootstrapped_hint_is_advisory_not_a_config_change_statement() {
+        // §2.8：hint 是"考虑修改"的非阻塞建议，不是"已修改"的陈述
+        assert!(
+            BOOTSTRAP_HINT.starts_with("Host now supports key authentication; consider"),
+            "hint 应以建议语气开头: {BOOTSTRAP_HINT}"
+        );
+        assert!(
+            !BOOTSTRAP_HINT.contains("changed host policy"),
+            "hint 不得宣称已修改 host policy: {BOOTSTRAP_HINT}"
+        );
     }
 }

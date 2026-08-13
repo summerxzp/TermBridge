@@ -853,16 +853,20 @@ impl TermBridgeServer {
         }
     }
 
-    /// Bootstrap SSH key authentication for a host (ADR-0009).
+    /// Bootstrap SSH key authentication for a host (ADR-0009 / ADR-0017 §2.8).
     ///
     /// If the host already has working key authentication (via SSH Agent or
     /// IdentityFile), returns `already_configured`. Otherwise, prompts the user
     /// for a password via an out-of-band credential prompt (never via MCP
     /// arguments), uses the password to deploy the public key to the remote
     /// `~/.ssh/authorized_keys`, then reconnects to verify key authentication
-    /// works. After bootstrap, subsequent `open_session` calls use key auth
-    /// exclusively — the password is discarded.
-    #[tool(description = "Bootstrap SSH key authentication for a host. Deploys public key to remote authorized_keys via one-time password prompt (password never passed via MCP args). Returns status: already_configured / bootstrapped / cancelled / authentication_failed / bootstrap_failed.")]
+    /// works. The password is discarded after use.
+    ///
+    /// **不修改 host policy（ADR-0017 §2.2 不可变原则）**：hosts.toml 保持不变。
+    /// `bootstrapped` 返回 `hint`（非阻塞建议，建议用户手动把 hosts.toml 的
+    /// `auth` 改为 `key`）；若用户不修改，后续 `open_session` 仍按 host policy
+    /// 执行（`auth=password` → 继续弹密码）。
+    #[tool(description = "Bootstrap SSH key authentication for a host. Deploys public key to remote authorized_keys via one-time password prompt (password never passed via MCP args). Does NOT modify host policy (hosts.toml): if auth=password is configured, open_session keeps prompting; bootstrapped includes a hint to update hosts.toml manually. Returns status: already_configured / bootstrapped / cancelled / authentication_failed / bootstrap_failed.")]
     async fn bootstrap_host(
         &self,
         Parameters(params): Parameters<BootstrapHostParams>,
