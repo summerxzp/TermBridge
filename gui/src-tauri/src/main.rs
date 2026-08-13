@@ -156,7 +156,9 @@ async fn open_session(
         .open_session(
             &host,
             Some(PtySize { rows, cols }),
-            true,
+            // GUI 连接语义 = 显式开 persistent session（ADR-0017 §2.4：
+            // explicit > host policy——用户点了连接即显式要求 persistent）
+            Some(true),
             Some("gui".to_string()),
         )
         .await
