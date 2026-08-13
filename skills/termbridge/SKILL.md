@@ -13,7 +13,7 @@ Use it when the user wants to operate on a remote Linux host: run commands, debu
 
 ```
 1. list_hosts                      → confirm host alias is visible
-2. bootstrap_host (first time)     → deploy SSH public key (one-time)
+2. bootstrap_host (first time)     → deploy SSH public key (one-time, key-auth hosts only)
 3. open_session(host)              → get session_id
 4. send_input(cmd)                 → run command (raw bytes, no auto-\n)
 5. read_output(wait_for=marker)    → wait for completion
@@ -23,6 +23,10 @@ Use it when the user wants to operate on a remote Linux host: run commands, debu
 
 For an already-running persistent session, skip step 3 and `attach_remote_session` instead.
 
+> **Host policy (ADR-0017 §3.3)**: `hosts.toml` defines per-host defaults (`auth` = `key` / `password` / `auto`; `session` = `standard` / `persistent`).
+> - **`auth=password` host** → every `open_session` prompts the user for a password (out-of-band, never via MCP args). **Never call `bootstrap_host` on such a host** unless the user explicitly asks to switch to key auth.
+> - **`bootstrap_host` does not modify host policy** — hosts.toml stays untouched; `open_session` keeps prompting until the user edits it.
+
 > **Scope guidance**: For standard commands (ls, cat, grep, systemctl status), the workflow above is sufficient. For timeout / disconnect / TUI programs / retry scenarios, consult the **7 Rules** and **Decision Table** below.
 
 ## Tool Reference
@@ -30,8 +34,8 @@ For an already-running persistent session, skip step 3 and `attach_remote_sessio
 | Tool | Purpose |
 |------|---------|
 | `list_hosts` | List hosts from `~/.ssh/config` |
-| `bootstrap_host` | Deploy ed25519 public key (first-time only, idempotent) |
-| `open_session` | Open new PTY session (persistent=true for cross-restart) |
+| `bootstrap_host` | Deploy ed25519 public key (first-time only, idempotent). Do NOT call on `auth=password` hosts unless the user asks to switch to key auth |
+| `open_session` | Open new PTY session (persistent=true for cross-restart). May trigger a user password prompt on `auth=password` hosts — do not assume immediate return |
 | `attach_remote_session` | Attach to existing persistent session on daemon |
 | `list_remote_sessions` | List daemon-hosted sessions on a host |
 | `send_input` | Write raw bytes to PTY (no auto-append `\n`) |
@@ -147,7 +151,9 @@ Daemon crash = all detached sessions lost (Phase 3 does not recover). Must `open
 
 | Situation | Action |
 |-----------|--------|
-| First connection to a host | `bootstrap_host` (one-time, deploys SSH key) |
+| First connection to a key-auth host | `bootstrap_host` (one-time, deploys SSH key) |
+| First connection to an `auth=password` host | `open_session` directly — user is prompted for password; do NOT `bootstrap_host` unless the user explicitly asks to switch to key auth |
+| `open_session` on an `auth=password` host | expect a user password prompt (out-of-band); do not assume immediate return |
 | Subsequent connections | `open_session` (key auth, no password) |
 | Plain command (ls, cat, grep) | `send_input` + marker + `read_output(wait_for)` |
 | Need full command output | record cursor → send → wait_for → `read_output(since_cursor)` |
@@ -171,6 +177,7 @@ Daemon crash = all detached sessions lost (Phase 3 does not recover). Must `open
 - **PTY echo**: the shell echoes input back. `wait_for("MARKER")` may match the echo — use `$REQID` variable so echo contains the variable name, not the value.
 - **ANSI noise**: PTY output contains control sequences (bracketed paste `\x1b[?2004h/l`, OSC 7 `\x1b]7;...`, color codes, `\x1b[K`). Use `read_output(strip_ansi=true)` for clean text; RingBuffer keeps raw bytes, so cursor stays valid.
 - **Credentials never in MCP params**: `bootstrap_host` accepts only `host`. Passwords are prompted via separate `termbridge-auth-helper` process, never exposed to MCP stdio.
+- **Host policy is user intent (ADR-0017 §2.2)**: `hosts.toml` `auth=password` means password for every connection — it is NOT a gap to "fix". `bootstrap_host` never modifies host policy (returns a `hint` instead), so an `auth=password` host keeps prompting until the user edits hosts.toml. Never bootstrap a password-policy host as a convenience optimization.
 
 ## Anti-Patterns
 
@@ -193,6 +200,10 @@ full = r.output  # only match context, not full output
 
 # BAD: echo marker (PTY echo re-matches)
 send_input("echo __TB_DONE__:abc:0\n")  # echo itself contains the marker!
+
+# BAD: auto-bootstrap on a password-policy host (violates user intent, ADR-0017 §3.3)
+bootstrap_host(host="prod")  # policy says auth=password — user wants password auth;
+                             # bootstrap also does NOT change hosts.toml, so the prompt stays
 ```
 
 ## Quick Reference: Happy Path
@@ -200,7 +211,7 @@ send_input("echo __TB_DONE__:abc:0\n")  # echo itself contains the marker!
 ```
 # First time on a host
 list_hosts
-bootstrap_host(host="myserver")
+bootstrap_host(host="myserver")  # key-auth host only; auth=password hosts: skip (rule §3.3)
 open_session(host="myserver", persistent=true, name="work")
 
 # Run a command with completion marker
