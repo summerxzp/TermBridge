@@ -5,6 +5,24 @@ All notable changes to TermBridge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-08-13
+
+### Added
+
+**Host Connection Policy（ADR-0017）**
+- Per-host 连接策略配置文件 `hosts.toml`：`auth`（key / password / auto）+ `session`（standard / persistent）双维度
+- 优先级：显式参数 > host policy > system default；无 hosts.toml 时行为与 0.1.x 完全一致（向后兼容）
+- `auth=password` 认证路径：`open_session` 经 credential helper 弹窗请求密码（不持久化、不部署 key）；`password + persistent` 组合在弹密码**之前**明确拒绝（不做静默降级）
+- `bootstrap_host` 成功返回 `hint`（建议手动更新 hosts.toml），**永不自动修改配置**（ADR-0017 §2.2 不可变原则）
+- 新 CLI 子命令 `termbridge policy`：查看 hosts.toml 策略（全览 / 单 host 有效值 + 修改提示）
+- Skill 新增 password-policy host 两条规则（禁止主动 bootstrap_host + open_session 可能触发用户弹窗）
+
+### Fixed
+
+- `ssh -G` 在 Git for Windows 下阻塞等待 stdin EOF，导致 open_session 永久挂起（stdin 置空）
+- TOML 点号别名（IP host）静默失效：`[hosts.192.168.1.180]` 被解析为嵌套表、策略不生效 — 加载时 WARN 并提示正确写法 `[hosts."192.168.1.180"]`
+- macOS 配置路径遵循 XDG（`~/.config/termbridge/`，而非 Apple 的 `~/Library/Application Support`）；Windows 统一为 `%APPDATA%\TermBridge\`（与 agentd 本地路径一致）
+
 ## [0.1.1] - 2026-08-12
 
 ### Changed
