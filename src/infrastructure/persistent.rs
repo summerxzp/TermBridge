@@ -756,6 +756,20 @@ impl TerminalProvider for PersistentProvider {
             return self.ssh.open(request).await;
         }
 
+        // ADR-0017 §2.3：password + persistent 不支持。persistent runtime 的
+        // check/deploy/bootstrap/exec 每一步都开新 SSH 连接，依赖 key-based
+        // unattended auth；SessionManager 已在弹密码前校验，这里是双保险。
+        if request.password.is_some() {
+            return Err(TermError::InvalidArgument(
+                "auth=password with session=persistent is not supported: password \
+                 authentication is supported for standard SSH sessions; persistent \
+                 sessions require key-based unattended SSH authentication. Use \
+                 auth=password + session=standard, or auth=key + session=persistent \
+                 (ADR-0017 §2.3)"
+                    .into(),
+            ));
+        }
+
         let host = &request.host;
         tracing::info!(
             host = %host.name,
@@ -965,6 +979,7 @@ impl PersistentProvider {
             pty_size: PtySize::default(),
             persistent: false,
             name: None,
+            password: None,
         };
         let handle = self.ssh.open(temp_req).await?;
         let deploy_result: Result<(), TermError> = async {
@@ -1072,6 +1087,7 @@ impl PersistentProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::credential::Secret;
 
     #[test]
     fn local_agentd_path_uses_localappdata() {
@@ -1161,5 +1177,42 @@ mod tests {
     fn persistent_provider_default_constructs() {
         // Default trait 应能构造（内部 new SshProvider::default）
         let _provider = PersistentProvider::default();
+    }
+
+    // ── ADR-0017 §2.3：password + persistent 组合校验 ──────────────────
+
+    #[tokio::test]
+    async fn open_rejects_password_with_persistent_session() {
+        // password + persistent 不支持：必须在不做任何 SSH 操作前拒绝
+        //（SessionManager 已在弹密码前校验，此处为 Provider 边界双保险）
+        let provider = PersistentProvider::default();
+        let host = Host {
+            name: "prod".into(),
+            hostname: "192.0.2.1".into(),
+            user: "root".into(),
+            port: 22,
+            identity_files: vec![],
+            proxy_jump: None,
+            user_known_hosts_files: vec![],
+            strict_host_key_checking: "yes".into(),
+        };
+        let err = match provider
+            .open(OpenTerminalRequest {
+                host,
+                pty_size: PtySize::default(),
+                persistent: true,
+                name: None,
+                password: Some(Secret::new("hunter2".into())),
+            })
+            .await
+        {
+            Err(e) => e,
+            // dyn TerminalHandle 不实现 Debug，不能用 unwrap_err
+            Ok(_) => panic!("expected InvalidArgument for password+persistent"),
+        };
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+        let msg = format!("{err}");
+        assert!(msg.contains("auth=password with session=persistent"));
+        assert!(msg.contains("ADR-0017"));
     }
 }

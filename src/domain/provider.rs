@@ -28,6 +28,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use thiserror::Error;
 
+use crate::domain::credential::Secret;
+
 // ───────────────────────────────────────────────────────────────────────────
 // Host（配置实体，§4.3）—— "去哪台机器？"
 // ───────────────────────────────────────────────────────────────────────────
@@ -145,7 +147,10 @@ impl ControlKey {
 /// - `persistent = false`：Interactive Session（Phase 1/2 路径，SSH 直连 PTY）
 /// - `persistent = true`：Persistent Session（Phase 3 路径，远端 daemon 托管 PTY）
 ///   `name` 仅 persistent 模式有效，作为远端 session 的可读标签（list_remote_sessions 返回）
-#[derive(Debug, Clone)]
+///
+/// ADR-0017（Phase 9）：`password` 为 `auth=password` 路径的一次性密码凭据。
+/// 不实现 `Clone`：`Secret` 不可克隆（凭据隔离，ADR-0005），请求持有期间即用即弃。
+#[derive(Debug)]
 pub struct OpenTerminalRequest {
     pub host: Host,
     pub pty_size: PtySize,
@@ -153,6 +158,13 @@ pub struct OpenTerminalRequest {
     pub persistent: bool,
     /// 远端 session 可读标签（仅 persistent=true 时使用）
     pub name: Option<String>,
+    /// 密码认证凭据（ADR-0017 §2.3 `auth=password`）。None = key-only 路径。
+    ///
+    /// 由 SessionManager 通过 CredentialProvider 获取，仅 SSH 认证瞬间
+    /// `reveal()` 后即弃；请求 drop 时 `Secret` 自动 Zeroize。
+    /// 仅 `persistent=false` 有效；`persistent=true` 携带 → `InvalidArgument`
+    /// （persistent runtime 依赖 key-based unattended auth，ADR-0017 §2.3）。
+    pub password: Option<Secret>,
 }
 
 // ───────────────────────────────────────────────────────────────────────────

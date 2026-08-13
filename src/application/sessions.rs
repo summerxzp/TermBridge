@@ -20,10 +20,13 @@ use serde::Serialize;
 use tokio::task::JoinHandle;
 use bytes::Bytes;
 
+use crate::domain::credential::{
+    CredentialError, CredentialProvider, NoopCredentialProvider, PasswordRequest, Secret,
+};
 use crate::domain::output::{ReadOutputParams, ReadOutputResult};
 use crate::domain::policy::{Action, Decision};
 use crate::domain::provider::{
-    ControlKey, HostName, OpenTerminalRequest, PtySize, TerminalProvider, TermError,
+    ControlKey, Host, HostName, OpenTerminalRequest, PtySize, TerminalProvider, TermError,
     TransferDirection,
 };
 use crate::domain::session::{Session, SessionId, SessionSummary};
@@ -32,7 +35,7 @@ use crate::infrastructure::daemon_proto::SessionInfo;
 use crate::infrastructure::persistent::{PersistentProvider, PersistentTerminalHandle};
 use crate::infrastructure::ssh::SshTerminalHandle;
 use crate::infrastructure::sshconfig;
-use crate::application::host_policy::{HostPolicyResolver, SessionMode};
+use crate::application::host_policy::{AuthMode, HostPolicyResolver, SessionMode};
 use crate::application::path_policy::PathPolicy;
 use crate::application::policy::PolicyManager;
 
@@ -129,6 +132,12 @@ pub struct SessionManager {
     /// （优先级：explicit > host policy > system default，ADR-0017 §2.4）。
     /// 只读不写（ADR-0017 §2.2 不可变原则）。
     host_policy: HostPolicyResolver,
+    /// CredentialProvider（ADR-0009 / ADR-0017 §2.3）。
+    ///
+    /// `auth=password` 时通过它请求密码（不持久化、不部署 key）。
+    /// `new()` 系列默认 `NoopCredentialProvider`（返回 Unsupported）；
+    /// 生产入口（main.rs）注入 `HelperCredentialProvider`。
+    credential_provider: Arc<dyn CredentialProvider>,
     /// idleReaper task 句柄。Drop 时 abort 防泄漏。
     idle_reaper_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -140,6 +149,7 @@ impl SessionManager {
             PathPolicy::default_from_cwd(),
             Arc::new(PolicyManager::with_default()),
             HostPolicyResolver::empty(),
+            Arc::new(NoopCredentialProvider),
         )
     }
 
@@ -153,6 +163,7 @@ impl SessionManager {
             path_policy,
             Arc::new(PolicyManager::with_default()),
             HostPolicyResolver::empty(),
+            Arc::new(NoopCredentialProvider),
         )
     }
 
@@ -162,23 +173,32 @@ impl SessionManager {
         path_policy: PathPolicy,
         policy: Arc<PolicyManager>,
     ) -> Self {
-        Self::build(provider, path_policy, policy, HostPolicyResolver::empty())
+        Self::build(
+            provider,
+            path_policy,
+            policy,
+            HostPolicyResolver::empty(),
+            Arc::new(NoopCredentialProvider),
+        )
     }
 
-    /// 用自定义 Host Policy 解析器构造（ADR-0017，生产接线用）。
+    /// 用自定义 Host Policy 解析器 + CredentialProvider 构造（ADR-0017，生产接线用）。
     ///
     /// 生产入口（src/main.rs）用 `HostPolicyResolver::load_default()` 加载
-    /// hosts.toml 后传入。`new()` / `with_path_policy` / `with_policy` 保持
-    /// 空解析器（system default），测试不依赖真实用户配置。
+    /// hosts.toml，并注入 `HelperCredentialProvider`（与 BootstrapHost 共享同一
+    /// Arc）。`new()` / `with_path_policy` / `with_policy` 保持空解析器 +
+    /// NoopCredentialProvider，测试不依赖真实用户配置 / 弹窗。
     pub fn with_host_policy(
         provider: Arc<dyn TerminalProvider>,
         host_policy: HostPolicyResolver,
+        credential_provider: Arc<dyn CredentialProvider>,
     ) -> Self {
         Self::build(
             provider,
             PathPolicy::default_from_cwd(),
             Arc::new(PolicyManager::with_default()),
             host_policy,
+            credential_provider,
         )
     }
 
@@ -187,6 +207,7 @@ impl SessionManager {
         path_policy: PathPolicy,
         policy: Arc<PolicyManager>,
         host_policy: HostPolicyResolver,
+        credential_provider: Arc<dyn CredentialProvider>,
     ) -> Self {
         let sessions = Arc::new(DashMap::new());
 
@@ -203,20 +224,25 @@ impl SessionManager {
             path_policy,
             policy,
             host_policy,
+            credential_provider,
             idle_reaper_task: Mutex::new(Some(idle_reaper_task)),
         }
     }
 
     /// 打开一个新 Session（§6 open_session 工具的后端）。
     ///
-    /// 流程：`ssh -G <alias>` 解析 → `provider.open()` → `Session::new()` → 存入 map。
-    /// 返回 session_id 供后续操作引用。
+    /// 流程：解析策略 → `ssh -G <alias>` → （password 路径弹密码）→ `provider.open()` →
+    /// `Session::new()` → 存入 map。返回 session_id 供后续操作引用。
     ///
     /// - `persistent=None`：走 host policy（ADR-0017 §2.4：explicit > host policy >
     ///   system default），未配置时 system default = standard
     /// - `persistent=Some(false)`：Interactive Session（Phase 1/2 路径，SSH 直连 PTY）
     /// - `persistent=Some(true)`：Persistent Session（Phase 3 路径，远端 daemon 托管 PTY，ADR-0004）
     ///   `name` 仅 persistent 模式有效，作为远端 session 可读标签
+    ///
+    /// auth 只来自 host policy（MCP schema 无 auth 参数——ADR-0009 禁止密码进
+    /// tool arguments）。`auth=password` 时经 CredentialProvider 请求密码（可能
+    /// 触发用户 prompt，ADR-0017 §2.7），密码不持久化、不部署 key。
     pub async fn open_session(
         &self,
         host_alias: &HostName,
@@ -226,26 +252,37 @@ impl SessionManager {
     ) -> Result<SessionId, TermError> {
         tracing::info!(host = %host_alias, persistent = ?persistent, "open_session: resolving ssh config");
 
-        // 1. ssh -G 解析（ADR-0006：复用 OpenSSH 完整 config 解析）
+        // 1. 解析 session 模式 + auth 模式（ADR-0017 §2.4：explicit > host policy > default）
+        let session_mode = self.resolve_session_mode(host_alias, persistent);
+        let auth_mode = self.resolve_auth_mode(host_alias);
+
+        // 2. 组合校验（ADR-0017 §2.3）：password + persistent 不支持。
+        //    必须在 credential prompt 之前拒绝——用户不应为注定失败的请求输入密码。
+        Self::validate_auth_session_combo(auth_mode, session_mode)?;
+
+        // 3. ssh -G 解析（ADR-0006：复用 OpenSSH 完整 config 解析）
         let host = sshconfig::resolve(host_alias).await?;
 
-        // 2. session 模式解析（ADR-0017 §2.4：explicit > host policy > system default）
-        let persistent = match self.resolve_session_mode(host_alias, persistent) {
-            SessionMode::Persistent => true,
-            SessionMode::Standard => false,
+        // 4. password 路径：经 CredentialProvider 请求密码（ADR-0017 §2.3）。
+        //    Secret 仅在 SSH 认证瞬间 reveal()；provider.open 返回后 request drop → Zeroize。
+        let password = match auth_mode {
+            AuthMode::Password => Some(self.request_password(&host).await?),
+            AuthMode::Key | AuthMode::Auto => None,
         };
+
+        // 5. Provider 创建 Terminal Backend
+        //    persistent=false → SshProvider 路径（SSH connect + auth + PTY + shell）
+        //    persistent=true  → PersistentProvider 路径（check/deploy/bootstrap daemon + session.create）
+        let persistent = matches!(session_mode, SessionMode::Persistent);
         tracing::info!(
             host = %host.name,
             hostname = %host.hostname,
             port = host.port,
             user = %host.user,
             persistent,
+            auth = ?auth_mode,
             "open_session: resolved, connecting"
         );
-
-        // 3. Provider 创建 Terminal Backend
-        //    persistent=false → SshProvider 路径（SSH connect + auth + PTY + shell）
-        //    persistent=true  → PersistentProvider 路径（check/deploy/bootstrap daemon + session.create）
         let pty_size = pty_size.unwrap_or_default();
         let handle = self
             .provider
@@ -254,10 +291,11 @@ impl SessionManager {
                 pty_size,
                 persistent,
                 name,
+                password,
             })
             .await?;
 
-        // 3. 创建 Session（内部 spawn PTY read task）
+        // 6. 创建 Session（内部 spawn PTY read task）
         let id = self.next_session_id();
         let session = Arc::new(Session::new(
             id.clone(),
@@ -269,6 +307,57 @@ impl SessionManager {
         self.sessions.insert(id.clone(), session);
         tracing::info!(session = %id, host = %host.name, "open_session: ready");
         Ok(id)
+    }
+
+    /// 解析 open_session 的最终 auth 模式（ADR-0017 §2.4 优先级）。
+    ///
+    /// explicit_auth 恒为 None：MCP schema 无 auth 参数（ADR-0009 禁止密码进
+    /// tool arguments），auth 只来自 host policy / system default（auto = key-only）。
+    fn resolve_auth_mode(&self, host_alias: &str) -> AuthMode {
+        self.host_policy.resolve(host_alias, None, None).auth
+    }
+
+    /// 组合校验（ADR-0017 §2.3）：`auth=password` + `session=persistent` 不支持。
+    ///
+    /// 必须在 credential prompt 之前调用——用户不应为注定失败的请求输入密码。
+    /// 显式失败（InvalidArgument + 修复建议），**不做静默降级**：不把用户显式
+    /// 请求的 persistent session 悄悄变成 standard（ADR-0017 §2.3 禁止）。
+    fn validate_auth_session_combo(
+        auth: AuthMode,
+        session: SessionMode,
+    ) -> Result<(), TermError> {
+        if auth == AuthMode::Password && session == SessionMode::Persistent {
+            return Err(TermError::InvalidArgument(
+                "auth=password with session=persistent is not supported: password \
+                 authentication is supported for standard SSH sessions; persistent \
+                 sessions require key-based unattended SSH authentication. Use \
+                 auth=password + session=standard, or auth=key + session=persistent \
+                 (ADR-0017 §2.3)"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 经 CredentialProvider 请求密码（ADR-0017 §2.3 auth=password）。
+    ///
+    /// 错误映射（与 bootstrap_host 一致，ADR-0009）：
+    /// - 用户取消 → `AuthFailed`（认证未发生）
+    /// - helper 失败 / 平台不支持 → `InvalidArgument`
+    async fn request_password(&self, host: &Host) -> Result<Secret, TermError> {
+        self.credential_provider
+            .request_password(PasswordRequest {
+                host: host.hostname.clone(),
+                user: host.user.clone(),
+                reason: "open_session: host policy auth=password (ADR-0017)".into(),
+            })
+            .await
+            .map_err(|e| match e {
+                CredentialError::Cancelled => TermError::AuthFailed,
+                CredentialError::HelperFailed(msg) | CredentialError::Unsupported(msg) => {
+                    TermError::InvalidArgument(msg)
+                }
+            })
     }
 
     /// 解析 open_session 的最终 session 模式（ADR-0017 §2.4 优先级）。
@@ -911,6 +1000,7 @@ impl SessionManager {
                 pty_size,
                 persistent: false,
                 name: None,
+                password: None,
             })
             .await
         {
@@ -1246,6 +1336,9 @@ fn read_mode_name(params: &ReadOutputParams) -> &'static str {
 mod tests {
     use super::*;
     use crate::application::host_policy::{HostPolicy, HostPolicyConfig};
+    use crate::domain::credential::{
+        CredentialError, CredentialProvider, PassphraseRequest, PasswordRequest, Secret,
+    };
     use crate::domain::provider::{OpenTerminalRequest, TerminalHandle};
     use crate::domain::session::SessionState;
     use async_trait::async_trait;
@@ -1311,7 +1404,7 @@ mod tests {
     // 注意：open_session 依赖 sshconfig::resolve（调 `ssh -G` 子进程），
     // 这需要真实 ssh 环境。这里只测不依赖 SSH 的逻辑。
 
-    // ── ADR-0017：resolve_session_mode（优先级 explicit > host policy > default）──
+    // ── ADR-0017：resolve_session_mode / resolve_auth_mode / 组合校验 / 密码 ──
 
     /// 构造带 host policy 的 SessionManager（测试辅助）。
     /// SessionManager 构造会 spawn idleReaper task，需在 tokio runtime 中调用。
@@ -1327,6 +1420,67 @@ mod tests {
         SessionManager::with_host_policy(
             Arc::new(FakeProvider) as Arc<dyn TerminalProvider>,
             HostPolicyResolver::with_config(config),
+            Arc::new(NoopCredentialProvider),
+        )
+    }
+
+    /// 最小 Host 构造（password 测试辅助，不真正连接）。
+    fn test_host() -> Host {
+        Host {
+            name: "prod".into(),
+            hostname: "192.0.2.1".into(),
+            user: "root".into(),
+            port: 22,
+            identity_files: vec![],
+            proxy_jump: None,
+            user_known_hosts_files: vec![],
+            strict_host_key_checking: "yes".into(),
+        }
+    }
+
+    /// 假 CredentialProvider：按编程结果响应。
+    /// Secret 不可 Clone（ADR-0005），每次调用构造新值。
+    #[derive(Clone)]
+    enum FakeResponse {
+        Ok,
+        Cancelled,
+        HelperFailed(String),
+        Unsupported(String),
+    }
+
+    struct FakeCredentialProvider {
+        response: PLMutex<FakeResponse>,
+    }
+
+    #[async_trait]
+    impl CredentialProvider for FakeCredentialProvider {
+        async fn request_password(
+            &self,
+            _request: PasswordRequest,
+        ) -> Result<Secret, CredentialError> {
+            match self.response.lock().clone() {
+                FakeResponse::Ok => Ok(Secret::new("fake-password".into())),
+                FakeResponse::Cancelled => Err(CredentialError::Cancelled),
+                FakeResponse::HelperFailed(msg) => Err(CredentialError::HelperFailed(msg)),
+                FakeResponse::Unsupported(msg) => Err(CredentialError::Unsupported(msg)),
+            }
+        }
+
+        async fn request_passphrase(
+            &self,
+            _request: PassphraseRequest,
+        ) -> Result<Secret, CredentialError> {
+            Err(CredentialError::Unsupported("fake".into()))
+        }
+    }
+
+    fn mgr_with_credentials(response: FakeResponse) -> SessionManager {
+        SessionManager::with_host_policy(
+            Arc::new(FakeProvider) as Arc<dyn TerminalProvider>,
+            HostPolicyResolver::empty(),
+            Arc::new(FakeCredentialProvider {
+                response: PLMutex::new(response),
+            }),
         )
     }
 
@@ -1376,6 +1530,7 @@ mod tests {
         let mgr2 = SessionManager::with_host_policy(
             Arc::new(FakeProvider) as Arc<dyn TerminalProvider>,
             HostPolicyResolver::with_config(config),
+            Arc::new(NoopCredentialProvider),
         );
         assert_eq!(
             mgr2.resolve_session_mode("test", Some(true)),
@@ -1391,6 +1546,110 @@ mod tests {
             mgr.resolve_session_mode("unknown", None),
             SessionMode::Standard
         );
+    }
+
+    // ── ADR-0017：resolve_auth_mode ───────────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_auth_mode_no_config_defaults_auto() {
+        // 无 hosts.toml → system default = auto（等价 key-only）
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        assert_eq!(mgr.resolve_auth_mode("prod"), AuthMode::Auto);
+    }
+
+    #[tokio::test]
+    async fn resolve_auth_mode_uses_host_policy() {
+        let mut config = HostPolicyConfig::default();
+        config.hosts.insert(
+            "prod".into(),
+            HostPolicy {
+                auth: Some(AuthMode::Password),
+                session: None,
+            },
+        );
+        let mgr = SessionManager::with_host_policy(
+            Arc::new(FakeProvider) as Arc<dyn TerminalProvider>,
+            HostPolicyResolver::with_config(config),
+            Arc::new(NoopCredentialProvider),
+        );
+
+        assert_eq!(mgr.resolve_auth_mode("prod"), AuthMode::Password);
+        // 未配置的 host → system default
+        assert_eq!(mgr.resolve_auth_mode("unknown"), AuthMode::Auto);
+    }
+
+    // ── ADR-0017 §2.3：组合校验（password + persistent 不支持）────────
+
+    #[test]
+    fn validate_auth_session_combo_rejects_password_persistent() {
+        let err = SessionManager::validate_auth_session_combo(
+            AuthMode::Password,
+            SessionMode::Persistent,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+        let msg = format!("{err}");
+        assert!(msg.contains("auth=password with session=persistent"));
+        // 附修复建议（两种可行配置）
+        assert!(msg.contains("session=standard"));
+        assert!(msg.contains("auth=key"));
+    }
+
+    #[test]
+    fn validate_auth_session_combo_allows_valid_combinations() {
+        // 其余三种主要路径全部放行（ADR-0017 §2.3）
+        assert!(
+            SessionManager::validate_auth_session_combo(
+                AuthMode::Password,
+                SessionMode::Standard
+            )
+            .is_ok()
+        );
+        assert!(
+            SessionManager::validate_auth_session_combo(AuthMode::Key, SessionMode::Persistent)
+                .is_ok()
+        );
+        assert!(
+            SessionManager::validate_auth_session_combo(AuthMode::Key, SessionMode::Standard)
+                .is_ok()
+        );
+        assert!(
+            SessionManager::validate_auth_session_combo(AuthMode::Auto, SessionMode::Persistent)
+                .is_ok()
+        );
+    }
+
+    // ── ADR-0017 §2.3：request_password 错误映射 ──────────────────────
+
+    #[tokio::test]
+    async fn request_password_returns_secret_on_ok() {
+        let mgr = mgr_with_credentials(FakeResponse::Ok);
+        let password = mgr.request_password(&test_host()).await.unwrap();
+        assert_eq!(password.reveal(), "fake-password");
+    }
+
+    #[tokio::test]
+    async fn request_password_maps_cancelled_to_auth_failed() {
+        // 用户取消 → AuthFailed（认证未发生，Agent 应提示用户重试）
+        let mgr = mgr_with_credentials(FakeResponse::Cancelled);
+        let err = mgr.request_password(&test_host()).await.unwrap_err();
+        assert_eq!(err.code(), "AUTH_FAILED");
+    }
+
+    #[tokio::test]
+    async fn request_password_maps_helper_failed_to_invalid_argument() {
+        let mgr = mgr_with_credentials(FakeResponse::HelperFailed("helper crashed".into()));
+        let err = mgr.request_password(&test_host()).await.unwrap_err();
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+        assert!(format!("{err}").contains("helper crashed"));
+    }
+
+    #[tokio::test]
+    async fn request_password_maps_unsupported_to_invalid_argument() {
+        let mgr = mgr_with_credentials(FakeResponse::Unsupported("no GUI".into()));
+        let err = mgr.request_password(&test_host()).await.unwrap_err();
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+        assert!(format!("{err}").contains("no GUI"));
     }
 
     #[tokio::test]

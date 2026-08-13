@@ -363,8 +363,22 @@ impl TerminalProvider for SshProvider {
             "ssh connecting"
         );
 
-        // 连接 + 认证（直连或 ProxyJump 路径，由 connect_session 内部决策）
-        let connected = connect_session(host, 0).await?;
+        // 连接 + 认证
+        // - key 路径（默认）：connect_session 内部完成（Agent/IdentityFile，ProxyJump 递归）
+        // - password 路径（ADR-0017 §2.3 auth=password）：connect_unauthenticated +
+        //   authenticate_with_password，不尝试 key（policy 已声明密码优先）
+        let connected = if let Some(password) = &request.password {
+            let mut connected = connect_unauthenticated(host).await?;
+            let ok = authenticate_with_password(&mut connected.handle, &host.user, password.reveal())
+                .await?;
+            if !ok {
+                return Err(TermError::AuthFailed);
+            }
+            tracing::info!(user = %host.user, auth_via = "password", "ssh authenticated");
+            connected
+        } else {
+            connect_session(host, 0).await?
+        };
         let session = connected.handle;
 
         // 开 channel + request PTY + request shell（§5.1）
@@ -746,17 +760,17 @@ async fn connect_session(host: &Host, depth: usize) -> Result<ConnectResult, Ter
     })
 }
 
-/// 建立 SSH 连接但不认证（供 bootstrap_host 使用，ADR-0009）。
+/// 建立 SSH 连接但不认证（供 bootstrap_host 与 open_session password 路径使用，ADR-0009 / ADR-0017）。
 ///
 /// 与 `connect_session` 的区别：不调用 `authenticate_session`，仅完成 TCP 连接 + host key 校验。
 /// 调用方负责后续认证（可先尝试 key，失败再密码）。
 ///
-/// **不支持 ProxyJump**：bootstrap 场景假设直连目标主机。
+/// **不支持 ProxyJump**：password 认证场景假设直连目标主机（跳板机认证无法用同一密码复用）。
 /// 如果 host 配置了 proxy_jump，返回 `TermError::InvalidArgument`。
 pub async fn connect_unauthenticated(host: &Host) -> Result<ConnectResult, TermError> {
     if host.proxy_jump.is_some() {
         return Err(TermError::InvalidArgument(
-            "bootstrap does not support ProxyJump".to_string(),
+            "password authentication does not support ProxyJump".to_string(),
         ));
     }
 
