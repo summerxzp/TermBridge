@@ -22,6 +22,7 @@ use clap::{Parser, Subcommand};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
+use termbridge::application::host_policy::{default_config_path, HostPolicyResolver};
 use termbridge::application::hosts::HostManager;
 use termbridge::application::sessions::SessionManager;
 use termbridge::domain::provider::{PtySize, TerminalProvider};
@@ -42,6 +43,11 @@ struct Cli {
 enum Command {
     /// 列出 ~/.ssh/config 中已配置的主机
     Hosts,
+    /// 显示 host policy（ADR-0017：hosts.toml 中的 per-host 策略）
+    Policy {
+        /// 可选：只显示某个 host 的策略（省略则显示全部已配置 host）
+        host: Option<String>,
+    },
     /// 连接到主机（开新 persistent session，进入交互式终端）
     Connect {
         /// SSH config 中的 Host 别名
@@ -71,6 +77,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Hosts => cmd_hosts(),
+        Command::Policy { host } => cmd_policy(host.as_deref()),
         Command::Connect { host } => cmd_connect(&host).await,
         Command::Sessions { host } => cmd_sessions(&host).await,
         Command::Attach { host, session_id } => cmd_attach(&host, &session_id).await,
@@ -96,6 +103,69 @@ fn cmd_hosts() -> Result<()> {
             h.alias,
             h.hostname.as_deref().unwrap_or("-")
         );
+    }
+    Ok(())
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// policy（ADR-0017 §4 第 6 步：展示 host policy）
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 显示 hosts.toml 中的 host policy（ADR-0017）。
+///
+/// - `termbridge policy`：列出全部已配置 host 的**有效策略**（host policy > system default）
+/// - `termbridge policy <host>`：单 host 视图——已配置值 + 有效值 + 修改提示
+///
+/// 只读展示，不修改配置（ADR-0017 §2.2 不可变原则）。配置文件由用户手动编辑。
+fn cmd_policy(host: Option<&str>) -> Result<()> {
+    let resolver = HostPolicyResolver::load_default();
+    let path = default_config_path();
+
+    match host {
+        // 单 host 视图：已配置值（可能有省略）+ 有效值（已合并优先级）
+        Some(alias) => {
+            println!("host: {alias}");
+            println!("config: {}", path.display());
+            match resolver.get_host_policy(alias) {
+                Some(policy) => {
+                    let auth = policy
+                        .auth
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "-".into());
+                    let session = policy
+                        .session
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "-".into());
+                    println!("configured: auth = {auth}, session = {session} (- = 省略，走 system default)");
+                }
+                None => {
+                    println!("configured: (none — 未在 hosts.toml 配置，走 system default)");
+                }
+            }
+            let effective = resolver.resolve(alias, None, None);
+            println!("effective: auth = {}, session = {}", effective.auth, effective.session);
+            println!("hint: edit {} to change this host's policy", path.display());
+        }
+        // 全部视图：已配置 host 的有效策略表
+        None => {
+            println!("config: {}", path.display());
+            let mut hosts = resolver.list_configured_hosts();
+            if hosts.is_empty() {
+                println!("(no hosts.toml — all hosts use system defaults: auth = auto, session = standard)");
+                println!(
+                    "hint: create {} to configure per-host policies: [hosts.<alias>] auth = \"key\" | \"password\" | \"auto\", session = \"standard\" | \"persistent\"",
+                    path.display()
+                );
+                return Ok(());
+            }
+            hosts.sort_unstable();
+            println!("{:<20} {:<10} {:<10}", "HOST", "AUTH", "SESSION");
+            for alias in hosts {
+                let p = resolver.resolve(alias, None, None);
+                println!("{:<20} {:<10} {:<10}", alias, p.auth, p.session);
+            }
+            println!("hint: hosts not listed above use system defaults (auth = auto, session = standard)");
+        }
     }
     Ok(())
 }

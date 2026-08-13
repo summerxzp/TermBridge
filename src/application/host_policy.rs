@@ -67,6 +67,29 @@ impl From<bool> for SessionMode {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Display（CLI / GUI 展示用，ADR-0017 §4 第 6 步）
+// ───────────────────────────────────────────────────────────────────────────
+
+impl std::fmt::Display for AuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            AuthMode::Key => "key",
+            AuthMode::Password => "password",
+            AuthMode::Auto => "auto",
+        })
+    }
+}
+
+impl std::fmt::Display for SessionMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SessionMode::Standard => "standard",
+            SessionMode::Persistent => "persistent",
+        })
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // 配置结构
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -321,6 +344,20 @@ mod tests {
         // open_session 的 persistent 显式参数映射（ADR-0017 §2.3）
         assert_eq!(SessionMode::from(true), SessionMode::Persistent);
         assert_eq!(SessionMode::from(false), SessionMode::Standard);
+    }
+
+    #[test]
+    fn auth_mode_display_lowercase() {
+        // CLI / GUI 展示用（ADR-0017 §4 第 6 步）
+        assert_eq!(AuthMode::Key.to_string(), "key");
+        assert_eq!(AuthMode::Password.to_string(), "password");
+        assert_eq!(AuthMode::Auto.to_string(), "auto");
+    }
+
+    #[test]
+    fn session_mode_display_lowercase() {
+        assert_eq!(SessionMode::Standard.to_string(), "standard");
+        assert_eq!(SessionMode::Persistent.to_string(), "persistent");
     }
 
     #[test]
