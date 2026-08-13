@@ -128,7 +128,9 @@ session = "standard" | "persistent"
 | key / auto | standard | 纯 SSH，普通开发/生产/安全环境 |
 | key / auto | persistent | **TermBridge 最佳体验** |
 | password | standard | 临时/遗留/受限机器 |
-| password | persistent | 支持但不推荐；动机通常自相矛盾（persistent 需在目标机留 runtime，与 password 模式"不想留痕"的诉求冲突） |
+| password | persistent | **不支持**。Persistent runtime 的建立过程（check → deploy agentd → bootstrap daemon → exec）每一步都打开新的 SSH 连接，依赖**可复用、非交互的 key-based authentication**；password 模式每次连接需交互式密码，与 unattended runtime 管理冲突。`open_session` 在 credential prompt 之前返回 `InvalidArgument` |
+
+> **不做静默降级**：TermBridge 不会把显式请求的 persistent session 静默降级为 standard session。用户请求的语义与实际执行语义必须一致（Runtime Contract 核心思想）。`auth=password + session=persistent` 组合在弹密码**之前**返回 `InvalidArgument`（附修复建议：改用 `session=standard` 或 `auth=key`），而不是打开一个用户没要求的 session 类型。
 
 ### 2.4 优先级解析
 
@@ -264,7 +266,7 @@ Host Policy 只回答"怎么使用这台主机"，不重新发明 SSH config 或
 | 1 | ADR-0017（本文档） | 本文档过审 |
 | 2 | HostPolicy resolver：读 hosts.toml + 优先级解析 | 单测：显式参数 > host policy > system default |
 | 3 | open_session 接入 HostPolicy 默认值 | e2e：配 `session=standard` 的 host 不传 persistent → 走 standard；传 `persistent=true` → 走 persistent |
-| 4 | `auth=password` 路径：CredentialProvider 注入 SessionManager + open_session password 分支 | e2e：配 `auth=password` 的 host 每次 open_session 弹密码，不部署 key |
+| 4 | `auth=password` 路径：CredentialProvider 注入 SessionManager + open_session password 分支 | e2e：配 `auth=password` 的 host 每次 open_session 弹密码，不部署 key；`auth=password + session=persistent` → 弹密码前返回 `InvalidArgument` |
 | 5 | bootstrap_host 返回 hint（不修改 hosts.toml） | 单测：bootstrap 成功后 hosts.toml 内容不变 |
 | 6 | CLI / GUI 展示 host policy | 手动验证 |
 | 7 | Skill 更新（§3.3 两条规则） | Skill 文档审查 |
@@ -298,6 +300,14 @@ Host Policy 只回答"怎么使用这台主机"，不重新发明 SSH config 或
 ### F. Host Policy 做 enforcement（约束 Agent 不能用某模式）
 
 **否决（第一版）**：Host Policy 是 default preference，不是 enforcement policy。约束层一旦加上，需在 open_session 里做 policy enforcement，污染 Application 层。第一版先把默认值做好；若未来出现"prod 被误装 agentd"事故再评估，需新 ADR。
+
+### G. password 凭据贯穿 persistent runtime 内部连接
+
+**否决**：PersistentProvider 的 check/deploy/bootstrap/exec 每一步都开新 SSH 连接，整个生命周期建立在 key-based unattended authentication 之上。把 password 线程化穿过这些内部连接，等于改变 ADR-0004 的核心运行模型，且仅服务于一个本身就自相矛盾的组合。以"明确拒绝"替代（§2.3），错误信息给出两种可行配置。
+
+### H. `password + persistent` 静默降级为 standard
+
+**否决**：silent semantic downgrade。用户显式配 `session=persistent`，若实际得到 SSH-bound session，Agent 会误以为 MCP 重启后 session 仍在。违反"用户请求的语义与实际执行语义必须一致"。宁可明确失败（§2.3），不偷偷降级。
 
 ## 6. Relationships
 
