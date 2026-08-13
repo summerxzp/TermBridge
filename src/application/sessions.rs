@@ -32,6 +32,7 @@ use crate::infrastructure::daemon_proto::SessionInfo;
 use crate::infrastructure::persistent::{PersistentProvider, PersistentTerminalHandle};
 use crate::infrastructure::ssh::SshTerminalHandle;
 use crate::infrastructure::sshconfig;
+use crate::application::host_policy::{HostPolicyResolver, SessionMode};
 use crate::application::path_policy::PathPolicy;
 use crate::application::policy::PolicyManager;
 
@@ -122,6 +123,12 @@ pub struct SessionManager {
     path_policy: PathPolicy,
     /// 危险动作拦截策略链（PLAN.md §8，Phase 2）。默认 [DefaultPolicy]。
     policy: Arc<PolicyManager>,
+    /// Host Policy 解析器（ADR-0017，Phase 9）。
+    ///
+    /// open_session 未显式指定 persistent 时，从这里解析 per-host 默认值
+    /// （优先级：explicit > host policy > system default，ADR-0017 §2.4）。
+    /// 只读不写（ADR-0017 §2.2 不可变原则）。
+    host_policy: HostPolicyResolver,
     /// idleReaper task 句柄。Drop 时 abort 防泄漏。
     idle_reaper_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -132,6 +139,7 @@ impl SessionManager {
             provider,
             PathPolicy::default_from_cwd(),
             Arc::new(PolicyManager::with_default()),
+            HostPolicyResolver::empty(),
         )
     }
 
@@ -144,6 +152,7 @@ impl SessionManager {
             provider,
             path_policy,
             Arc::new(PolicyManager::with_default()),
+            HostPolicyResolver::empty(),
         )
     }
 
@@ -153,13 +162,31 @@ impl SessionManager {
         path_policy: PathPolicy,
         policy: Arc<PolicyManager>,
     ) -> Self {
-        Self::build(provider, path_policy, policy)
+        Self::build(provider, path_policy, policy, HostPolicyResolver::empty())
+    }
+
+    /// 用自定义 Host Policy 解析器构造（ADR-0017，生产接线用）。
+    ///
+    /// 生产入口（src/main.rs）用 `HostPolicyResolver::load_default()` 加载
+    /// hosts.toml 后传入。`new()` / `with_path_policy` / `with_policy` 保持
+    /// 空解析器（system default），测试不依赖真实用户配置。
+    pub fn with_host_policy(
+        provider: Arc<dyn TerminalProvider>,
+        host_policy: HostPolicyResolver,
+    ) -> Self {
+        Self::build(
+            provider,
+            PathPolicy::default_from_cwd(),
+            Arc::new(PolicyManager::with_default()),
+            host_policy,
+        )
     }
 
     fn build(
         provider: Arc<dyn TerminalProvider>,
         path_policy: PathPolicy,
         policy: Arc<PolicyManager>,
+        host_policy: HostPolicyResolver,
     ) -> Self {
         let sessions = Arc::new(DashMap::new());
 
@@ -175,6 +202,7 @@ impl SessionManager {
             counter: AtomicU64::new(0),
             path_policy,
             policy,
+            host_policy,
             idle_reaper_task: Mutex::new(Some(idle_reaper_task)),
         }
     }
@@ -184,20 +212,28 @@ impl SessionManager {
     /// 流程：`ssh -G <alias>` 解析 → `provider.open()` → `Session::new()` → 存入 map。
     /// 返回 session_id 供后续操作引用。
     ///
-    /// - `persistent=false`：Interactive Session（Phase 1/2 路径，SSH 直连 PTY）
-    /// - `persistent=true`：Persistent Session（Phase 3 路径，远端 daemon 托管 PTY，ADR-0004）
+    /// - `persistent=None`：走 host policy（ADR-0017 §2.4：explicit > host policy >
+    ///   system default），未配置时 system default = standard
+    /// - `persistent=Some(false)`：Interactive Session（Phase 1/2 路径，SSH 直连 PTY）
+    /// - `persistent=Some(true)`：Persistent Session（Phase 3 路径，远端 daemon 托管 PTY，ADR-0004）
     ///   `name` 仅 persistent 模式有效，作为远端 session 可读标签
     pub async fn open_session(
         &self,
         host_alias: &HostName,
         pty_size: Option<PtySize>,
-        persistent: bool,
+        persistent: Option<bool>,
         name: Option<String>,
     ) -> Result<SessionId, TermError> {
-        tracing::info!(host = %host_alias, persistent, "open_session: resolving ssh config");
+        tracing::info!(host = %host_alias, persistent = ?persistent, "open_session: resolving ssh config");
 
         // 1. ssh -G 解析（ADR-0006：复用 OpenSSH 完整 config 解析）
         let host = sshconfig::resolve(host_alias).await?;
+
+        // 2. session 模式解析（ADR-0017 §2.4：explicit > host policy > system default）
+        let persistent = match self.resolve_session_mode(host_alias, persistent) {
+            SessionMode::Persistent => true,
+            SessionMode::Standard => false,
+        };
         tracing::info!(
             host = %host.name,
             hostname = %host.hostname,
@@ -207,7 +243,7 @@ impl SessionManager {
             "open_session: resolved, connecting"
         );
 
-        // 2. Provider 创建 Terminal Backend
+        // 3. Provider 创建 Terminal Backend
         //    persistent=false → SshProvider 路径（SSH connect + auth + PTY + shell）
         //    persistent=true  → PersistentProvider 路径（check/deploy/bootstrap daemon + session.create）
         let pty_size = pty_size.unwrap_or_default();
@@ -233,6 +269,17 @@ impl SessionManager {
         self.sessions.insert(id.clone(), session);
         tracing::info!(session = %id, host = %host.name, "open_session: ready");
         Ok(id)
+    }
+
+    /// 解析 open_session 的最终 session 模式（ADR-0017 §2.4 优先级）。
+    ///
+    /// `explicit`（persistent 显式参数）> host policy > system default（standard）。
+    /// 纯函数便于单测——open_session 本身依赖 `ssh -G` 子进程，无法在单测中运行，
+    /// 优先级逻辑收敛在此处测试。
+    fn resolve_session_mode(&self, host_alias: &str, explicit: Option<bool>) -> SessionMode {
+        self.host_policy
+            .resolve(host_alias, None, explicit.map(SessionMode::from))
+            .session
     }
 
     /// 写输入到 PTY（§4.6 契约 7：立即返回，不等命令完成）。
@@ -1198,6 +1245,7 @@ fn read_mode_name(params: &ReadOutputParams) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::host_policy::{HostPolicy, HostPolicyConfig};
     use crate::domain::provider::{OpenTerminalRequest, TerminalHandle};
     use crate::domain::session::SessionState;
     use async_trait::async_trait;
@@ -1262,6 +1310,88 @@ mod tests {
 
     // 注意：open_session 依赖 sshconfig::resolve（调 `ssh -G` 子进程），
     // 这需要真实 ssh 环境。这里只测不依赖 SSH 的逻辑。
+
+    // ── ADR-0017：resolve_session_mode（优先级 explicit > host policy > default）──
+
+    /// 构造带 host policy 的 SessionManager（测试辅助）。
+    /// SessionManager 构造会 spawn idleReaper task，需在 tokio runtime 中调用。
+    fn mgr_with_policy(policy: &str) -> SessionManager {
+        let mut config = HostPolicyConfig::default();
+        config.hosts.insert(
+            policy.to_string(),
+            HostPolicy {
+                auth: None,
+                session: Some(SessionMode::Persistent),
+            },
+        );
+        SessionManager::with_host_policy(
+            Arc::new(FakeProvider) as Arc<dyn TerminalProvider>,
+            HostPolicyResolver::with_config(config),
+        )
+    }
+
+    #[tokio::test]
+    async fn resolve_session_mode_no_config_defaults_standard() {
+        // 无 hosts.toml（empty resolver）→ system default = standard（false）
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        assert_eq!(mgr.resolve_session_mode("prod", None), SessionMode::Standard);
+        assert_eq!(
+            mgr.resolve_session_mode("prod", Some(false)),
+            SessionMode::Standard
+        );
+        assert_eq!(
+            mgr.resolve_session_mode("prod", Some(true)),
+            SessionMode::Persistent
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_session_mode_host_policy_persistent_without_explicit() {
+        // 配 session=persistent 的 host，不传 persistent → persistent
+        let mgr = mgr_with_policy("prod");
+        assert_eq!(
+            mgr.resolve_session_mode("prod", None),
+            SessionMode::Persistent
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_session_mode_explicit_overrides_host_policy() {
+        let mgr = mgr_with_policy("prod");
+
+        // 显式 persistent=false 覆盖 host policy 的 persistent
+        assert_eq!(
+            mgr.resolve_session_mode("prod", Some(false)),
+            SessionMode::Standard
+        );
+        // 显式 persistent=true 覆盖 host policy 的 standard
+        let mut config = HostPolicyConfig::default();
+        config.hosts.insert(
+            "test".to_string(),
+            HostPolicy {
+                auth: None,
+                session: Some(SessionMode::Standard),
+            },
+        );
+        let mgr2 = SessionManager::with_host_policy(
+            Arc::new(FakeProvider) as Arc<dyn TerminalProvider>,
+            HostPolicyResolver::with_config(config),
+        );
+        assert_eq!(
+            mgr2.resolve_session_mode("test", Some(true)),
+            SessionMode::Persistent
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_session_mode_unknown_host_uses_system_default() {
+        // 未配置的 host → system default = standard
+        let mgr = mgr_with_policy("prod");
+        assert_eq!(
+            mgr.resolve_session_mode("unknown", None),
+            SessionMode::Standard
+        );
+    }
 
     #[tokio::test]
     async fn session_not_found_errors() {

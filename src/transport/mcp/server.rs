@@ -102,7 +102,8 @@ pub struct OpenSessionParams {
     pub rows: Option<u16>,
     /// PTY columns (default 80)
     pub cols: Option<u16>,
-    /// Use persistent daemon session (ADR-0004). Default false (interactive session).
+    /// Use persistent daemon session (ADR-0004). Omitted → resolved from host policy
+    /// (ADR-0017 §2.4, per-host hosts.toml), defaulting to false (interactive session).
     /// When true, deploys and connects to remote termbridge-agentd daemon for cross-restart persistence.
     #[serde(default)]
     pub persistent: Option<bool>,
@@ -455,10 +456,11 @@ impl TermBridgeServer {
             (Some(r), Some(c)) => Some(PtySize { rows: r, cols: c }),
             _ => None,
         };
-        let persistent = params.persistent.unwrap_or(false);
+        // persistent=None 透传给 SessionManager，由 host policy 解析默认值
+        // （ADR-0017 §2.4：explicit > host policy > system default）
         match self
             .session_manager
-            .open_session(&params.host, pty_size, persistent, params.name)
+            .open_session(&params.host, pty_size, params.persistent, params.name)
             .await
         {
             Ok(id) => ok_result(OpenSessionResult { session_id: id }),

@@ -145,7 +145,9 @@ async fn cmd_connect(host: &str) -> Result<()> {
         .open_session(
             &host.to_string(),
             Some(PtySize { rows, cols }),
-            true,
+            // CLI connect 命令语义 = 显式开 persistent session（ADR-0017 §2.4：
+            // explicit > host policy——用户选择 connect 即显式要求 persistent）
+            Some(true),
             Some(format!("cli-{ts}")),
         )
         .await

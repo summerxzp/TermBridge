@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use termbridge::application::bootstrap::BootstrapHost;
+use termbridge::application::host_policy::HostPolicyResolver;
 use termbridge::application::hosts::HostManager;
 use termbridge::application::sessions::SessionManager;
 use termbridge::domain::credential::{CredentialProvider, NoopCredentialProvider};
@@ -32,7 +33,11 @@ async fn main() -> anyhow::Result<()> {
     // persistent=true 走远端 daemon 路径 ADR-0004）→ SessionManager, HostManager → Server
     let provider = Arc::new(PersistentProvider::default())
         as Arc<dyn termbridge::domain::provider::TerminalProvider>;
-    let session_manager = Arc::new(SessionManager::new(provider));
+    // ADR-0017：启动时加载 hosts.toml（不存在 → 空配置，行为与之前完全一致）
+    let session_manager = Arc::new(SessionManager::with_host_policy(
+        provider,
+        HostPolicyResolver::load_default(),
+    ));
     let host_manager = Arc::new(HostManager::new());
 
     // ADR-0009：CredentialProvider —— 优先 HelperCredentialProvider（spawn 独立 helper
