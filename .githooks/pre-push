@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# pre-push 门禁：镜像 ci.yml 的检查步骤（debug 档本地快速版）。
+# 目的：push 前拦截跨 crate 编译错误（如公共 API 签名变更漏改调用点），
+# 不把 CI 当作第一个发现编译错误的地方。
+#
+# 与 ci.yml 的对应关系：
+#   Build termbridge-mcp/termbridge   → cargo check -p termbridge --all-targets
+#   Build auth-helper                 → cargo check -p termbridge-auth-helper
+#   Check GUI (Tauri)                 → cargo check -p termbridge-gui
+#   Build agentd (Linux only)         → 条件执行（agentd 仅 Linux 可编译）
+#   cargo test --lib                  → cargo test -p termbridge --lib
+#
+# 启用：git config core.hooksPath .githooks
+
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+echo "==> pre-push: cargo check -p termbridge --all-targets"
+cargo check -p termbridge --all-targets
+
+echo "==> pre-push: cargo check -p termbridge-auth-helper"
+cargo check -p termbridge-auth-helper
+
+echo "==> pre-push: cargo check -p termbridge-gui"
+cargo check -p termbridge-gui
+
+echo "==> pre-push: cargo test -p termbridge --lib"
+cargo test -p termbridge --lib
+
+if [[ "$(uname -s)" == "Linux" ]]; then
+    echo "==> pre-push: cargo check -p termbridge-agentd (Linux)"
+    cargo check -p termbridge-agentd
+fi
+
+echo "==> pre-push: all checks passed"
