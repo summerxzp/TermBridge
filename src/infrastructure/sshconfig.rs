@@ -21,10 +21,14 @@ use crate::domain::provider::TermError;
 ///
 /// `alias` 是 ssh config 里的 Host 别名（或直接 IP/hostname）。
 pub async fn resolve(alias: &str) -> Result<Host, TermError> {
-    // ssh -G 走 stdio，快速返回，用 tokio::process 异步等
+    // ssh -G 走 stdio，快速返回，用 tokio::process 异步等。
+    // stdin 置空：`ssh -G` 不读 stdin，但某些实现（如 Git for Windows 的
+    // OpenSSH）会等 stdin EOF 才输出——MCP 场景 stdin 是长驻 transport，
+    // 不置空会导致 open_session 永久挂起。
     let output = tokio::process::Command::new("ssh")
         .arg("-G")
         .arg(alias)
+        .stdin(std::process::Stdio::null())
         .output()
         .await
         .map_err(|e| TermError::ConnectFailed(format!("spawn `ssh -G {alias}`: {e}")))?;
