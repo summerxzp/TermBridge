@@ -35,3 +35,6 @@ docs/internal/
 
 # Release artifacts (built binaries, not source)
 release-artifacts/
+
+# Personal dev memory (local only)
+project_memory.md
