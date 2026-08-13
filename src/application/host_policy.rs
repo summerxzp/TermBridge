@@ -18,7 +18,7 @@
 //! Host Policy = 用户意图。TermBridge 永不作为连接/认证/bootstrap/session
 //! 操作的副作用隐式修改 Host Policy。配置文件只由用户显式编辑或 GUI 显式写入。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -165,7 +165,7 @@ impl HostPolicyResolver {
     }
 
     /// 从指定路径加载（测试用）。
-    pub fn load_from(path: &PathBuf) -> Self {
+    pub fn load_from(path: &Path) -> Self {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
@@ -299,15 +299,32 @@ fn warn_on_nested_dotted_host_keys(content: &str) {
 /// - Linux / macOS：`~/.config/termbridge/hosts.toml`（XDG）
 /// - Windows：`%APPDATA%\TermBridge\hosts.toml`
 ///
-/// 用 `dirs` crate 解析，不硬编码。
+/// macOS 特殊处理：`dirs::config_dir()` 在 macOS 返回 `~/Library/Application Support`
+/// （Apple 原生惯例，适合 GUI 应用用 plist 管理配置）。但 TermBridge 是 CLI/开发者
+/// 工具，hosts.toml 是用户手写的 toml，应遵循 XDG 惯例（`~/.config`），与 git/vim/
+/// tmux 等所有 CLI 工具一致。参考：https://becca.ooo/blog/macos-dotfiles/
 pub fn default_config_path() -> PathBuf {
-    // Linux/macOS: config_dir = ~/.config；Windows: config_dir = %APPDATA%
-    // 统一用 config_dir，符合 XDG（Linux）和 Windows Roaming AppData 约定。
-    let base = dirs::config_dir().unwrap_or_else(|| {
-        tracing::warn!("dirs::config_dir() returned None, falling back to home dir");
-        dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
-    });
-    base.join("termbridge").join("hosts.toml")
+    let base = if cfg!(target_os = "macos") {
+        // macOS: 强制 XDG 风格（~/.config），尊重 XDG_CONFIG_HOME 环境变量
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".config")
+            })
+    } else {
+        // Linux: dirs::config_dir() = ~/.config（尊重 XDG_CONFIG_HOME）
+        // Windows: dirs::config_dir() = %APPDATA%
+        dirs::config_dir().unwrap_or_else(|| {
+            tracing::warn!("dirs::config_dir() returned None, falling back to home dir");
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+        })
+    };
+    // Windows 用 TermBridge 目录（与 agentd 本地路径、ADR-0017 §2.9 一致，
+    // %APPDATA%\TermBridge\hosts.toml）；Unix 用 XDG 惯例小写 termbridge。
+    let app_dir = if cfg!(windows) { "TermBridge" } else { "termbridge" };
+    base.join(app_dir).join("hosts.toml")
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -755,6 +772,19 @@ auth = "password"
         // 不断言具体路径（跨平台），只断言非空且以 hosts.toml 结尾
         assert!(path.ends_with("hosts.toml"));
         assert!(path.components().count() > 1);
+        // 目录段与 ADR-0017 §2.9 一致：Windows TermBridge / Unix termbridge
+        #[cfg(windows)]
+        assert!(
+            path.to_string_lossy().contains("TermBridge"),
+            "Windows 路径应用 TermBridge 目录: {}",
+            path.display()
+        );
+        #[cfg(not(windows))]
+        assert!(
+            path.to_string_lossy().contains("termbridge"),
+            "Unix 路径应用小写 termbridge 目录: {}",
+            path.display()
+        );
     }
 
     // ── 辅助 ─────────────────────────────────────────────────────────
