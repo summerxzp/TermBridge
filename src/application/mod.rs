@@ -7,9 +7,13 @@
 //! Phase 1：
 //! - `path_policy`：SFTP 路径策略（ADR-0005 §4）
 //!
+//! Phase 9 / ADR-0017：
+//! - `host_policy`：HostPolicy per-host 连接偏好配置（auth / session）
+//!
 //! 关键解耦（PLAN.md §4）：Application 层定义业务接口，MCP transport 只是调用方之一。
 
 pub mod bootstrap;
+pub mod host_policy;
 pub mod hosts;
 pub mod path_policy;
 pub mod policy;

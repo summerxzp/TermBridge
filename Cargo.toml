@@ -78,5 +78,9 @@ dashmap = "6"
 # Phase 5 / ADR-0009：CredentialProvider Secret 自动清零
 zeroize = { version = "1", features = ["alloc"] }
 
+# ADR-0017：Host Policy 配置文件（~/.config/termbridge/hosts.toml）平台路径与 TOML 解析
+dirs = "6"
+toml = "0.8"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

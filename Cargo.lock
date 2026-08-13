@@ -4799,7 +4799,7 @@ dependencies = [
 
 [[package]]
 name = "termbridge"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4808,6 +4808,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dashmap",
+ "dirs",
  "parking_lot",
  "regex",
  "rmcp",
@@ -4817,6 +4818,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
+ "toml 0.8.2",
  "tracing",
  "tracing-subscriber",
  "zeroize",
@@ -4824,7 +4826,7 @@ dependencies = [
 
 [[package]]
 name = "termbridge-agentd"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4845,7 +4847,7 @@ dependencies = [
 
 [[package]]
 name = "termbridge-auth-helper"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "libc",
  "serde",
@@ -4855,7 +4857,7 @@ dependencies = [
 
 [[package]]
 name = "termbridge-cli"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4872,7 +4874,7 @@ dependencies = [
 
 [[package]]
 name = "termbridge-gui"
-version = "0.0.1"
+version = "0.1.1"
 dependencies = [
  "base64 0.23.1",
  "dashmap",
