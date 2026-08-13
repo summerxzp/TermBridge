@@ -25,6 +25,7 @@ TermBridge 是一个 MCP（Model Context Protocol）server，通过 stdio 与 AI
 - **完整 Terminal 语义**：PTY byte stream + cursor + `wait_for` + 4 种读取模式，不是屏幕快照
 - **SFTP 文件/目录传输**：单文件原子写、目录递归、路径策略防越界
 - **Persistent Runtime（可选）**：opt-in 部署远端 daemon，支持 session 跨 MCP 重启保活、detach/attach
+- **Host Policy（ADR-0017）**：per-host 连接策略配置（`hosts.toml`），声明认证方式偏好（key / password / auto）与 session 持久化偏好（standard / persistent）。无配置时行为与 0.1.x 完全一致
 - **Agent Terminal Protocol**：ADR-0013 定义的 7 条规则，确保 Agent 正确处理 completion / timeout / disconnect / TUI
 - **跨平台**：Windows / Linux / macOS 预构建二进制（macOS Apple Silicon 原生，Intel Mac 可走 Rosetta 2），CLI + GUI + MCP 三种消费者
 - **安全边界严格**：host key 严格校验、密码脱敏日志、SFTP 路径策略、凭据不进 MCP schema
@@ -303,6 +304,59 @@ daemon 管理 PTY + OutputBuffer（Unix socket 通信）
 - daemon 单用户模式，socket 权限 0600
 - 不开 TCP / HTTP，仅 Unix socket + SSH tunnel
 
+## Host Policy（ADR-0017）
+
+不同 host 有不同的安全/运维约束（开发机 key+persistent、生产机 key+standard、临时机 password+standard）。Host Policy 通过可选配置文件声明 per-host 默认偏好，让 Agent 一次调用就能匹配用户意图。
+
+### 配置文件
+
+| 平台 | 路径 |
+|---|---|
+| Linux / macOS | `~/.config/termbridge/hosts.toml`（XDG） |
+| Windows | `%APPDATA%\TermBridge\hosts.toml` |
+
+文件**可选**——不存在时所有 host 走 system default（auth=auto 等价 key-only、session=standard），行为与 0.1.x 完全一致。
+
+### 字段
+
+```toml
+[hosts.prod]
+auth = "key"           # key | password | auto（auto 等价 key-only）
+session = "standard"   # standard | persistent
+
+[hosts."192.168.1.180"]   # IP / 点号别名必须加引号，否则 TOML 解析为嵌套表
+auth = "password"
+session = "standard"
+```
+
+| auth | session | 用途 |
+|---|---|---|
+| key / auto | standard | 纯 SSH，普通开发/生产/安全环境 |
+| key / auto | persistent | TermBridge 最佳体验 |
+| password | standard | 临时/遗留/受限机器（每次 open_session 弹密码，不部署 key） |
+| password | persistent | **不支持**，在弹密码前返回 `InvalidArgument`（不做静默降级） |
+
+### 优先级
+
+```
+explicit tool argument  >  host policy  >  system default
+```
+
+例：`[hosts.prod] session = "standard"` 时，`open_session(host="prod", persistent=true)` 仍走 persistent（显式参数优先）。host policy 只是默认值，不是约束。
+
+### 不可变原则
+
+Host Policy = 用户意图。`bootstrap_host` 成功**不修改** hosts.toml，只返回 `hint` 建议用户手动切换；TermBridge 永不作为连接/认证/session 操作的副作用隐式修改配置。
+
+### CLI
+
+```bash
+termbridge policy              # 查看所有已配置 host 的策略
+termbridge policy prod         # 查看单 host 有效值 + 修改提示
+```
+
+> 设计动机与完整否决项见 [ADR-0017](docs/adr/0017-host-connection-policy.md)。
+
 ## 安全模型
 
 | 维度 | 策略 |
@@ -344,6 +398,7 @@ TermBridge Runtime 支持三种消费者，全部遵守 Agent Terminal Protocol�
 | [0014](docs/adr/0014-phase7-consumer-roadmap.md) | Phase 7 消费者路线图 | Accepted |
 | [0015](docs/adr/0015-provider-api-freeze.md) | Provider API 冻结 | Accepted |
 | [0016](docs/adr/0016-runtime-freeze.md) | Runtime Freeze | Accepted |
+| [0017](docs/adr/0017-host-connection-policy.md) | Host Connection Policy | Accepted |
 
 ## 项目结构
 
@@ -390,7 +445,7 @@ TermBridge/
 | T17 attach/cursor 边界 | 8/8 ✅ |
 | Cross-restart E2E | 5/5 ✅ |
 | T16 resize | 6/6 ✅ |
-| 单元测试 | 256/256 ✅ |
+| 单元测试 | 298/298 ✅ |
 
 ## 许可证
 

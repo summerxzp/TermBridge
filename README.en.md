@@ -25,6 +25,7 @@ TermBridge is an MCP (Model Context Protocol) server that communicates with AI c
 - **Full Terminal Semantics**: PTY byte stream + cursor + `wait_for` + 4 read modes, not screen snapshots
 - **SFTP File/Directory Transfer**: Atomic single-file writes, recursive directories, path policy protection
 - **Persistent Runtime (optional)**: Opt-in remote daemon for sessions surviving MCP restarts, detach/attach
+- **Host Policy (ADR-0017)**: Per-host connection policy config (`hosts.toml`) declaring auth preference (key / password / auto) and session persistence preference (standard / persistent). No config = identical behavior to 0.1.x
 - **Agent Terminal Protocol**: 7 rules defined in ADR-0013 ensuring Agents handle completion / timeout / disconnect / TUI correctly
 - **Cross-Platform**: Windows / Linux / macOS pre-built binaries (macOS Apple Silicon native, Intel Mac via Rosetta 2), three consumers (CLI + GUI + MCP)
 - **Strict Security Boundary**: Host key strict checking, password redaction in logs, SFTP path policy, credentials excluded from MCP schema
@@ -303,6 +304,59 @@ daemon manages PTY + OutputBuffer (Unix socket communication)
 - daemon single-user mode, socket permission 0600
 - No TCP / HTTP, Unix socket + SSH tunnel only
 
+## Host Policy (ADR-0017)
+
+Different hosts have different security/ops constraints (dev box: key+persistent, prod: key+standard, legacy: password+standard). Host Policy is an optional config file declaring per-host default preferences, so a single Agent call matches user intent.
+
+### Config File
+
+| Platform | Path |
+|---|---|
+| Linux / macOS | `~/.config/termbridge/hosts.toml` (XDG) |
+| Windows | `%APPDATA%\TermBridge\hosts.toml` |
+
+The file is **optional** — when absent, all hosts use system defaults (auth=auto ≡ key-only, session=standard), identical to 0.1.x behavior.
+
+### Fields
+
+```toml
+[hosts.prod]
+auth = "key"           # key | password | auto (auto ≡ key-only)
+session = "standard"   # standard | persistent
+
+[hosts."192.168.1.180"]   # IP / dotted aliases MUST be quoted, otherwise TOML parses them as nested tables
+auth = "password"
+session = "standard"
+```
+
+| auth | session | Use case |
+|---|---|---|
+| key / auto | standard | Pure SSH, dev/prod/security-sensitive hosts |
+| key / auto | persistent | TermBridge best experience |
+| password | standard | Legacy/restricted hosts (open_session prompts password each time, no key deployed) |
+| password | persistent | **Unsupported**, returns `InvalidArgument` before prompting (no silent downgrade) |
+
+### Priority
+
+```
+explicit tool argument  >  host policy  >  system default
+```
+
+Example: with `[hosts.prod] session = "standard"`, `open_session(host="prod", persistent=true)` still uses persistent (explicit wins). Host policy is a default, not an enforcement.
+
+### Immutability Principle
+
+Host Policy = user intent. `bootstrap_host` success **does not modify** hosts.toml — it returns a `hint` suggesting the user switch manually. TermBridge never implicitly mutates host policy as a side effect of connection/auth/session operations.
+
+### CLI
+
+```bash
+termbridge policy              # list all configured hosts' policies
+termbridge policy prod         # show a single host's effective values + edit hint
+```
+
+> For design rationale and rejected alternatives, see [ADR-0017](docs/adr/0017-host-connection-policy.md).
+
 ## Security Model
 
 | Dimension | Policy |
@@ -344,6 +398,7 @@ TermBridge Runtime supports three consumers, all following Agent Terminal Protoc
 | [0014](docs/adr/0014-phase7-consumer-roadmap.md) | Phase 7 Consumer Roadmap | Accepted |
 | [0015](docs/adr/0015-provider-api-freeze.md) | Provider API Freeze | Accepted |
 | [0016](docs/adr/0016-runtime-freeze.md) | Runtime Freeze | Accepted |
+| [0017](docs/adr/0017-host-connection-policy.md) | Host Connection Policy | Accepted |
 
 ## Project Structure
 
@@ -390,7 +445,7 @@ TermBridge/
 | T17 attach/cursor boundary | 8/8 ✅ |
 | Cross-restart E2E | 5/5 ✅ |
 | T16 resize | 6/6 ✅ |
-| Unit tests | 256/256 ✅ |
+| Unit tests | 298/298 ✅ |
 
 ## License
 

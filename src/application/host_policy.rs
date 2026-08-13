@@ -206,16 +206,16 @@ impl HostPolicyResolver {
         }
     }
 
-/// 用空配置创建（所有 host 走 system default，测试用）。
-pub fn empty() -> Self {
-    Self {
-        config: HostPolicyConfig::default(),
+    /// 用空配置创建（所有 host 走 system default，测试用）。
+    pub fn empty() -> Self {
+        Self {
+            config: HostPolicyConfig::default(),
+        }
     }
-}
 
-/// 用预加载的配置创建（测试用）。
-pub fn with_config(config: HostPolicyConfig) -> Self {
-    Self { config }
+    /// 用预加载的配置创建（测试用）。
+    pub fn with_config(config: HostPolicyConfig) -> Self {
+        Self { config }
     }
 
     /// 解析某 host 的最终策略（ADR-0017 §2.4 优先级）。

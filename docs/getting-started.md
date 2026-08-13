@@ -94,7 +94,50 @@ termbridge hosts
 - **Trae / Claude Code**：放到 `.trae/skills/termbridge/SKILL.md` 或客户端 skill 目录
 - **其他**：参考客户端文档
 
-## 6. 首次连接（Happy Path）
+## 6. 配置 Host Policy（可选）
+
+如果某些 host 有特殊的安全/运维约束（如生产机不允许部署 daemon、临时机器只用密码不部署 key），可创建 `hosts.toml` 声明 per-host 默认偏好。**多数用户可跳过此步**——无配置时所有 host 走默认（key 认证 + standard session），行为与 0.1.x 一致。
+
+| 平台 | 路径 |
+|---|---|
+| Linux / macOS | `~/.config/termbridge/hosts.toml` |
+| Windows | `%APPDATA%\TermBridge\hosts.toml` |
+
+```toml
+# 生产机：纯 SSH，不部署 daemon
+[hosts.prod]
+auth = "key"
+session = "standard"
+
+# 临时机：每次输密码，不部署 key（bootstrap_host 也不会改这里）
+[hosts."192.168.1.180"]
+auth = "password"
+session = "standard"
+```
+
+> IP / 点号别名必须加引号（`[hosts."192.168.1.180"]`），否则 TOML 解析为嵌套表，策略静默失效。
+
+两个维度：
+
+| 字段 | 值 | 含义 |
+|---|---|---|
+| `auth` | `key` / `password` / `auto` | 认证方式偏好。`auto` 等价 `key`。`password` 每次 `open_session` 弹密码，不持久化、不部署 key |
+| `session` | `standard` / `persistent` | 是否允许部署远端 daemon。`standard` = 纯 SSH，断开即丢 |
+
+**注意**：`auth=password + session=persistent` 不支持，会在弹密码前返回 `InvalidArgument`。
+
+优先级：显式工具参数 > host policy > system default。即 `hosts.toml` 里写了 `session = "standard"`，Agent 仍可用 `open_session(persistent=true)` 显式覆盖。
+
+查看当前配置：
+
+```bash
+termbridge policy              # 全部已配置 host
+termbridge policy prod         # 单 host 有效值 + 修改提示
+```
+
+完整设计见 [ADR-0017](../docs/adr/0017-host-connection-policy.md)。
+
+## 7. 首次连接（Happy Path）
 
 第一次连接某主机时，需要部署 SSH 公钥。让 Agent 调用 `bootstrap_host`：
 
@@ -116,7 +159,7 @@ Agent: send_input + read_output 执行命令
 
 之后所有连接直接 `open_session`，SSH key 免密，不再需要密码。
 
-## 7. 验证可用
+## 8. 验证可用
 
 让 Agent 执行一个简单命令：
 
