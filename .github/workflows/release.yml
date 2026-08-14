@@ -36,6 +36,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-agentd
+
       - name: Build agentd
         run: cargo build --release -p termbridge-agentd
 
@@ -69,6 +74,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
 
       - name: Download agentd artifact
         uses: actions/download-artifact@v5

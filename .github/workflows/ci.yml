@@ -24,6 +24,11 @@ jobs:
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci
+
       - name: Install Linux dependencies (Tauri)
         if: runner.os == 'Linux'
         run: |
@@ -34,6 +39,8 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: 24
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
 
       - name: Build frontend (for Tauri asset embedding)
         working-directory: gui
@@ -41,15 +48,15 @@ jobs:
           npm ci
           npm run build
 
-      - name: Build main binaries (termbridge-mcp, termbridge)
-        run: cargo build --release --bin termbridge-mcp --bin termbridge
+      - name: Check main binaries (termbridge-mcp, termbridge)
+        run: cargo check -p termbridge --all-targets
 
-      - name: Build auth helper
-        run: cargo build --release -p termbridge-auth-helper
+      - name: Check auth helper
+        run: cargo check -p termbridge-auth-helper
 
-      - name: Build agentd (Linux only)
+      - name: Check agentd (Linux only)
         if: runner.os == 'Linux'
-        run: cargo build --release -p termbridge-agentd
+        run: cargo check -p termbridge-agentd
 
       - name: Check GUI (Tauri)
         run: cargo check -p termbridge-gui

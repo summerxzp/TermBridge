@@ -4,11 +4,11 @@
 # 不把 CI 当作第一个发现编译错误的地方。
 #
 # 与 ci.yml 的对应关系：
-#   Build termbridge-mcp/termbridge   → cargo check -p termbridge --all-targets
-#   Build auth-helper                 → cargo check -p termbridge-auth-helper
-#   Check GUI (Tauri)                 → cargo check -p termbridge-gui
-#   Build agentd (Linux only)         → 条件执行（agentd 仅 Linux 可编译）
-#   cargo test --lib                  → cargo test -p termbridge --lib
+#   Check main binaries (termbridge-mcp/termbridge) → cargo check -p termbridge --all-targets
+#   Check auth-helper                              → cargo check -p termbridge-auth-helper
+#   Check GUI (Tauri)                              → cargo check -p termbridge-gui
+#   Check agentd (Linux only)                      → 条件执行（agentd 仅 Linux 可编译）
+#   Run unit tests                                 → cargo test -p termbridge --lib
 #
 # 启用：git config core.hooksPath .githooks
 #
