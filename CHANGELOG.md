@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.1] - 2026-08-14
 
+### Fixed
+
+- macOS：`XDG_RUNTIME_DIR` 未设置时 instance discovery 读写目录不一致（register 走 temp_dir 兜底而 list 返回空），以及 Unix socket bind 前未创建父目录导致 `ENOENT` —— 统一目录兜底 + bind 前 `create_dir_all`
+
 ### Added
 
 **Local Control Plane（ADR-0018）**
