@@ -5,6 +5,40 @@ All notable changes to TermBridge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-08-14
+
+### Added
+
+**Local Control Plane（ADR-0018）**
+- 新增 Human Control Plane：MCP server 启动时监听本地 IPC（Linux/macOS Unix socket 0600 / Windows TCP loopback），与 MCP stdio（Agent 数据面）互补
+- Agent 不可调用权限提升接口——`set_approval_mode` 仅通过 Control IPC 由人类经 CLI/GUI 操作
+- Instance 发现机制：MCP server 启动时写 `$XDG_RUNTIME_DIR/termbridge/mcp-<instance>.json`（Windows: `%TEMP%/termbridge/`），含 pid/endpoint/token；退出自动清理 + stale instance 自动回收
+- 新 CLI 子命令：`termbridge mcp list`（列运行中 MCP server）、`termbridge session list`（列 MCP server 上的 session）、`termbridge session approve <session_id>`（批准 session 进入 unrestricted 模式）
+
+**Session Approval Mode**
+- `ApprovalMode` enum（`Standard` / `Unrestricted`），session-scoped 不持久化，Session 关闭即重置
+- `Unrestricted` 模式**只跳过 confirm 类 guardrail**（sudo / rm -rf /tmp 等），blocklist / hard deny（`rm -rf /`、`mkfs` 等）**仍生效**；不绕过 SSH host key / credential / path safety / protocol invariants 等系统级安全边界
+- `list_sessions` / `SessionSummary` 暴露 `approval_mode` 字段
+
+**sudo -n 保守放行**
+- `sudo -n` / `--non-interactive` 命令豁免 sudo confirm（auto-passthrough），仅当：行内仅一次 sudo、行首命令、紧跟 `-n`、无 shell 复合构造（`;` `&&` `||` `|` `$(` 等）
+- blocklist（rm -rf /、mkfs、dd of=/dev/ 等）和其他 confirm 规则仍独立生效，安全性不降级
+- 防止 policy bypass：`sudo rm /tmp/foo; echo "sudo -n"` 等子串注入正确拦截
+
+**Policy 错误信息改进**
+- `POLICY_NEEDS_CONFIRM` 错误附 3 条可操作建议：用 `sudo -n` / 请求 `termbridge session approve` / 手动执行
+
+**Skill 强化**
+- 新增 `Input Semantics` 小节：区分 shell command input（必加 LF）vs interactive input（不加 LF），附 BAD/GOOD 对比
+- Decision Table 更新 sudo 行为：`sudo -n` auto-passthrough + unrestricted session 选项
+- Anti-Patterns 新增 sudo 反模式示例
+
+### Changed
+
+- `Session` struct 新增 `approval_mode` 字段（`parking_lot::Mutex<ApprovalMode>`，默认 Standard）
+- `PolicyManager` 新增 `authorize_with_approval(action, approval_mode)` 方法（Unrestricted 短路）
+- `check_policy` 改造：仅 `SendInput` 在 Deny/Confirm 时检查 session approval_mode（SFTP 有独立 PathPolicy，不参与短路）
+
 ## [0.2.0] - 2026-08-13
 
 ### Added

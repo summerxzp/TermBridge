@@ -23,6 +23,7 @@ use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
 use super::output::{OutputEngine, ReadOutputParams, ReadOutputResult, DEFAULT_BUFFER_SIZE};
+use super::policy::ApprovalMode;
 use super::provider::{ControlKey, HostName, PtySize, TerminalHandle, TermError};
 use super::timeline::Timeline;
 
@@ -107,6 +108,8 @@ pub struct Session {
     timeline: Timeline,
     /// Session 创建时间（Unix 毫秒，Phase 4-B）。
     created_at: u64,
+    /// 审批模式（ADR-0018）。session-scoped，不持久化。
+    approval_mode: parking_lot::Mutex<ApprovalMode>,
 }
 
 impl Session {
@@ -171,6 +174,7 @@ impl Session {
             last_activity: AtomicU64::new(now_secs()),
             timeline,
             created_at: now_millis(),
+            approval_mode: parking_lot::Mutex::new(ApprovalMode::Standard),
         }
     }
 
@@ -198,6 +202,26 @@ impl Session {
     /// Session 创建时间（Unix 毫秒，Phase 4-B）。
     pub fn created_at(&self) -> u64 {
         self.created_at
+    }
+
+    /// 当前审批模式（ADR-0018）。
+    pub fn approval_mode(&self) -> ApprovalMode {
+        *self.approval_mode.lock()
+    }
+
+    /// 设置审批模式（仅 Control IPC 调用，ADR-0018）。
+    ///
+    /// 注：从已持有的锁内读取旧值（避免再次获取锁导致死锁），ApprovalMode 为 Copy。
+    pub fn set_approval_mode(&self, mode: ApprovalMode) {
+        let mut g = self.approval_mode.lock();
+        let prev = *g;
+        tracing::warn!(
+            session = %self.id,
+            from = %prev.as_str(),
+            to = %mode.as_str(),
+            "approval_mode changed"
+        );
+        *g = mode;
     }
 
     /// 是否空闲超过 `threshold_secs` 秒。供 idleReaper 判定（§7.4 Phase 1）。
@@ -344,6 +368,8 @@ pub struct SessionSummary {
     pub written: u64,
     /// Session 名称（Phase 4-B：client 侧 Session 暂无 name 字段，恒为 None）。
     pub name: Option<String>,
+    /// 审批模式（ADR-0018）。
+    pub approval_mode: ApprovalMode,
 }
 
 impl Session {
@@ -357,6 +383,7 @@ impl Session {
             last_activity: self.last_activity.load(Ordering::Relaxed),
             written: self.output.buffer().written(),
             name: None,
+            approval_mode: self.approval_mode(),
         }
     }
 }

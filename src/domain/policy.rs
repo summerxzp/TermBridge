@@ -18,6 +18,8 @@
 //!   `TermError::PolicyNeedsConfirm`；Phase 6 实现 HITL UI 后真正交互确认）
 //! - `Deny`：拒绝，返回 `TermError::PolicyDenied`
 
+use serde::Serialize;
+
 use crate::domain::provider::TransferDirection;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -105,6 +107,41 @@ impl Decision {
     /// Application 层据此返回对应 TermError。
     pub fn is_blocked_in_phase2(self) -> bool {
         matches!(self, Self::Deny | Self::Confirm)
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// ApprovalMode —— Session 级审批模式（ADR-0018）
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Session 级审批模式（ADR-0018）。
+///
+/// 控制用户对当前 Session 的命令执行授权边界：
+/// - `Standard`：默认，PolicyManager 正常执行 blocklist/confirm 检查
+/// - `Unrestricted`：用户经 Control IPC 明确授权后，跳过 command-level policy
+///   （仅跳过 PolicyManager 的 blocklist+confirm，不绕过 SSH/credential/path safety）
+///
+/// 作用域：session-scoped，不持久化，Session 关闭即重置。
+/// 激活途径：仅通过 Local Control IPC（ADR-0018），Agent 不可自行批准提升。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    Standard,
+    Unrestricted,
+}
+
+impl Default for ApprovalMode {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
+impl ApprovalMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Unrestricted => "unrestricted",
+        }
     }
 }
 

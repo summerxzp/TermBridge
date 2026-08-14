@@ -4,3 +4,4 @@
 //! 未来可扩展 WebSocket / HTTP transport。
 
 pub mod mcp;
+pub mod control;

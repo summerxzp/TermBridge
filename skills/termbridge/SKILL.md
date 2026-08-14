@@ -29,6 +29,36 @@ For an already-running persistent session, skip step 3 and `attach_remote_sessio
 
 > **Scope guidance**: For standard commands (ls, cat, grep, systemctl status), the workflow above is sufficient. For timeout / disconnect / TUI programs / retry scenarios, consult the **7 Rules** and **Decision Table** below.
 
+## Input Semantics
+
+`send_input()` sends **exactly the bytes you provide**. Nothing is added or modified.
+
+### For shell commands: always include terminating LF
+
+```
+# BAD: command stays in input buffer, never submitted
+send_input("ls -la")
+
+# GOOD: LF terminates the command, shell executes it
+send_input("ls -la\n")
+```
+
+### For interactive input: do NOT add LF unless submitting
+
+Interactive prompts (sudo password, `read -p`, vim, REPL, mysql) expect input without automatic LF. Only add `\n` when the user intends to submit the input.
+
+```
+# sudo password prompt: send password + LF to submit
+send_input("my_password\n")
+
+# vim normal mode command: no LF
+send_input(":w")
+```
+
+### Empty output ≠ command not executed
+
+PTY is a stream. `read_output` immediately after `send_input` may return empty because the command is still running. Use the marker pattern (Rule 1) to wait for completion before reading.
+
 ## Tool Reference
 
 | Tool | Purpose |
@@ -161,7 +191,8 @@ Daemon crash = all detached sessions lost (Phase 3 does not recover). Must `open
 | Long-running command (build) | do NOT retry on timeout; `since_cursor` poll |
 | Watch output (tail -f) | `send_input` + `read_output(tail_lines)` periodically; `ctrl_c` to stop |
 | vim / top / htop | no marker; use app exit keys (`:q`, `q`) or `ctrl_c` |
-| sudo requiring password | triggers `POLICY_NEEDS_CONFIRM` — do NOT send password via `send_input` |
+| `sudo -n` (non-interactive) | Auto-passthrough: `sudo -n ls`, `sudo -n du`, `sudo -n stat` etc. execute without confirmation. Must be `sudo -n` at line start, no shell chaining (`;` `&&` `|` etc.) |
+| sudo (interactive, no `-n`) | Triggers `POLICY_NEEDS_CONFIRM`. Do NOT send password via `send_input`. Options: (1) use `sudo -n` if NOPASSWD; (2) ask user to run `termbridge session approve <session_id>` for unrestricted session; (3) execute manually in target terminal |
 | SSH disconnect mid-command | state UNKNOWN → `reconnect_session` + idempotency check |
 | Retry a side-effecting command | reconnect first, idempotency check, retry only if NOT-RUN |
 | Cross-restart resume | `list_remote_sessions` → `attach_remote_session` |
@@ -178,6 +209,7 @@ Daemon crash = all detached sessions lost (Phase 3 does not recover). Must `open
 - **ANSI noise**: PTY output contains control sequences (bracketed paste `\x1b[?2004h/l`, OSC 7 `\x1b]7;...`, color codes, `\x1b[K`). Use `read_output(strip_ansi=true)` for clean text; RingBuffer keeps raw bytes, so cursor stays valid.
 - **Credentials never in MCP params**: `bootstrap_host` accepts only `host`. Passwords are prompted via separate `termbridge-auth-helper` process, never exposed to MCP stdio.
 - **Host policy is user intent (ADR-0017 §2.2)**: `hosts.toml` `auth=password` means password for every connection — it is NOT a gap to "fix". `bootstrap_host` never modifies host policy (returns a `hint` instead), so an `auth=password` host keeps prompting until the user edits hosts.toml. Never bootstrap a password-policy host as a convenience optimization.
+- **Session approval mode (0.2.1+)**: Sessions start in `standard` mode (PolicyManager enforces blocklist + confirm). Users can elevate a session to `unrestricted` via `termbridge session approve <session_id>` (CLI, human-only). In unrestricted mode, **only confirm guardrails are skipped** (sudo, `rm -rf /tmp/x`, etc. execute without confirmation); **hard-deny rules still apply** (`rm -rf /`, `mkfs`, `dd of=/dev/`, etc. are still blocked). This does NOT bypass SSH credentials, path safety, or protocol invariants. Approval is session-scoped — closing the session resets to standard. Agent cannot self-approve; only the human user can via CLI. TermBridge Policy is a secondary guardrail (defense-in-depth), not a primary approval system — command approval is the Coding Agent's responsibility.
 
 ## Anti-Patterns
 
@@ -204,6 +236,16 @@ send_input("echo __TB_DONE__:abc:0\n")  # echo itself contains the marker!
 # BAD: auto-bootstrap on a password-policy host (violates user intent, ADR-0017 §3.3)
 bootstrap_host(host="prod")  # policy says auth=password — user wants password auth;
                              # bootstrap also does NOT change hosts.toml, so the prompt stays
+
+# BAD: sudo without -n (triggers POLICY_NEEDS_CONFIRM, blocks automation)
+send_input("sudo systemctl restart nginx\n")  # blocked!
+
+# GOOD: sudo -n for NOPASSWD hosts (auto-passthrough)
+send_input("sudo -n systemctl restart nginx\n")
+
+# GOOD: if sudo needs password, ask user to approve session first
+# User runs: termbridge session approve <session_id>
+# Then: sudo commands execute without policy confirmation
 ```
 
 ## Quick Reference: Happy Path

@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use crate::domain::policy::{Action, Decision, Policy};
+use crate::domain::policy::{Action, ApprovalMode, Decision, Policy};
 
 // ───────────────────────────────────────────────────────────────────────────
 // blocklist / confirm 正则（进程级编译一次）
@@ -170,6 +170,44 @@ impl DefaultPolicy {
         Self
     }
 
+    /// 保守判断：整行是否为"单个 sudo -n 调用且无 shell 复合构造"（ADR-0018）。
+    ///
+    /// 安全原则：sudo -n 只消除密码交互风险，不降低命令权限/影响。
+    /// 本函数只决定"是否豁免 sudo confirm"，blocklist 和其他 confirm 规则
+    /// （如 rm -rf）仍由 check_line 主流程独立生效。
+    ///
+    /// 放行条件（全部满足）：
+    /// 1. 行内 sudo 仅出现一次
+    /// 2. sudo 是行首命令（允许前导空白）
+    /// 3. sudo 后紧跟 -n 或 --non-interactive
+    /// 4. 行内无 shell 链接/复合构造：; && || | $( ` <( >(
+    fn sudo_non_interactive_passthrough(line: &str) -> bool {
+        let trimmed = line.trim();
+
+        // 条件 4：无 shell 复合构造（先查，快速短路）
+        let chain_markers = [";", "&&", "||", "|", "$(", "`", "<(", ">("];
+        if chain_markers.iter().any(|m| trimmed.contains(m)) {
+            return false;
+        }
+
+        // 条件 1+2+3：token 级检查
+        let mut tokens = trimmed.split_whitespace();
+        // 条件 2：sudo 是行首命令
+        if tokens.next() != Some("sudo") {
+            return false;
+        }
+        // 条件 3：sudo 后紧跟 -n / --non-interactive
+        match tokens.next() {
+            Some(t) if t == "-n" || t == "--non-interactive" => {}
+            _ => return false,
+        }
+        // 条件 1：整行 sudo 仅出现一次
+        if tokens.any(|t| t == "sudo") {
+            return false;
+        }
+        true
+    }
+
     /// 对单行命令文本做 blocklist + confirm 检查。
     ///
     /// 返回：Deny / Confirm / None（未命中任何规则）。
@@ -180,18 +218,26 @@ impl DefaultPolicy {
                 tracing::warn!(
                     rule = %desc,
                     line = %line,
-                    "DefaultPolicy: 命中 blocklist，Deny"
+                    "DefaultPolicy: 命中 blocklist, Deny"
                 );
                 return Some(Decision::Deny);
             }
         }
-        // 2. confirm：任一命中 → Confirm
+        // 2. confirm：逐条检查，sudo 规则在 sudo_non_interactive_passthrough 命中时跳过
         for (desc, re) in confirm_list() {
+            // sudo 智能放行：仅豁免 sudo confirm，不豁免其他 confirm
+            if desc.starts_with("sudo") && Self::sudo_non_interactive_passthrough(line) {
+                tracing::info!(
+                    line = %line,
+                    "DefaultPolicy: sudo -n 非交互, 豁免 sudo confirm"
+                );
+                continue;
+            }
             if re.is_match(line) {
                 tracing::info!(
                     rule = %desc,
                     line = %line,
-                    "DefaultPolicy: 命中 confirm 列表，Confirm"
+                    "DefaultPolicy: 命中 confirm 列表, Confirm"
                 );
                 return Some(Decision::Confirm);
             }
@@ -365,6 +411,33 @@ impl PolicyManager {
             }
         }
         result
+    }
+
+    /// 带 approval_mode 的链式判决（ADR-0018）。
+    ///
+    /// 评估顺序（defense-in-depth 定位）：
+    /// 1. 先跑完整 policy 链 → 若任一返回 `Deny` → 返回 `Deny`
+    ///    （hard safety boundary，unrestricted 也不绕过）
+    /// 2. 若 unrestricted → 返回 `Allow`（跳过 confirm 类 guardrail）
+    /// 3. 若 standard → 返回链式结果（Confirm / Allow）
+    ///
+    /// 即：`unrestricted` 只解除 TermBridge 的 confirm 类 guardrail，
+    /// 不绕过 hard-deny rules / SSH 安全检查 / credential 隔离 / protocol invariants。
+    pub fn authorize_with_approval(&self, action: &Action, approval: ApprovalMode) -> Decision {
+        let decision = self.authorize(action);
+        match decision {
+            // hard deny 永远生效，unrestricted 也不绕过
+            Decision::Deny => Decision::Deny,
+            // unrestricted 跳过 confirm → Allow
+            Decision::Confirm if approval == ApprovalMode::Unrestricted => {
+                tracing::warn!(
+                    "PolicyManager: session approval_mode=Unrestricted, 跳过 confirm guardrail"
+                );
+                Decision::Allow
+            }
+            // standard 或 Allow → 原样返回
+            other => other,
+        }
     }
 }
 
@@ -800,5 +873,128 @@ mod tests {
     fn policy_name_returns_correct_name() {
         let p = DefaultPolicy::new();
         assert_eq!(p.name(), "DefaultPolicy");
+    }
+
+    // ── sudo -n 智能放行测试（ADR-0018） ──────────────────────────────
+
+    #[test]
+    fn sudo_n_passthrough_allows() {
+        let p = DefaultPolicy::new();
+        for cmd in [
+            "sudo -n ls -la /opt/data",
+            "sudo -n true",
+            "sudo -n du -sh /opt/data",
+            "sudo --non-interactive systemctl status foo",
+            "sudo -n stat /opt/data/file",
+        ] {
+            let d = p.authorize(&Action::send_input("s1", cmd));
+            assert_eq!(d, Decision::Allow, "应 Allow: {cmd}");
+        }
+    }
+
+    #[test]
+    fn sudo_n_passthrough_blocked_by_other_confirm() {
+        let p = DefaultPolicy::new();
+        // sudo -n rm -rf 仍因 rm -rf confirm 规则被拦
+        let d = p.authorize(&Action::send_input("s1", "sudo -n rm -rf /tmp/x"));
+        assert_eq!(d, Decision::Confirm);
+        // sudo -n rm -rf / 仍因 blocklist 被拦
+        let d = p.authorize(&Action::send_input("s1", "sudo -n rm -rf /"));
+        assert_eq!(d, Decision::Deny);
+    }
+
+    #[test]
+    fn sudo_n_passthrough_rejects_chain_constructs() {
+        let p = DefaultPolicy::new();
+        // 含 ; 链接 → 不放行
+        let d = p.authorize(&Action::send_input("s1", "sudo rm /tmp/foo; echo \"sudo -n\""));
+        assert_eq!(d, Decision::Confirm, "含 ; 应不豁免");
+        // 含 && 链接
+        let d = p.authorize(&Action::send_input("s1", "sudo -n foo && sudo bar"));
+        assert_eq!(d, Decision::Confirm, "含 && 应不豁免");
+    }
+
+    #[test]
+    fn sudo_n_passthrough_rejects_non_leading_sudo() {
+        let p = DefaultPolicy::new();
+        // sudo 非行首 → 不放行
+        let d = p.authorize(&Action::send_input("s1", "echo \"sudo -n\""));
+        assert_eq!(d, Decision::Confirm, "echo 行含 sudo 应仍 Confirm");
+    }
+
+    #[test]
+    fn sudo_n_passthrough_rejects_without_n() {
+        let p = DefaultPolicy::new();
+        // 无 -n 的 sudo 仍 Confirm
+        for cmd in ["sudo ls", "sudo apt update", "sudo -i", "sudo rm /tmp/foo"] {
+            let d = p.authorize(&Action::send_input("s1", cmd));
+            assert_eq!(d, Decision::Confirm, "应 Confirm: {cmd}");
+        }
+    }
+
+    #[test]
+    fn sudo_n_passthrough_rejects_multiple_sudo() {
+        let p = DefaultPolicy::new();
+        // 行内多个 sudo（即使都有 -n）→ 不放行
+        let d = p.authorize(&Action::send_input("s1", "sudo -n ls sudo -n rm"));
+        assert_eq!(d, Decision::Confirm);
+    }
+
+    // ── PolicyManager approval_mode 短路测试（ADR-0018） ──────────────
+
+    #[test]
+    fn policy_manager_unrestricted_skips_confirm_but_not_blocklist() {
+        let mgr = PolicyManager::with_default();
+        // unrestricted + blocklist (rm -rf /) → Deny（hard deny 不绕过）
+        let d = mgr.authorize_with_approval(
+            &Action::send_input("s1", "rm -rf /"),
+            ApprovalMode::Unrestricted,
+        );
+        assert_eq!(d, Decision::Deny);
+        // unrestricted + blocklist (mkfs) → Deny
+        let d = mgr.authorize_with_approval(
+            &Action::send_input("s1", "mkfs.ext4 /dev/sda1"),
+            ApprovalMode::Unrestricted,
+        );
+        assert_eq!(d, Decision::Deny);
+        // unrestricted + blocklist (sudo rm -rf /) → Deny
+        let d = mgr.authorize_with_approval(
+            &Action::send_input("s1", "sudo rm -rf /"),
+            ApprovalMode::Unrestricted,
+        );
+        assert_eq!(d, Decision::Deny);
+        // unrestricted + confirm (sudo ls) → Allow（跳过 confirm）
+        let d = mgr.authorize_with_approval(
+            &Action::send_input("s1", "sudo ls"),
+            ApprovalMode::Unrestricted,
+        );
+        assert_eq!(d, Decision::Allow);
+        // unrestricted + confirm (rm -rf /tmp/x) → Allow
+        let d = mgr.authorize_with_approval(
+            &Action::send_input("s1", "rm -rf /tmp/x"),
+            ApprovalMode::Unrestricted,
+        );
+        assert_eq!(d, Decision::Allow);
+        // unrestricted + normal → Allow
+        let d = mgr.authorize_with_approval(
+            &Action::send_input("s1", "ls -la"),
+            ApprovalMode::Unrestricted,
+        );
+        assert_eq!(d, Decision::Allow);
+    }
+
+    #[test]
+    fn policy_manager_standard_runs_normal_checks() {
+        let mgr = PolicyManager::with_default();
+        let d = mgr.authorize_with_approval(
+            &Action::send_input("s1", "rm -rf /"),
+            ApprovalMode::Standard,
+        );
+        assert_eq!(d, Decision::Deny);
+        let d = mgr.authorize_with_approval(
+            &Action::send_input("s1", "sudo ls"),
+            ApprovalMode::Standard,
+        );
+        assert_eq!(d, Decision::Confirm);
     }
 }

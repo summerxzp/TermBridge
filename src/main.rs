@@ -63,7 +63,35 @@ async fn main() -> anyhow::Result<()> {
 
     let bootstrap_host = Arc::new(BootstrapHost::new(Arc::clone(&credential_provider)));
 
+    // ADR-0018：clone session_manager 用于 Control IPC（必须在 move 进
+    // TermBridgeServer 之前完成 clone——之后 binding 不可用）
+    let control_handler: Arc<dyn termbridge::transport::control::ControlHandler> =
+        Arc::clone(&session_manager) as Arc<dyn termbridge::transport::control::ControlHandler>;
+
     let server = TermBridgeServer::new(host_manager, session_manager, bootstrap_host);
+
+    // ADR-0018：启动 Local Control IPC（Human Control Plane）
+    // MCP stdio = Agent 数据面；Control IPC = 人类授权/管理面
+    // Agent 不可调用 set_approval_mode，仅 CLI/GUI 通过本地 IPC 操作
+    let _control_server = match termbridge::transport::control::ControlServer::start(control_handler).await {
+        Ok(s) => {
+            let info = s.instance_info();
+            tracing::info!(
+                endpoint = %info.endpoint,
+                transport = %info.transport,
+                "Control IPC: listening (human control plane, ADR-0018)"
+            );
+            Some(s)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Control IPC: failed to start (session approve via CLI unavailable); MCP server continues"
+            );
+            None
+        }
+    };
+
     server.serve_stdio().await?;
 
     tracing::info!("termbridge: server stopped");

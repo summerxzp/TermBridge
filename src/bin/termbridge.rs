@@ -70,6 +70,22 @@ enum Command {
         /// 本地 session ID
         session_id: String,
     },
+    /// 列出运行中的 MCP server instance（ADR-0018）
+    McpList,
+    /// 列出 MCP server 上的 session（ADR-0018）
+    SessionList {
+        /// 可选：指定 MCP instance ID（默认连第一个）
+        #[arg(long)]
+        instance: Option<String>,
+    },
+    /// 批准 session 进入 unrestricted 模式（ADR-0018）
+    SessionApprove {
+        /// session ID
+        session_id: String,
+        /// 可选：指定 MCP instance ID
+        #[arg(long)]
+        instance: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -82,6 +98,11 @@ async fn main() -> Result<()> {
         Command::Sessions { host } => cmd_sessions(&host).await,
         Command::Attach { host, session_id } => cmd_attach(&host, &session_id).await,
         Command::Detach { session_id } => cmd_detach(&session_id),
+        Command::McpList => cmd_mcp_list(),
+        Command::SessionList { instance } => cmd_session_list(instance.as_deref()).await,
+        Command::SessionApprove { session_id, instance } => {
+            cmd_session_approve(&session_id, instance.as_deref()).await
+        }
     }
 }
 
@@ -469,4 +490,194 @@ fn key_code_to_bytes(code: crossterm::event::KeyCode) -> Option<Vec<u8>> {
         KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
         _ => None, // F-keys 等暂不处理
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Control IPC 客户端（ADR-0018）
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 连接到 MCP server 的 Control IPC，发送 HELLO + 请求。
+///
+/// 流程：发现 instance → 连接 endpoint → HELLO token → 发请求 → 读响应
+async fn control_ipc_call(
+    instance_id: Option<&str>,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    // 1. 发现 instance
+    let instances = termbridge::transport::control::InstanceRegistry::list_instances();
+    if instances.is_empty() {
+        anyhow::bail!(
+            "no running TermBridge MCP server found.\n\
+             Start one first (e.g. via your MCP client), then retry."
+        );
+    }
+
+    // 选择 instance：指定 ID（按 endpoint 子串匹配）或取第一个
+    let info = if let Some(id) = instance_id {
+        instances
+            .iter()
+            .find(|i| i.endpoint.contains(id))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "instance '{}' not found among {} running instances",
+                    id,
+                    instances.len()
+                )
+            })?
+    } else {
+        if instances.len() > 1 {
+            eprintln!(
+                "[提示] 发现 {} 个运行中的 MCP server，使用第一个。用 --instance 指定。",
+                instances.len()
+            );
+        }
+        &instances[0]
+    };
+
+    // 2. 连接 endpoint（用 Box<dyn AsyncRead/AsyncWrite> 抽象平台差异）
+    let (reader, mut writer): (
+        Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+    ) = connect_endpoint_split(&info.endpoint).await?;
+
+    // 3. HELLO token 认证
+    let hello = serde_json::json!({"token": &info.token});
+    writer.write_all(format!("{hello}\n").as_bytes()).await?;
+    writer.flush().await?;
+
+    let mut reader = BufReader::new(reader);
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    let hello_resp: serde_json::Value = serde_json::from_str(line.trim())?;
+    if hello_resp.get("ok") != Some(&serde_json::Value::Bool(true)) {
+        anyhow::bail!("HELLO authentication failed: {}", hello_resp);
+    }
+
+    // 4. 发请求
+    line.clear();
+    let req = serde_json::json!({"id": 1, "method": method, "params": params});
+    writer.write_all(format!("{req}\n").as_bytes()).await?;
+    writer.flush().await?;
+    reader.read_line(&mut line).await?;
+    let resp: serde_json::Value = serde_json::from_str(line.trim())?;
+    if resp.get("ok") == Some(&serde_json::Value::Bool(true)) {
+        Ok(resp["result"].clone())
+    } else {
+        let err = &resp["error"];
+        anyhow::bail!(
+            "control IPC error: {} - {}",
+            err["code"].as_str().unwrap_or("?"),
+            err["message"].as_str().unwrap_or("?")
+        )
+    }
+}
+
+/// 连接到 endpoint，返回分离的 reader/writer（平台抽象）。
+///
+/// - Linux/macOS：endpoint 以 `/` 开头时走 Unix socket，否则按 TCP 处理
+/// - Windows：恒走 TCP loopback（endpoint 形如 "tcp://127.0.0.1:<port>"）
+async fn connect_endpoint_split(
+    endpoint: &str,
+) -> Result<(
+    Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+    Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+)> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        if endpoint.starts_with('/') {
+            let stream = tokio::net::UnixStream::connect(endpoint)
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Unix socket {} failed: {}", endpoint, e))?;
+            let (r, w) = tokio::io::split(stream);
+            return Ok((Box::new(r), Box::new(w)));
+        }
+    }
+
+    // TCP loopback
+    let addr = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect to {} failed: {}", endpoint, e))?;
+    let (r, w) = tokio::io::split(stream);
+    Ok((Box::new(r), Box::new(w)))
+}
+
+/// termbridge mcp list —— 列出运行中的 MCP server instance
+fn cmd_mcp_list() -> Result<()> {
+    let instances = termbridge::transport::control::InstanceRegistry::list_instances();
+    if instances.is_empty() {
+        println!("(no running TermBridge MCP server)");
+        println!("hint: start an MCP client (Claude / Codex / OpenCode) to launch termbridge-mcp");
+        return Ok(());
+    }
+    println!(
+        "{:<10} {:<8} {:<15} {:<20}",
+        "INSTANCE", "PID", "TRANSPORT", "ENDPOINT"
+    );
+    println!("{:-<60}", "");
+    for i in &instances {
+        // 从 endpoint 提取末尾段作为 instance 标识（如 mcp-abc123.sock）
+        let id = i
+            .endpoint
+            .rsplit(|c| c == '/' || c == '\\')
+            .next()
+            .unwrap_or(&i.endpoint);
+        let id_short = &id[..id.len().min(8)];
+        println!(
+            "{:<10} {:<8} {:<15} {:<20}",
+            id_short, i.pid, i.transport, i.endpoint
+        );
+    }
+    Ok(())
+}
+
+/// termbridge session list —— 列出 MCP server 上的 session
+async fn cmd_session_list(instance: Option<&str>) -> Result<()> {
+    let result = control_ipc_call(instance, "session.list", serde_json::json!({})).await?;
+    let sessions = result
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("unexpected response: not an array"))?;
+    if sessions.is_empty() {
+        println!("(no sessions)");
+        return Ok(());
+    }
+    println!(
+        "{:<20} {:<20} {:<10} {:<15}",
+        "ID", "HOST", "STATE", "APPROVAL"
+    );
+    println!("{:-<70}", "");
+    for s in sessions {
+        let id = s["id"].as_str().unwrap_or("?");
+        let id_short = &id[..id.len().min(20)];
+        println!(
+            "{:<20} {:<20} {:<10} {:<15}",
+            id_short,
+            s["host"].as_str().unwrap_or("-"),
+            s["state"].as_str().unwrap_or("?"),
+            s["approval_mode"].as_str().unwrap_or("?"),
+        );
+    }
+    Ok(())
+}
+
+/// termbridge session approve <session_id> —— 批准 session 进入 unrestricted 模式
+async fn cmd_session_approve(session_id: &str, instance: Option<&str>) -> Result<()> {
+    let result = control_ipc_call(
+        instance,
+        "session.set_approval_mode",
+        serde_json::json!({"session_id": session_id, "mode": "unrestricted"}),
+    )
+    .await?;
+    println!(
+        "✓ session {} approved: {}",
+        session_id,
+        result["approval_mode"].as_str().unwrap_or("?")
+    );
+    println!("  TermBridge will skip command-level policy (sudo, rm -rf, etc.) for this session.");
+    println!("  This does NOT bypass SSH credentials or remote server permissions.");
+    println!("  Approval resets when the session closes.");
+    Ok(())
 }

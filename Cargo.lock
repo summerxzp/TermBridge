@@ -4799,7 +4799,7 @@ dependencies = [
 
 [[package]]
 name = "termbridge"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4826,7 +4826,7 @@ dependencies = [
 
 [[package]]
 name = "termbridge-agentd"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4847,7 +4847,7 @@ dependencies = [
 
 [[package]]
 name = "termbridge-auth-helper"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "libc",
  "serde",
@@ -4857,7 +4857,7 @@ dependencies = [
 
 [[package]]
 name = "termbridge-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -4874,7 +4874,7 @@ dependencies = [
 
 [[package]]
 name = "termbridge-gui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.23.1",
  "dashmap",

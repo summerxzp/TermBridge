@@ -24,7 +24,7 @@ use crate::domain::credential::{
     CredentialError, CredentialProvider, NoopCredentialProvider, PasswordRequest, Secret,
 };
 use crate::domain::output::{ReadOutputParams, ReadOutputResult};
-use crate::domain::policy::{Action, Decision};
+use crate::domain::policy::{Action, ApprovalMode, Decision};
 use crate::domain::provider::{
     ControlKey, Host, HostName, OpenTerminalRequest, PtySize, TerminalProvider, TermError,
     TransferDirection,
@@ -816,6 +816,19 @@ impl SessionManager {
         self.sessions.iter().map(|r| r.value().summary()).collect()
     }
 
+    /// 设置 session 审批模式（ADR-0018，仅 Control IPC 调用）。
+    ///
+    /// Agent 不可直接调用——通过 Local Control IPC 由用户经 CLI/GUI 操作。
+    pub fn set_approval_mode(
+        &self,
+        session_id: &str,
+        mode: ApprovalMode,
+    ) -> Result<(), TermError> {
+        let session = self.get_session(session_id)?;
+        session.set_approval_mode(mode);
+        Ok(())
+    }
+
     /// 返回 session 的 timeline 事件（最近 limit 条，Phase 4-A）。
     ///
     /// 用于排障和 AI 上下文：结构化展示"发了什么命令→返回什么输出→发了什么控制键"。
@@ -1099,8 +1112,25 @@ impl SessionManager {
     /// - Allow → Ok(())
     /// - Deny → Err(PolicyDenied)
     /// - Confirm → Err(PolicyNeedsConfirm)（Phase 2 MVP 等同 Deny）
+    ///
+    /// ADR-0018：仅 `SendInput` 检查 session approval_mode。
+    /// Unrestricted 跳过 confirm 类 guardrail，但 hard deny（blocklist）永远生效。
+    /// SFTP 操作有独立 PathPolicy 安全层，不参与 approval_mode 短路。
     fn check_policy(&self, action: &Action) -> Result<(), TermError> {
-        let decision = self.policy.authorize(action);
+        // ADR-0018：仅 SendInput 检查 session approval_mode
+        // SFTP 操作有独立 PathPolicy 安全层，不参与 approval_mode 短路
+        let approval = if let Action::SendInput { session_id, .. } = action {
+            self.sessions
+                .get(session_id.as_str())
+                .map(|s| s.approval_mode())
+                .unwrap_or(ApprovalMode::Standard)
+        } else {
+            ApprovalMode::Standard
+        };
+
+        // authorize_with_approval 保证：Deny 永远生效（blocklist），
+        // unrestricted 只跳过 confirm 类 guardrail
+        let decision = self.policy.authorize_with_approval(action, approval);
         match decision {
             Decision::Allow => Ok(()),
             Decision::Deny => Err(TermError::PolicyDenied(policy_reason(action, "blocked"))),
@@ -1206,6 +1236,9 @@ async fn sftp_remove_recursive(
 }
 
 /// 从 Action + 状态描述构造 Policy 拒绝/需确认的原因字符串。
+///
+/// ADR-0018：`needs confirmation` 文案附可操作建议，引导用户走 sudo -n 放行
+/// 或 session approve 授权（而非盲目重试）。
 fn policy_reason(action: &Action, status: &str) -> String {
     match action {
         Action::SendInput { data, .. } => {
@@ -1219,7 +1252,18 @@ fn policy_reason(action: &Action, status: &str) -> String {
             } else {
                 snippet.to_string()
             };
-            format!("command {status}: {snippet}")
+            if status == "needs confirmation" {
+                format!(
+                    "command needs confirmation: {snippet}\n\n\
+                     TermBridge cannot auto-confirm in current mode.\n\
+                     Options:\n\
+                     1. Use `sudo -n` for non-interactive sudo (auto-passthrough)\n\
+                     2. Ask the user to approve unrestricted session via `termbridge session approve <session_id>`\n\
+                     3. Execute the command manually in the target terminal"
+                )
+            } else {
+                format!("command {status}: {snippet}")
+            }
         }
         Action::SftpTransfer { direction, remote, .. } => {
             format!("sftp {} {status}: {remote}", direction.as_str())
@@ -1329,6 +1373,62 @@ fn read_mode_name(params: &ReadOutputParams) -> &'static str {
         "wait_for"
     } else {
         "settle"
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// ControlHandler impl（ADR-0018，Control IPC 业务逻辑）
+// ───────────────────────────────────────────────────────────────────────────
+
+impl crate::transport::control::ControlHandler for SessionManager {
+    fn list_sessions(&self) -> Vec<crate::transport::control::SessionControlInfo> {
+        // 注：trait 与 inherent 方法同名，inherent 优先（trait 未 `use` 进作用域）。
+        // 这里调用 inherent `list_sessions` 返回 Vec<SessionSummary>，再转换。
+        self.list_sessions()
+            .into_iter()
+            .map(|s| crate::transport::control::SessionControlInfo {
+                id: s.id,
+                host: s.host,
+                state: format!("{:?}", s.state).to_lowercase(),
+                approval_mode: s.approval_mode.as_str().to_string(),
+            })
+            .collect()
+    }
+
+    fn get_session(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::transport::control::SessionControlInfo> {
+        self.sessions.get(session_id).map(|r| {
+            let s = r.value();
+            crate::transport::control::SessionControlInfo {
+                id: s.id().to_string(),
+                host: s.host().to_string(),
+                state: format!("{:?}", s.state()).to_lowercase(),
+                approval_mode: s.approval_mode().as_str().to_string(),
+            }
+        })
+    }
+
+    fn set_approval_mode(
+        &self,
+        session_id: &str,
+        mode: &str,
+    ) -> Result<(), crate::transport::control::ControlError> {
+        let approval_mode = match mode {
+            "standard" => ApprovalMode::Standard,
+            "unrestricted" => ApprovalMode::Unrestricted,
+            _ => {
+                return Err(crate::transport::control::ControlError::new(
+                    "INVALID_ARGUMENT",
+                    format!("invalid mode '{}'; expected 'standard' or 'unrestricted'", mode),
+                ));
+            }
+        };
+        self.set_approval_mode(session_id, approval_mode)
+            .map_err(|e| {
+                crate::transport::control::ControlError::new("SESSION_ERROR", e.to_string())
+            })
     }
 }
 
