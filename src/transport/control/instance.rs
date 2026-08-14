@@ -3,7 +3,7 @@
 //! MCP Server 启动时创建 instance 文件，CLI 通过扫描发现运行中的 MCP Server。
 //!
 //! 文件位置：
-//! - Linux/macOS: $XDG_RUNTIME_DIR/termbridge/mcp-<instance>.json
+//! - Linux/macOS: $XDG_RUNTIME_DIR/termbridge/mcp-<instance>.json（未设置时回退系统临时目录）
 //! - Windows: %TEMP%/termbridge/mcp-<instance>.json
 //!
 //! 文件内容：pid / endpoint / token / started_at / protocol_version
@@ -145,24 +145,26 @@ fn generate_instance_id() -> String {
 
 /// Instance discovery 目录。
 fn instance_dir() -> Option<PathBuf> {
-    // Linux/macOS: $XDG_RUNTIME_DIR/termbridge/
-    // Windows: %TEMP%/termbridge/
+    // Linux/macOS: $XDG_RUNTIME_DIR/termbridge/，未设置时回退系统临时目录，
+    // 保证 register 与 list_instances 读写一致（XDG_RUNTIME_DIR 常缺省，如 CI）。
     if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
         std::env::var("XDG_RUNTIME_DIR")
             .ok()
             .map(|d| PathBuf::from(d).join("termbridge"))
+            .or_else(|| Some(std::env::temp_dir().join("termbridge")))
     } else {
         // Windows 及其他：用 TEMP
         std::env::var("TEMP")
             .ok()
             .map(|d| PathBuf::from(d).join("termbridge"))
+            .or_else(|| Some(std::env::temp_dir().join("termbridge")))
     }
 }
 
 /// Instance discovery 文件路径。
 fn instance_file_path(instance_id: &str) -> PathBuf {
     instance_dir()
-        .unwrap_or_else(|| std::env::temp_dir().join("termbridge"))
+        .expect("instance dir always resolvable (temp_dir fallback)")
         .join(format!("mcp-{instance_id}.json"))
 }
 

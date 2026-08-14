@@ -72,6 +72,12 @@ impl ControlServer {
         // 确保旧 socket 文件不存在
         let _ = std::fs::remove_file(&endpoint);
 
+        // 确保父目录存在（bind 不创建父目录；XDG_RUNTIME_DIR 未设置时
+        // 兜底 /tmp 下的 termbridge 目录可能不存在）
+        if let Some(parent) = std::path::Path::new(&endpoint).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
         let listener = UnixListener::bind(&endpoint)?;
 
         // 设置 0600 权限
