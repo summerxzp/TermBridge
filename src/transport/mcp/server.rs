@@ -583,7 +583,7 @@ impl TermBridgeServer {
     }
 
     /// Transfer files via SFTP (Phase 1, upload/download only).
-    #[tool(description = "Transfer files via SFTP. Supports upload (local->remote) and download (remote->local). Path policy enforced: local paths must be under allowedLocalPaths (default cwd); remote paths resolved via realpath to prevent ../ traversal and symlink escape. Download uses atomic write (temp + fsync + rename).")]
+    #[tool(description = "Transfer files via SFTP. Supports upload (local->remote) and download (remote->local). Path policy enforced: local paths must be under allowedLocalPaths (default: cwd + OS temp/termbridge, extendable via TERMBRIDGE_ALLOWED_LOCAL_PATHS); remote paths resolved via realpath to prevent ../ traversal and symlink escape. Download uses atomic write (temp + fsync + rename).")]
     async fn sftp_transfer(
         &self,
         Parameters(params): Parameters<SftpTransferParams>,

@@ -69,7 +69,7 @@ SSH Agent（首选）> IdentityFile > HITL（Phase 6）
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `allowedLocalPaths` | `[cwd]` | 本地可读写的根；upload 源 / download 目标必须在其下 |
+| `allowedLocalPaths` | `[cwd, temp/termbridge]`（`TERMBRIDGE_ALLOWED_LOCAL_PATHS` 可追加；Windows `;` 分隔） | 本地可读写的根；upload 源 / download 目标必须在其下 |
 | `allowedRemotePaths` | `["/"]`（全放行，可收紧为白名单） | 远端可读写的根 |
 
 **防穿越**：
