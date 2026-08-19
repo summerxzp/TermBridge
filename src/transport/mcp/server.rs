@@ -30,7 +30,7 @@ use std::sync::Arc;
 use rmcp::{
     ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
-    model::{CallToolResult, ServerCapabilities, ServerInfo},
+    model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
 };
 use serde::{Deserialize, Serialize};
@@ -899,6 +899,10 @@ impl TermBridgeServer {
 impl ServerHandler for TermBridgeServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "termbridge-mcp",
+                env!("CARGO_PKG_VERSION"),
+            ))
             .with_instructions("TermBridge: Remote terminal bridge for AI agents. Open a session to an SSH host, send commands, read output, send control characters (Ctrl+C etc.), transfer files via SFTP (upload/download), create/list/delete remote directories and files, change permissions (chmod), and close when done.")
     }
 }
