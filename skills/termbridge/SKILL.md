@@ -1,11 +1,16 @@
 ---
 name: "termbridge"
 description: "Operate remote Linux hosts via TermBridge terminal runtime. Invoke when user asks to run commands on, manage, debug, or deploy to a remote SSH host."
+metadata:
+  version: "0.2.1"
+  mcp-server: termbridge
 ---
 
 # TermBridge
 
 TermBridge is a persistent, recoverable terminal runtime for AI agents. It exposes a remote SSH host's shell as a PTY session you can send input to, read output from, and resume after disconnect.
+
+> **Version check**: `metadata.version` in this file is the TermBridge release this SKILL.md was packaged with. The MCP server reports its own version in the `serverInfo.version` field of the initialize handshake. If the two differ (e.g. the user updated termbridge but this skill was not re-synced from the release package), tell the user: "SKILL.md 版本落后，请从 release 包重新复制 SKILL.md 到 agent 的 skill 目录" and do not assume behaviors from newer releases.
 
 Use it when the user wants to operate on a remote Linux host: run commands, debug services, edit files, deploy code, inspect logs.
 

@@ -23,6 +23,17 @@ SKILL.md                  Agent Terminal Protocol operational guide
 resources/agentd/         Remote daemon binary (auto-deployed to target host by
                           bootstrap_host, do not run locally; Linux x86_64 only)
 
+Upgrading
+---------
+
+1. Replace termbridge-mcp, termbridge-auth-helper (and termbridge if present).
+2. IMPORTANT: Overwrite the SKILL.md in your AI Agent's skill directory as well.
+   It is a separate copy outside this folder, e.g.:
+   - Claude Code / OpenCode:  ~/.claude/skills/termbridge/SKILL.md
+   - Trae:                    .trae/skills/termbridge/SKILL.md
+   SKILL.md evolves with each release; agents only read their own copy.
+3. Restart your MCP client. Existing terminal sessions are unaffected.
+
 First Connection
 ----------------
 
