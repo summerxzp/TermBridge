@@ -1,0 +1,26 @@
+{
+  "name": "termbridge-mcp",
+  "version": "0.2.1",
+  "description": "TermBridge 的 npm 安装器壳：npx -y termbridge-mcp 即可自动下载 GitHub Releases 对应平台二进制并启动（含 termbridge CLI 与 termbridge-auth-helper）",
+  "license": "Apache-2.0",
+  "keywords": [
+    "termbridge",
+    "mcp",
+    "ssh",
+    "terminal"
+  ],
+  "bin": {
+    "termbridge": "bin/termbridge.js",
+    "termbridge-mcp": "bin/termbridge-mcp.js",
+    "termbridge-auth-helper": "bin/termbridge-auth-helper.js"
+  },
+  "files": [
+    "bin",
+    "launcher.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {}
+}

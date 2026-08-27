@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **更新检查**（借鉴 chrome-devtools-mcp）：`termbridge-mcp` 与 `termbridge` 启动时检查 GitHub Releases 是否有新版本，有则 stderr 提示下载（仅提示，不自动安装）
   - 本地缓存 `dirs::cache_dir()/termbridge/update-check.json`，24h 内不重复联网检查；网络/解析失败静默，24h 后重试
   - 版本刷新在后台线程异步完成，不阻塞启动；可用 `TERMBRIDGE_NO_UPDATE_CHECK=1` 关闭
+- **npm 安装器壳**（`packaging/npm`，发布为 `termbridge-mcp` npm 包）：`npx -y termbridge-mcp` 即可自动下载 GitHub Releases 对应平台二进制（sha256 校验后缓存于 `~/.cache/termbridge-npm`），获得与 chrome-devtools-mcp 一致的 npx 安装/更新体验
+  - 零运行时依赖（Node 内置模块 + 系统 `tar`）；后台每 24h 检查新版本自动缓存，下次启动生效
+  - 网络受限环境可用 `TERMBRIDGE_NPM_MIRROR` 指向镜像源
 
 ## [0.2.1] - 2026-08-14
 

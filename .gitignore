@@ -30,6 +30,9 @@ gui/dist/
 gui/src-tauri/target/
 gui/src-tauri/gen/
 
+# npm 安装器壳依赖
+packaging/npm/node_modules/
+
 # Internal development docs (phase reports, plans, etc.)
 docs/internal/
 
