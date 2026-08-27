@@ -29,6 +29,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("termbridge: Phase 3-A starting (persistent provider enabled)");
 
+    // 启动时检查是否有新版本（借鉴 chrome-devtools-mcp：本地缓存 + 24h 限频 +
+    // 后台刷新，仅提示不自动安装；TERMBRIDGE_NO_UPDATE_CHECK=1 可关闭）
+    termbridge::infrastructure::update_check::check_for_updates();
+
     // 组装依赖链：PersistentProvider（内化 SshProvider，persistent=false 委托 SSH 直连，
     // persistent=true 走远端 daemon 路径 ADR-0004）→ SessionManager, HostManager → Server
     let provider = Arc::new(PersistentProvider::default())

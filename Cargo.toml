@@ -82,5 +82,8 @@ zeroize = { version = "1", features = ["alloc"] }
 dirs = "6"
 toml = "0.8"
 
+# 更新检查（借鉴 chrome-devtools-mcp）：轻量 HTTP 客户端查询 GitHub Releases 最新版
+ureq = "2"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

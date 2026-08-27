@@ -90,6 +90,10 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 启动时检查是否有新版本（与 termbridge-mcp 一致：本地缓存 + 24h 限频 +
+    // 后台刷新，仅提示不自动安装；TERMBRIDGE_NO_UPDATE_CHECK=1 可关闭）
+    termbridge::infrastructure::update_check::check_for_updates();
+
     let cli = Cli::parse();
     match cli.command {
         Command::Hosts => cmd_hosts(),

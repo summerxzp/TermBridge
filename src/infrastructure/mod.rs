@@ -10,3 +10,4 @@ pub mod redact;
 pub mod sftp;
 pub mod ssh;
 pub mod sshconfig;
+pub mod update_check;
