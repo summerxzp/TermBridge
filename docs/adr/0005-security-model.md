@@ -14,7 +14,7 @@ Phase 0-C vertical slice 为快速跑通行为契约，留了三笔安全欠账�
 2. **无日志脱敏**——`tracing` 直写 stderr，PTY output / 错误信息中可能含凭证、Authorization header、PEM 私钥块。
 3. **单一 IdentityFile**——`authenticate_with_key` 只读 `host.identity_file`，无 ssh-agent 路径，无 IdentityFile 时直接报错（"ssh-agent auth not implemented in Phase 0-C"）。
 
-**参考前车之鉴**：classfang `ssh-mcp-server` 把密码作为 `mcp.json` 的 args 字段传递，导致凭据出现在 MCP server 进程的命令行参数中，任何能列进程列表（`ps` / task manager）的本机用户即可读出。TermBridge 必须从设计上杜绝此路径。
+**设计约束**：在把密码写进 MCP 配置参数（`mcp.json` args）的方案中，凭据会出现在 MCP server 进程的命令行参数里，任何能列进程列表（`ps` / task manager）的本机用户即可读出。TermBridge 从设计上杜绝此路径。
 
 PLAN §5.5 / §9 已定下 Phase 1 安全 baseline：known_hosts 校验、SSH Agent / IdentityFile 认证、log redaction 三类正则、凭据不进 MCP 配置 args、SFTP 路径策略 + 下载原子写。本 ADR 锁定具体实现策略。
 
@@ -33,7 +33,7 @@ SSH Agent（首选）> IdentityFile > HITL（Phase 6）
 | 密码 / passphrase | **不**做 | — | Phase 6 走 HITL UI，secret 直接写 PTY，不经 LLM context |
 | MCP 配置 args | **禁** | — | `mcp.json` 只放 `command` / `args`（如 `["termbridge"]`），不放任何凭据字段 |
 
-**与 classfang 的关键差异**：TermBridge 的 MCP 配置永不包含 `password` / `privateKey` / `passphrase` 字段。即使本机被列进程，也读不到凭据。
+**关键差异**：TermBridge 的 MCP 配置永不包含 `password` / `privateKey` / `passphrase` 字段；密码/口令只经独立 helper 进程 IPC（ADR-0009）传入，永不进入 MCP schema / args / 日志。即使本机被列进程，也读不到凭据。
 
 ### 2. known_hosts 校验
 
@@ -70,15 +70,22 @@ SSH Agent（首选）> IdentityFile > HITL（Phase 6）
 | 配置 | 默认 | 说明 |
 |---|---|---|
 | `allowedLocalPaths` | `[cwd, temp/termbridge]`（`TERMBRIDGE_ALLOWED_LOCAL_PATHS` 可追加；Windows `;` 分隔） | 本地可读写的根；upload 源 / download 目标必须在其下 |
-| `allowedRemotePaths` | `["/"]`（全放行，可收紧为白名单） | 远端可读写的根 |
+| `allowedRemotePaths`（全局） | `TERMBRIDGE_ALLOWED_REMOTE_PATHS`（默认 `["/"]`，不缩小 SSH 账号已具备的权限） | 远端可读写的"范围"；安全底线由下方**操作分级 guardrail** 承担 |
+| `hosts.toml allowed_remote_paths`（per-host） | 省略 → 继承全局默认 | 每台主机声明"可触及范围"（用户意图），条目可含 `~` |
 
-**防穿越**：
+**远端访问 = 范围(scope) + 操作(operation) 分离**（`PathPolicy::check_remote_access(path, op, host_roots, sftp)`）：
 
-- 本地路径：`canonicalize()` 后检查 `starts_with(allowed)`。
-- 远端路径：调 SFTP `realpath` 解析后检查 `starts_with(allowed)`；拒绝含 `..` 的输入、拒绝 symlink 逃逸（`realpath` 已解析）、拒绝 null 字节。
-- 不满足 → `LOCAL_PATH_NOT_ALLOWED` / `REMOTE_PATH_NOT_ALLOWED`（`retriable=false`）。
+1. 拒绝含 null 字节的路径。
+2. `~` / `~/...` 按远端 home（SFTP `realpath("~")`，通道级缓存）展开。
+3. 远端 `realpath` 规范化，防 `..` 与 symlink 逃逸（`Create` 目标不存在时校验父目录）。
+4. Effective scope：per-host（hosts.toml）优先，否则全局；前缀匹配（`is_under_remote`，`/home/u` 不会误匹配 `/home/ux`）。
+5. **操作分级（`RemoteOperation`：Read / Write / Create / Delete / Chmod）**——不整目录封死：
+   - `~/.ssh/authorized_keys`：写/建/删/改权限 → **硬拒**（认证控制面文件，公钥部署唯一通道是 `bootstrap_host`）
+   - `/proc`、`/sys`：写/建/删 → **硬拒**（内核接口）；读不受限
+   - 系统目录（如 `/etc`、`/opt`、`/srv`）的正常读/写**允许**（运维场景：改 nginx.conf、部署应用等），`sftp_remove` 递归删除系统级根目录仍按既有规则拦截
+   - 不满足 → `LOCAL_PATH_NOT_ALLOWED` / `REMOTE_PATH_NOT_ALLOWED`（`retriable=false`）。
 
-未配置 `allowedRemotePaths` 白名单时启动期 `tracing::warn!` 提醒。
+未配置远端白名单时启动期 `tracing::warn!` 提醒（默认不缩小 SSH 权限，提示可用 `TERMBRIDGE_ALLOWED_REMOTE_PATHS` / hosts.toml 收紧）。
 
 ### 5. 下载原子写
 

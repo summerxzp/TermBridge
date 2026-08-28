@@ -56,6 +56,8 @@ pub struct RemoteEntry {
 /// 不缓存 SFTP session（Phase 1 不做 channel 池，避免复用复杂度）。
 pub struct SftpProvider {
     sftp: SftpSession,
+    /// 按通道缓存的远端 home（`realpath("~")`，供路径策略 `~` 展开）。
+    home: tokio::sync::OnceCell<Option<String>>,
 }
 
 impl SftpProvider {
@@ -82,7 +84,10 @@ impl SftpProvider {
             .map_err(|e| TermError::SftpError(format!("SftpSession::new: {e}")))?;
 
         tracing::info!("sftp channel opened");
-        Ok(Self { sftp })
+        Ok(Self {
+            sftp,
+            home: tokio::sync::OnceCell::new(),
+        })
     }
 
     /// 上传本地文件到远端（覆盖写）。
@@ -554,6 +559,22 @@ impl SftpCanonicalize for SftpProvider {
             .canonicalize(path)
             .await
             .map_err(|e| map_sftp_error(e, &format!("sftp canonicalize '{path}'")))
+    }
+
+    /// 远端 home：复用当前通道 `realpath("~")`，结果按通道缓存。
+    ///
+    /// OpenSSH sftp-server 支持 `~` 展开；解析失败（非 OpenSSH / chroot 等）
+    /// 返回 None，路径策略会拒绝含 `~` 的请求并提示用绝对路径。
+    async fn home(&self) -> Option<String> {
+        self.home
+            .get_or_init(|| async {
+                self.sftp.canonicalize("~").await.ok().and_then(|h| {
+                    let h = h.trim_end_matches('/').to_string();
+                    if h.is_empty() { None } else { Some(h) }
+                })
+            })
+            .await
+            .clone()
     }
 }
 

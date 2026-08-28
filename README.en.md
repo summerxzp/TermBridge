@@ -127,6 +127,9 @@ All subsequent `open_session` calls use SSH key authentication.
 
 TermBridge exposes 20 tools to MCP clients, categorized by function:
 
+> `get_info` (serverInfo metadata returned by the MCP `initialize` handshake) is not a
+> `tools/list` tool and is not counted.
+
 ### Host Management
 
 | Tool | Description |
@@ -365,7 +368,7 @@ termbridge policy prod         # show a single host's effective values + edit hi
 | **SSH Authentication** | Prefer SSH Agent / IdentityFile, password only for one-time bootstrap (ADR-0009) |
 | **Password Isolation** | Password via independent helper process IPC, never enters MCP arguments / LLM context |
 | **Log Redaction** | tracing logs auto-redact password / token / key and other sensitive fields (ADR-0005 §3) |
-| **SFTP Path Policy** | Local path allowlist `[cwd, $TEMP/termbridge]` + env var `TERMBRIDGE_ALLOWED_LOCAL_PATHS` to append; remote path realpath resolution prevents `../` traversal (ADR-0005 §4) |
+| **SFTP Path Policy** | Local path allowlist `[cwd, $TEMP/termbridge]` + env var `TERMBRIDGE_ALLOWED_LOCAL_PATHS` to append; remote scope: per-host `hosts.toml allowed_remote_paths` (supports `~`) first, else `TERMBRIDGE_ALLOWED_REMOTE_PATHS`, else no restriction beyond the SSH account's own permissions; remote realpath resolution prevents `../` traversal + operation-guardrailed: SFTP write/create/delete/chmod of `~/.ssh/authorized_keys` and `/proc` `/sys` is hard-denied (authorized_keys goes through `bootstrap_host` only) (ADR-0005 §4) |
 | **Download Atomic Write** | Temp file + fsync + rename, avoids half-written files being misread |
 
 ## Consumers

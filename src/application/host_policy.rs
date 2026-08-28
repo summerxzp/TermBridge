@@ -100,6 +100,7 @@ impl std::fmt::Display for SessionMode {
 /// [hosts.prod]
 /// auth = "key"
 /// session = "standard"
+/// allowed_remote_paths = ["/srv/app", "/var/log/myapp"]
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostPolicy {
@@ -107,6 +108,11 @@ pub struct HostPolicy {
     pub auth: Option<AuthMode>,
     /// session 持久化偏好。省略 → system default (Standard)。
     pub session: Option<SessionMode>,
+    /// 该主机允许的远端 SFTP 路径（ADR-0005 §4 操作级策略之上，按主机声明
+    /// "可触及范围"；用户意图，机器声明）。省略 → 用全局默认
+    /// （`TERMBRIDGE_ALLOWED_REMOTE_PATHS`，未设则不限制）。条目可含 `~`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_remote_paths: Option<Vec<String>>,
 }
 
 /// 整个 hosts.toml 配置文件。
@@ -251,6 +257,17 @@ impl HostPolicyResolver {
     /// 用于 GUI / CLI 展示当前配置。host 未配置时返回 None。
     pub fn get_host_policy(&self, host_alias: &str) -> Option<&HostPolicy> {
         self.config.hosts.get(host_alias)
+    }
+
+    /// 主机级远端路径声明（ADR-0005 §4）：`hosts.toml [hosts.<别名>].allowed_remote_paths`。
+    ///
+    /// 未配置 → None（此时 SFTP 路径检查回退全局默认：
+    /// `TERMBRIDGE_ALLOWED_REMOTE_PATHS` / `["/"]`）。
+    pub fn allowed_remote_paths_for(&self, host_alias: &str) -> Option<Vec<String>> {
+        self.config
+            .hosts
+            .get(host_alias)
+            .and_then(|p| p.allowed_remote_paths.clone())
     }
 
     /// 列出所有已配置的 host 别名。
@@ -433,6 +450,7 @@ mod tests {
             HostPolicy {
                 auth: Some(AuthMode::Key),
                 session: Some(SessionMode::Persistent),
+                ..Default::default()
             },
         );
         let resolver = HostPolicyResolver::with_config(config);
@@ -450,6 +468,7 @@ mod tests {
             HostPolicy {
                 auth: Some(AuthMode::Key),
                 session: Some(SessionMode::Persistent),
+                ..Default::default()
             },
         );
         let resolver = HostPolicyResolver::with_config(config);
@@ -472,6 +491,7 @@ mod tests {
             HostPolicy {
                 auth: Some(AuthMode::Key),
                 session: Some(SessionMode::Persistent),
+                ..Default::default()
             },
         );
         let resolver = HostPolicyResolver::with_config(config);
@@ -483,6 +503,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_allowed_remote_paths_per_host() {
+        // hosts.toml：per-host 远端路径声明（ADR-0005 §4）
+        let config: HostPolicyConfig = toml::from_str(
+            r#"
+            [hosts.prod]
+            auth = "key"
+            allowed_remote_paths = ["/srv/app", "~/logs"]
+            "#,
+        )
+        .unwrap();
+        let resolver = HostPolicyResolver::with_config(config);
+
+        assert_eq!(
+            resolver.allowed_remote_paths_for("prod"),
+            Some(vec!["/srv/app".to_string(), "~/logs".to_string()])
+        );
+        // 未声明的主机 → None（回退全局默认）
+        assert!(resolver.allowed_remote_paths_for("other").is_none());
+    }
+
+    #[test]
     fn resolve_explicit_session_only_auth_falls_back_to_host_policy() {
         let mut config = HostPolicyConfig::default();
         config.hosts.insert(
@@ -490,6 +531,7 @@ mod tests {
             HostPolicy {
                 auth: Some(AuthMode::Key),
                 session: Some(SessionMode::Persistent),
+                ..Default::default()
             },
         );
         let resolver = HostPolicyResolver::with_config(config);
@@ -508,6 +550,7 @@ mod tests {
             HostPolicy {
                 auth: Some(AuthMode::Key),
                 session: None, // 省略 → system default
+                ..Default::default()
             },
         );
         let resolver = HostPolicyResolver::with_config(config);
@@ -525,6 +568,7 @@ mod tests {
             HostPolicy {
                 auth: Some(AuthMode::Key),
                 session: Some(SessionMode::Persistent),
+                ..Default::default()
             },
         );
         let resolver = HostPolicyResolver::with_config(config);
@@ -546,6 +590,7 @@ mod tests {
             HostPolicy {
                 auth: Some(AuthMode::Key),
                 session: Some(SessionMode::Persistent),
+                ..Default::default()
             },
         );
         let resolver = HostPolicyResolver::with_config(config);
@@ -731,6 +776,7 @@ auth = "password"
             HostPolicy {
                 auth: Some(AuthMode::Key),
                 session: Some(SessionMode::Standard),
+                ..Default::default()
             },
         );
         let resolver = HostPolicyResolver::with_config(config);

@@ -426,6 +426,14 @@ impl TransferDirection {
 pub trait SftpCanonicalize: Send + Sync {
     /// 解析远端路径为绝对路径（等价 SFTP `realpath`）。
     async fn canonicalize(&self, path: &str) -> Result<String, TermError>;
+
+    /// 远端登录用户 home 目录（供路径策略 `~` / `~/...` 展开）。
+    ///
+    /// 默认 None：无法解析 → 任何含 `~` 的路径都会被拒绝（提示改用绝对路径）。
+    /// `SftpProvider` 按通道缓存 `realpath("~")` 的结果。
+    async fn home(&self) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(test)]

@@ -36,7 +36,7 @@ use crate::infrastructure::persistent::{PersistentProvider, PersistentTerminalHa
 use crate::infrastructure::ssh::SshTerminalHandle;
 use crate::infrastructure::sshconfig;
 use crate::application::host_policy::{AuthMode, HostPolicyResolver, SessionMode};
-use crate::application::path_policy::PathPolicy;
+use crate::application::path_policy::{PathPolicy, RemoteOperation};
 use crate::application::policy::PolicyManager;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -515,6 +515,13 @@ impl SessionManager {
         session.close().await
     }
 
+    /// 解析 session 所属 host 的 hosts.toml 远端路径声明（ADR-0005 §4）；
+    /// 未配置 → None（回退全局默认：`TERMBRIDGE_ALLOWED_REMOTE_PATHS` / `["/"]`）。
+    fn remote_roots_for(&self, session_id: &str) -> Option<Vec<String>> {
+        let host = self.get_session(session_id).ok()?.host().to_string();
+        self.host_policy.allowed_remote_paths_for(&host)
+    }
+
     /// SFTP 文件传输（Phase 1，§7.4 / ADR-0005 §4 / §5）。
     ///
     /// 流程：
@@ -563,10 +570,16 @@ impl SessionManager {
         // 2. 开 SFTP channel（复用 SSH session，新 channel 独立于 PTY）
         let sftp = ssh_handle.open_sftp_provider().await?;
 
-        // 3. 路径策略检查
-        //    check_remote 需要调远端 realpath，传 &sftp（实现 SftpCanonicalize）
+        // 3. 路径策略检查（操作分级：上传=Create / 下载=Read；hosts.toml 主机级 scope）
         self.path_policy.check_local(local.as_path())?;
-        self.path_policy.check_remote(&remote, &sftp).await?;
+        let roots = self.remote_roots_for(session_id);
+        let op = match direction {
+            TransferDirection::Upload => RemoteOperation::Create,
+            TransferDirection::Download => RemoteOperation::Read,
+        };
+        self.path_policy
+            .check_remote_access(&remote, op, roots.as_deref(), &sftp)
+            .await?;
 
         // 4. 执行传输
         let result = match direction {
@@ -602,9 +615,12 @@ impl SessionManager {
             "sftp_mkdir: starting"
         );
 
-        // 路径策略校验：mkdir 目标可能不存在，用 allow_new 变体
+        // 路径策略校验：mkdir 目标可能不存在，用 Create 语义（realpath 失败则查父目录）
         let result = async {
-            self.path_policy.check_remote_allow_new(&remote, &sftp).await?;
+            let roots = self.remote_roots_for(session_id);
+            self.path_policy
+                .check_remote_access(&remote, RemoteOperation::Create, roots.as_deref(), &sftp)
+                .await?;
             sftp.mkdir(&remote, mode).await
         }
         .await;
@@ -629,7 +645,10 @@ impl SessionManager {
         );
 
         let result = async {
-            self.path_policy.check_remote(&remote, &sftp).await?;
+            let roots = self.remote_roots_for(session_id);
+            self.path_policy
+                .check_remote_access(&remote, RemoteOperation::Read, roots.as_deref(), &sftp)
+                .await?;
             sftp.list_dir(&remote).await
         }
         .await;
@@ -666,7 +685,10 @@ impl SessionManager {
         );
 
         let result = async {
-            self.path_policy.check_remote(&remote, &sftp).await?;
+            let roots = self.remote_roots_for(session_id);
+            self.path_policy
+                .check_remote_access(&remote, RemoteOperation::Delete, roots.as_deref(), &sftp)
+                .await?;
             if recursive {
                 sftp_remove_recursive(&sftp, &remote, 0).await
             } else {
@@ -705,7 +727,10 @@ impl SessionManager {
         );
 
         let result = async {
-            self.path_policy.check_remote(&remote, &sftp).await?;
+            let roots = self.remote_roots_for(session_id);
+            self.path_policy
+                .check_remote_access(&remote, RemoteOperation::Chmod, roots.as_deref(), &sftp)
+                .await?;
             sftp.chmod(&remote, mode).await
         }
         .await;
@@ -744,16 +769,29 @@ impl SessionManager {
         );
 
         let result = async {
+            let roots = self.remote_roots_for(session_id);
             match direction {
                 TransferDirection::Upload => {
                     self.path_policy.check_local(local_path.as_path())?;
                     self.path_policy
-                        .check_remote_allow_new(&remote_path, &sftp)
+                        .check_remote_access(
+                            &remote_path,
+                            RemoteOperation::Create,
+                            roots.as_deref(),
+                            &sftp,
+                        )
                         .await?;
                     sftp.upload_dir(local_path.as_path(), &remote_path).await
                 }
                 TransferDirection::Download => {
-                    self.path_policy.check_remote(&remote_path, &sftp).await?;
+                    self.path_policy
+                        .check_remote_access(
+                            &remote_path,
+                            RemoteOperation::Read,
+                            roots.as_deref(),
+                            &sftp,
+                        )
+                        .await?;
                     self.path_policy.check_local(local_path.as_path())?;
                     sftp.download_dir(&remote_path, local_path.as_path()).await
                 }
@@ -1515,6 +1553,7 @@ mod tests {
             HostPolicy {
                 auth: None,
                 session: Some(SessionMode::Persistent),
+                ..Default::default()
             },
         );
         SessionManager::with_host_policy(
@@ -1625,6 +1664,7 @@ mod tests {
             HostPolicy {
                 auth: None,
                 session: Some(SessionMode::Standard),
+                ..Default::default()
             },
         );
         let mgr2 = SessionManager::with_host_policy(
@@ -1665,6 +1705,7 @@ mod tests {
             HostPolicy {
                 auth: Some(AuthMode::Password),
                 session: None,
+                ..Default::default()
             },
         );
         let mgr = SessionManager::with_host_policy(

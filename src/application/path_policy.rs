@@ -3,18 +3,58 @@
 //! 拒绝策略：
 //! - 本地路径：`canonicalize()` 后检查是否在 `allowed_local_paths` 之下，防 `../` 穿越。
 //! - 远端路径：调远端 SFTP `realpath`（通过 `SftpCanonicalize` trait）解析后检查
-//!   是否在 `allowed_remote_paths` 之下，防 `../` 与 symlink 逃逸。
+//!   是否在允许根之下，防 `../` 与 symlink 逃逸。
 //! - null 字节（`\0`）一律拒绝（防止 null 字节注入绕过路径检查）。
 //!
+//! 远端访问模型（按操作分级 + 硬安全规则，scope 与操作分离）：
+//!   `check_remote_access(path, op, host_roots, sftp)` 流水线：
+//!   1. null 字节拒绝
+//!   2. `~` / `~/...` 按远端 home（`sftp.home()`，通道级缓存）展开
+//!   3. 远端 realpath 规范化
+//!   4. Effective scope：`host_roots`（hosts.toml per-host）优先，否则全局
+//!      （`TERMBRIDGE_ALLOWED_REMOTE_PATHS` 环境变量 → 默认 `["/"]`）前缀匹配
+//!   5. Hard safety（无条件、无论 scope 多宽松）：`~/.ssh/authorized_keys` 与
+//!      `/proc` `/sys` 的写/建/删 → 硬拒（authorized_keys 只能走 bootstrap_host）
+//!
 //! 默认：
-//! - `allowed_local_paths` = `[cwd]`（启动时确定）
-//! - `allowed_remote_paths` = `["/"]`（全放行，启动期 WARN 提醒用户收紧）
+//! - `allowed_local_paths` = `[cwd, temp/termbridge]`（+ `TERMBRIDGE_ALLOWED_LOCAL_PATHS`）
+//! - `allowed_remote_paths` = `TERMBRIDGE_ALLOWED_REMOTE_PATHS`（默认 `["/"]`，不缩小
+//!   SSH 账号已具备的权限；用户/运维可经 env 或 hosts.toml 按主机收紧，安全底线由
+//!   操作分级 guardrail 承担）
 //!
 //! 错误码（§6.1）：`LOCAL_PATH_NOT_ALLOWED` / `REMOTE_PATH_NOT_ALLOWED`（retriable=false）。
 
 use std::path::{Path, PathBuf};
 
 use crate::domain::provider::{SftpCanonicalize, TermError};
+
+/// 远端 SFTP 操作类型。路径策略按操作分级：同一路径读与写/删除风险不同，
+/// 硬安全规则只拦截"高风险操作"而非整条路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteOperation {
+    /// 读文件 / 列目录
+    Read,
+    /// 写已有文件（覆盖）
+    Write,
+    /// 创建新文件 / 新目录
+    Create,
+    /// 删除文件 / 目录
+    Delete,
+    /// 修改权限（chmod）
+    Chmod,
+}
+
+impl RemoteOperation {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RemoteOperation::Read => "read",
+            RemoteOperation::Write => "write",
+            RemoteOperation::Create => "create",
+            RemoteOperation::Delete => "delete",
+            RemoteOperation::Chmod => "chmod",
+        }
+    }
+}
 
 /// SFTP 路径策略。
 ///
@@ -24,7 +64,9 @@ pub struct PathPolicy {
     /// 默认 `[std::env::current_dir()]`。
     allowed_local_paths: Vec<PathBuf>,
     /// 允许读写的远端根路径列表（绝对路径，前缀匹配）。
-    /// 默认 `["/"]`（全放行；启动期 WARN 提醒收紧）。
+    /// 默认 `TERMBRIDGE_ALLOWED_REMOTE_PATHS`（未设则 `["/"]`，不缩小 SSH 账号权限；
+    /// 安全由操作分级 guardrail + 硬安全规则承担）。条目可含 `~`。
+    /// 主机级覆盖见 hosts.toml。
     allowed_remote_paths: Vec<String>,
 }
 
@@ -96,11 +138,34 @@ impl PathPolicy {
             ?allowed_local,
             "PathPolicy: allowed_local_paths = cwd + temp/termbridge + TERMBRIDGE_ALLOWED_LOCAL_PATHS"
         );
-        tracing::warn!(
-            ?cwd,
-            "PathPolicy: allowed_remote_paths 默认 [\"/\"]（全放行），建议收紧"
-        );
-        Self::new(allowed_local, vec!["/".to_string()])
+
+        // 远端全局默认：TERMBRIDGE_ALLOWED_REMOTE_PATHS（与本地对称，分隔符同规则；
+        // 条目可含 `~`，按远端 home 展开）。未配置 → ["/"]（不缩小 SSH 账号已具备的
+        // 权限；安全底线由操作分级 guardrail 承担）。主机级覆盖见 hosts.toml。
+        let allowed_remote = match std::env::var("TERMBRIDGE_ALLOWED_REMOTE_PATHS") {
+            Ok(v) if !v.trim().is_empty() => {
+                let sep = if cfg!(windows) { ';' } else { ':' };
+                let roots: Vec<String> = v
+                    .split(sep)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                tracing::info!(
+                    ?roots,
+                    "PathPolicy: allowed_remote_paths 来自 TERMBRIDGE_ALLOWED_REMOTE_PATHS"
+                );
+                roots
+            }
+            _ => {
+                tracing::warn!(
+                    "PathPolicy: allowed_remote_paths 默认 [\"/\"]（不缩小 SSH 账号权限；\
+                     异常位置写操作由操作级 guardrail 拦截）；可用 TERMBRIDGE_ALLOWED_REMOTE_PATHS 或 hosts.toml 收紧"
+                );
+                vec!["/".to_string()]
+            }
+        };
+
+        Self::new(allowed_local, allowed_remote)
     }
 
     // ── 本地路径检查 ──────────────────────────────────────────────
@@ -154,17 +219,22 @@ impl PathPolicy {
 
     // ── 远端路径检查 ──────────────────────────────────────────────
 
-    /// 检查远端路径是否允许读写。
+    /// 按操作检查远端路径访问（核心入口，scope 与操作分离）。
     ///
-    /// 规则：
+    /// 流水线：
     /// 1. 拒绝含 null 字节的路径。
-    /// 2. 通过 `SftpCanonicalize::canonicalize` 调远端 `realpath`，解析 `..` 与 symlink。
-    /// 3. 检查规范化后的路径是否在 `allowed_remote_paths` 任一根下。
-    ///
-    /// `sftp` 参数：实现 `SftpCanonicalize` 的引用（`&SftpProvider` 或 `&dyn SftpCanonicalize`）。
-    pub async fn check_remote(
+    /// 2. `~` / `~/...` 按远端 home（`sftp.home()`）展开（路径或允许根含 `~` 时）。
+    /// 3. 远端 `realpath` 规范化（防 `..` / symlink 逃逸）；`Create` 目标不存在时
+    ///    校验其父目录（需已存在且被允许）。
+    /// 4. Effective scope：`host_roots`（hosts.toml per-host，有则优先）或全局
+    ///    （`TERMBRIDGE_ALLOWED_REMOTE_PATHS` / 默认 `["/"]`），前缀匹配。
+    /// 5. Hard safety（无条件）：`~/.ssh/authorized_keys` 与 `/proc` `/sys` 的
+    ///    写/建/删 → 硬拒（authorized_keys 只能经 `bootstrap_host` 部署）。
+    pub async fn check_remote_access(
         &self,
         path: &str,
+        op: RemoteOperation,
+        host_roots: Option<&[String]>,
         sftp: &dyn SftpCanonicalize,
     ) -> Result<(), TermError> {
         // 1. 拒绝 null 字节
@@ -174,66 +244,105 @@ impl PathPolicy {
             )));
         }
 
-        // 2. 调远端 realpath 解析（防 .. / symlink 逃逸）
-        let canonical = sftp.canonicalize(path).await?;
-
-        // 3. 检查规范化路径是否在任一 allowed 根下
-        self.check_remote_canonical(&canonical, path)
-    }
-
-    /// 已规范化远端路径的前缀检查（提取为独立方法便于测试）。
-    fn check_remote_canonical(&self, canonical: &str, original: &str) -> Result<(), TermError> {
-        for allowed in &self.allowed_remote_paths {
-            if is_under_remote(canonical, allowed) {
-                return Ok(());
+        // 2. `~` 展开（按需调 home，避免无 `~` 时多一次远端往返）
+        let needs_home = path.contains('~')
+            || host_roots.is_some_and(|r| r.iter().any(|root| root.contains('~')))
+            || self.allowed_remote_paths.iter().any(|root| root.contains('~'));
+        let home = if needs_home {
+            match sftp.home().await {
+                Some(h) => Some(h),
+                None => {
+                    return Err(TermError::RemotePathNotAllowed(format!(
+                        "remote path '{path}' 使用 '~'，但无法解析远端 home（非 OpenSSH / \
+                         chroot 等）；请改用绝对路径"
+                    )));
+                }
             }
-        }
-        Err(TermError::RemotePathNotAllowed(format!(
-            "remote path '{original}' resolves to '{canonical}', not under allowed roots {:?}",
-            self.allowed_remote_paths
-        )))
-    }
+        } else {
+            None
+        };
+        let expanded = expand_tilde(path, home.as_deref());
 
-    /// 检查远端路径是否允许创建新目录/文件（Phase 2，mkdir 等用）。
-    ///
-    /// 与 `check_remote` 的区别：目标路径可能尚不存在（mkdir 的目标），
-    /// 因此先尝试 realpath；若返回 `SftpNoSuchFile`（路径不存在），则校验其
-    /// **父目录**是否在允许的根下（父目录必须存在且被允许）。
-    ///
-    /// - realpath 成功 → 目标已存在，用 check_remote_canonical 检查
-    /// - realpath 返回 SftpNoSuchFile → 目标不存在（预期），校验父目录
-    /// - realpath 返回其他错误 → 传播（权限不足 / 连接问题等）
-    /// - 父目录为 None（目标是根）→ 拒绝（不允许在根下直接创建）
-    pub async fn check_remote_allow_new(
-        &self,
-        path: &str,
-        sftp: &dyn SftpCanonicalize,
-    ) -> Result<(), TermError> {
-        // 1. 拒绝 null 字节
-        if path.as_bytes().contains(&0u8) {
-            return Err(TermError::RemotePathNotAllowed(format!(
-                "path contains null byte: {path}"
-            )));
-        }
-
-        // 2. 尝试 realpath
-        match sftp.canonicalize(path).await {
-            Ok(canonical) => {
-                // 目标已存在 → 检查是否在允许根下
-                self.check_remote_canonical(&canonical, path)
-            }
-            Err(TermError::SftpNoSuchFile(_)) => {
-                // 目标不存在（预期 for mkdir）→ 校验父目录
-                let parent = parent_remote_path(path).ok_or_else(|| {
+        // 3. realpath 规范化（Create：目标不存在 → 校验父目录）
+        let canonical = match sftp.canonicalize(&expanded).await {
+            Ok(c) => c,
+            Err(TermError::SftpNoSuchFile(_)) if op == RemoteOperation::Create => {
+                let parent = parent_remote_path(&expanded).ok_or_else(|| {
                     TermError::RemotePathNotAllowed(format!(
                         "cannot create: '{path}' has no parent directory"
                     ))
                 })?;
                 let parent_canonical = sftp.canonicalize(&parent).await?;
-                self.check_remote_canonical(&parent_canonical, path)
+                return self.check_scope_and_safety(
+                    &parent_canonical,
+                    path,
+                    op,
+                    host_roots,
+                    home.as_deref(),
+                );
             }
-            Err(e) => Err(e),
+            Err(e) => return Err(e),
+        };
+
+        // 4 + 5. scope 检查 + 硬安全规则
+        self.check_scope_and_safety(&canonical, path, op, host_roots, home.as_deref())
+    }
+
+    /// scope（允许根前缀匹配）→ hard safety（无条件拒绝）两段判定。
+    fn check_scope_and_safety(
+        &self,
+        canonical: &str,
+        original: &str,
+        op: RemoteOperation,
+        host_roots: Option<&[String]>,
+        home: Option<&str>,
+    ) -> Result<(), TermError> {
+        // 4. Effective scope：per-host（hosts.toml）优先，否则全局；含 `~` 的根展开
+        let effective: Vec<String> = match host_roots {
+            Some(roots) if !roots.is_empty() => roots.iter().map(|r| expand_tilde(r, home)).collect(),
+            _ => self
+                .allowed_remote_paths
+                .iter()
+                .map(|r| expand_tilde(r, home))
+                .collect(),
+        };
+        let in_scope = effective
+            .iter()
+            .any(|root| is_under_remote(canonical, root));
+        if !in_scope {
+            return Err(TermError::RemotePathNotAllowed(format!(
+                "remote path '{original}' resolves to '{canonical}', not under allowed roots {:?} \
+                 （可在 hosts.toml 或 TERMBRIDGE_ALLOWED_REMOTE_PATHS 中声明）",
+                effective
+            )));
         }
+
+        // 5. Hard safety（无条件，先拒后允）
+        if let Some(reason) = hard_safety_deny(canonical, op) {
+            return Err(TermError::RemotePathNotAllowed(format!(
+                "{reason}（path: '{original}' → '{canonical}', op: {}）",
+                op.as_str()
+            )));
+        }
+        Ok(())
+    }
+
+    /// 兼容入口：读操作 + 全局 scope（既有测试 / 只读场景）。
+    pub async fn check_remote(
+        &self,
+        path: &str,
+        sftp: &dyn SftpCanonicalize,
+    ) -> Result<(), TermError> {
+        self.check_remote_access(path, RemoteOperation::Read, None, sftp).await
+    }
+
+    /// 兼容入口：创建操作 + 全局 scope（mkdir / 上传目标可能不存在）。
+    pub async fn check_remote_allow_new(
+        &self,
+        path: &str,
+        sftp: &dyn SftpCanonicalize,
+    ) -> Result<(), TermError> {
+        self.check_remote_access(path, RemoteOperation::Create, None, sftp).await
     }
 
     /// 已规范化本地路径的前缀检查（提取为独立方法便于测试）。
@@ -297,6 +406,60 @@ fn is_under_remote(canonical: &str, root: &str) -> bool {
         format!("{root}/")
     };
     canonical.starts_with(&prefix)
+}
+
+/// 展开远端路径中的 `~` / `~/...`（POSIX 语义）。
+///
+/// 仅在 home 可解析且 `~` 位于开头时展开；其余情况原样返回（交给远端 realpath）。
+/// `home` 为 None（不可解析）→ 原样返回，由调用方保证此前已报错。
+fn expand_tilde(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home else {
+        return path.to_string();
+    };
+    if path == "~" {
+        home.to_string()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        if rest.is_empty() {
+            home.to_string()
+        } else {
+            format!("{home}/{rest}")
+        }
+    } else {
+        path.to_string()
+    }
+}
+
+/// 无条件硬安全规则（先于 allowlist 生效，任意命中即拒）。
+///
+/// 只拦"高风险操作"（写/建/删/改权限），读不受限：
+/// - `~/.ssh/authorized_keys`：认证控制面文件，公钥部署唯一受控通道是
+///   `bootstrap_host`（SFTP 写会改变 SSH 登录权限，与受控流程冲突）
+/// - `/proc` / `/sys`：内核接口，禁止写 / 建 / 删
+fn hard_safety_deny(canonical: &str, op: RemoteOperation) -> Option<String> {
+    use RemoteOperation::{Chmod, Create, Delete, Read, Write};
+    match op {
+        Read => None,
+        Write | Create | Delete | Chmod => {
+            // 1. authorized_keys（end-suffix 匹配：无论 home 是否能解析都覆盖）
+            if canonical.ends_with("/.ssh/authorized_keys") {
+                return Some(
+                    "~/.ssh/authorized_keys 是认证控制面文件，SFTP 写/删被禁止（公钥部署只能走 bootstrap_host）".to_string(),
+                );
+            }
+            // 2. /proc /sys 内核接口读写
+            if canonical == "/proc"
+                || canonical.starts_with("/proc/")
+                || canonical == "/sys"
+                || canonical.starts_with("/sys/")
+            {
+                return Some(format!(
+                    "/proc 与 /sys 为内核接口，禁止 {} 操作",
+                    op.as_str()
+                ));
+            }
+            None
+        }
+    }
 }
 
 /// 取远端 POSIX 路径的父目录（Phase 2，check_remote_allow_new 用）。
@@ -720,5 +883,152 @@ mod tests {
         let p = policy(vec![], vec!["/".into()]);
         let err = p.check_remote_allow_new("/home/user\0/etc", &sftp).await.unwrap_err();
         assert_eq!(err.code(), "REMOTE_PATH_NOT_ALLOWED");
+    }
+
+    // ── 操作分级 + 硬安全规则 + 主机级 scope + `~` 展开 ────────────
+
+    /// 带 home 的假 SFTP（用于 `~` 展开相关测试）。
+    struct FakeSftpHome {
+        mapping: std::sync::Mutex<std::collections::HashMap<String, String>>,
+        home: Option<String>,
+    }
+
+    #[async_trait]
+    impl SftpCanonicalize for FakeSftpHome {
+        async fn canonicalize(&self, path: &str) -> Result<String, TermError> {
+            self.mapping
+                .lock()
+                .unwrap()
+                .get(path)
+                .cloned()
+                .ok_or_else(|| TermError::SftpNoSuchFile(format!("not found: {path}")))
+        }
+        async fn home(&self) -> Option<String> {
+            self.home.clone()
+        }
+    }
+
+    fn fake_home(mapping: Vec<(&str, &str)>, home: Option<&str>) -> FakeSftpHome {
+        FakeSftpHome {
+            mapping: Mutex::new(mapping.into_iter().map(|(a, b)| (a.into(), b.into())).collect()),
+            home: home.map(|s| s.to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn authorized_keys_write_denied_but_read_allowed() {
+        // default scope "/"（不缩小 SSH 权限），但 authorized_keys 写必须硬拒
+        let sftp = fake_home(
+            vec![("/home/u/.ssh/authorized_keys", "/home/u/.ssh/authorized_keys")],
+            Some("/home/u"),
+        );
+        let p = policy(vec![], vec!["/".into()]);
+        assert!(p
+            .check_remote_access(
+                "/home/u/.ssh/authorized_keys",
+                RemoteOperation::Write,
+                None,
+                &sftp,
+            )
+            .await
+            .is_err());
+        assert!(p
+            .check_remote_access(
+                "/home/u/.ssh/authorized_keys",
+                RemoteOperation::Chmod,
+                None,
+                &sftp,
+            )
+            .await
+            .is_err());
+        // 读不受限（运维排查公钥状态是合法需求）
+        assert!(p
+            .check_remote_access(
+                "/home/u/.ssh/authorized_keys",
+                RemoteOperation::Read,
+                None,
+                &sftp,
+            )
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn proc_sys_mutation_denied_but_read_allowed() {
+        let sftp = fake_home([("/proc/self/environ", "/proc/self/environ")].into(), None);
+        let p = policy(vec![], vec!["/".into()]);
+        for op in [
+            RemoteOperation::Write,
+            RemoteOperation::Create,
+            RemoteOperation::Delete,
+        ] {
+            assert!(
+                p.check_remote_access("/proc/self/environ", op, None, &sftp).await.is_err(),
+                "{op:?} 应被硬拒"
+            );
+        }
+        assert!(p
+            .check_remote_access("/proc/self/environ", RemoteOperation::Read, None, &sftp)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn tilde_expands_via_remote_home() {
+        // allowed 根为 "~"，路径 "~/log/app.log" 展开为 "/home/u/log/app.log"
+        // （fake 的 mapping 只接受展开后的路径，展开成功即证明逻辑正确）
+        let sftp = fake_home(
+            vec![("/home/u/log/app.log", "/home/u/log/app.log")],
+            Some("/home/u"),
+        );
+        let p = policy(vec![], vec!["~".into()]);
+        assert!(p
+            .check_remote_access("~/log/app.log", RemoteOperation::Read, None, &sftp)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn tilde_unresolvable_home_rejects_with_absolute_hint() {
+        // home 解析不到（非 OpenSSH / chroot）：含 `~` 请求报错并提示绝对路径
+        let sftp = fake_home(vec![], None);
+        let p = policy(vec![], vec!["~".into()]);
+        let err = p
+            .check_remote_access("~/x", RemoteOperation::Read, None, &sftp)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "REMOTE_PATH_NOT_ALLOWED");
+    }
+
+    #[tokio::test]
+    async fn host_roots_override_global_scope() {
+        // hosts.toml per-host scope 优先于全局
+        let sftp = fake_home(
+            vec![
+                ("/home/u/x".into(), "/home/u/x".into()),
+                ("/opt/app/y".into(), "/opt/app/y".into()),
+            ],
+            Some("/home/u"),
+        );
+        let p = policy(vec![], vec!["/home/u".into()]); // 全局：home
+        let host_roots = vec!["/opt/app".to_string()];
+        assert!(p
+            .check_remote_access("/home/u/x", RemoteOperation::Read, Some(&host_roots), &sftp)
+            .await
+            .is_err(), "per-host scope 应覆盖全局");
+        assert!(p
+            .check_remote_access("/opt/app/y", RemoteOperation::Read, Some(&host_roots), &sftp)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn empty_host_roots_falls_back_to_global() {
+        let sftp = fake_home(vec![("/home/u/x", "/home/u/x")], Some("/home/u"));
+        let p = policy(vec![], vec!["/home/u".into()]);
+        assert!(p
+            .check_remote_access("/home/u/x", RemoteOperation::Read, Some(&[]), &sftp)
+            .await
+            .is_ok(), "空 host scope 应回退全局");
     }
 }

@@ -66,9 +66,12 @@ use crate::infrastructure::sshconfig;
 // keepalive 配置常量（§7.4 Phase 1）
 // ───────────────────────────────────────────────────────────────────────────
 
-/// keepalive 间隔（秒）。借鉴 classfang 默认值（PLAN §7.4）。
+/// keepalive 间隔（秒）。利用 SSH 标准 keepalive 机制（等价 OpenSSH 客户端
+/// `ServerAliveInterval`）；间隔取 10s：开销可忽略（每 10s 一个几十字节报文），
+/// 且远低于常见 NAT/防火墙空闲超时（30s 起），保障 Agent 长闲置会话不被剪断。
 pub const KEEPALIVE_INTERVAL_SECS: u64 = 10;
-/// 连续无响应上限。达到后断开 session，PTY read task 检测到 EOF → Session::Lost。
+/// 连续无响应上限（等价 OpenSSH `ClientAliveCountMax` 默认 3）。达到后断开
+/// session，PTY read task 检测到 EOF → Session::Lost。
 pub const KEEPALIVE_MAX_MISSES: u32 = 3;
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1280,7 +1283,9 @@ impl Drop for SshTerminalHandle {
 /// - 连续 `KEEPALIVE_MAX_MISSES` 次 miss → take session 并 disconnect，
 ///   PTY read task 随后检测到 EOF → Session 置 Lost
 ///
-/// 借鉴 classfang 默认值（10s 间隔 + 3 次上限）解决半开 socket / NAT 超时问题。
+/// SSH 标准 keepalive 机制（等价 OpenSSH `ServerAliveInterval`）：10s 间隔 + 3 次
+/// 上限解决半开 socket / NAT 超时问题；10s 开销可忽略且远低于常见 NAT 空闲超时，
+/// 连续 3 次 miss 才断开，短暂丢包不会误杀。
 async fn keepalive_loop(session: Arc<tokio::sync::Mutex<Option<Handle<SshClientHandler>>>>) {
     let mut misses: u32 = 0;
     loop {
@@ -1577,7 +1582,7 @@ mod tests {
 
     #[test]
     fn keepalive_constants_have_expected_values() {
-        // §7.4 Phase 1：10s 间隔 + 3 次上限（借鉴 classfang 默认值）
+        // §7.4 Phase 1：10s 间隔 + 3 次上限（SSH 标准 keepalive 机制）
         assert_eq!(KEEPALIVE_INTERVAL_SECS, 10, "keepalive 间隔应为 10 秒");
         assert_eq!(KEEPALIVE_MAX_MISSES, 3, "keepalive 最大 miss 次数应为 3");
     }

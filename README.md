@@ -127,6 +127,9 @@ Agent: 我需要连接 my-server，请先 bootstrap。
 
 TermBridge 向 MCP 客户端暴露 20 个工具，按功能分类：
 
+> `get_info`（MCP `initialize` 握手返回的 serverInfo 元数据）不是 `tools/list` 中的工具，
+> 不计数在内。
+
 ### Host 管理
 
 | 工具 | 说明 |
@@ -365,7 +368,7 @@ termbridge policy prod         # 查看单 host 有效值 + 修改提示
 | **SSH 认证** | 优先 SSH Agent / IdentityFile，密码仅 bootstrap 一次性使用（ADR-0009） |
 | **密码隔离** | 密码经独立 helper process IPC，不进 MCP arguments / LLM context |
 | **日志脱敏** | tracing 日志自动 redact 密码 / token / key 等敏感字段（ADR-0005 §3） |
-| **SFTP 路径策略** | 本地路径白名单 `[cwd, $TEMP/termbridge]` + 环境变量 `TERMBRIDGE_ALLOWED_LOCAL_PATHS` 追加；远端路径 realpath 解析防 `../` 越界（ADR-0005 §4） |
+| **SFTP 路径策略** | 本地路径白名单 `[cwd, $TEMP/termbridge]` + 环境变量 `TERMBRIDGE_ALLOWED_LOCAL_PATHS` 追加；远端 scope：per-host `hosts.toml allowed_remote_paths`（支持 `~`）优先，否则 `TERMBRIDGE_ALLOWED_REMOTE_PATHS`，否则不缩小 SSH 账号权限；远端 realpath 解析防 `../` 越界 + 操作分级 guardrail（`~/.ssh/authorized_keys` 与 `/proc`/`/sys` 写/建/删硬拒，authorized_keys 只能走 `bootstrap_host`）（ADR-0005 §4） |
 | **下载原子写** | 临时文件 + fsync + rename，避免半写文件被误读 |
 
 ## 消费者
