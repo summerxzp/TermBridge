@@ -108,9 +108,10 @@ jobs:
           # 嵌入 agentd（Linux 远端 runtime 组件，由 bootstrap_host 自动部署）
           New-Item -ItemType Directory -Path "$dir/resources/agentd/linux-x86_64" -Force | Out-Null
           Copy-Item "agentd-artifact/termbridge-agentd" "$dir/resources/agentd/linux-x86_64/"
+          # 扁平归档：Windows zip 与 Unix tar 层级一致，解压即得全部文件
           Compress-Archive -Path "$dir/*" -DestinationPath "$dir.zip"
           $hash = (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $dir.zip" | Out-File -Encoding ascii "$dir.zip.sha256"
+          "$hash  $dir.zip" | Out-File "$dir.zip.sha256"
 
       - name: Stage artifacts (Unix)
         if: runner.os != 'Windows'
@@ -128,7 +129,8 @@ jobs:
           # 嵌入 agentd（Linux 远端 runtime 组件，由 bootstrap_host 自动部署）
           mkdir -p "$dir/resources/agentd/linux-x86_64"
           cp "agentd-artifact/termbridge-agentd" "$dir/resources/agentd/linux-x86_64/"
-          tar czf "$dir.tar.gz" "$dir"
+          # 扁平归档（-C "$dir" .）：与 Windows zip 解压层级一致，解压即得全部文件
+          tar czf "$dir.tar.gz" -C "$dir" .
           shasum -a 256 "$dir.tar.gz" > "$dir.tar.gz.sha256"
 
       - uses: actions/upload-artifact@v5
@@ -157,3 +159,84 @@ jobs:
         with:
           files: release-files/*
           generate_release_notes: true
+
+  # npm 平台包（长期主渠道，参考 packaging/npm-platform/）：
+  # - 从同一 staging 生成 3 个平台包（@termbridge/<os>-<arch>，完整 release 目录）
+  #   与薄主包 termbridge-mcp，版本取 tag（与 Cargo 一致）
+  # - 默认只生成 + npm pack 校验；配置 NPM_TOKEN secret 后才真正 publish
+  npm-packages:
+    name: npm platform packages (publish needs NPM_TOKEN)
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ !cancelled() }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+
+      - name: Stage platform dirs from release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          # tag 与 Cargo.toml 版本一致（release.yml 由 v* tag 触发）
+          VERSION="${GITHUB_REF_NAME#v}"
+          # win32-x64  linux-x64  darwin-arm64 → asset 名
+          declare -A ASSETS=( [win32-x64]=windows-x86_64 [linux-x64]=linux-x86_64 [darwin-arm64]=macos-arm64 )
+          mkdir -p staging
+          for key in win32-x64 linux-x64 darwin-arm64; do
+            d="staging/$key"
+            mkdir -p "$d"
+            archive=$(find artifacts -type f \( -name "termbridge-${ASSETS[$key]}.zip" -o -name "termbridge-${ASSETS[$key]}.tar.gz" \) | head -1)
+            [ -n "$archive" ] || { echo "missing asset for $key"; exit 1; }
+            case "$archive" in
+              *.zip)    unzip -q "$archive" -d "$d" ;;
+              *.tar.gz) tar xzf "$archive" -C "$d" ;;
+            esac
+            # 兼容旧版「带顶层目录」归档：把二进制挪到 staging 根
+            if ! ls "$d"/termbridge* >/dev/null 2>&1; then
+              sub=$(find "$d" -mindepth 1 -maxdepth 1 -type d | head -1)
+              [ -n "$sub" ] && { mv "$sub"/* "$d"/ 2>/dev/null || true; }
+            fi
+          done
+
+      - name: Generate platform packages + sync main package version
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          node packaging/npm-platform/scripts/build-platform-packages.mjs \
+            --version "$VERSION" \
+            --os-arch win32-x64  --staging staging/win32-x64 \
+            --os-arch linux-x64  --staging staging/linux-x64 \
+            --os-arch darwin-arm64 --staging staging/darwin-arm64
+
+      - name: Pack validation (always)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for p in packaging/npm-platform/generated/@termbridge/win32-x64 \
+                   packaging/npm-platform/generated/@termbridge/linux-x64 \
+                   packaging/npm-platform/generated/@termbridge/darwin-arm64; do
+            ( cd "$p" && npm pack --dry-run )
+          done
+          ( cd packaging/npm-platform && npm pack --dry-run )
+
+      - name: Publish to npm (only when NPM_TOKEN is configured)
+        if: ${{ secrets.NPM_TOKEN != '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for p in packaging/npm-platform/generated/@termbridge/win32-x64 \
+                   packaging/npm-platform/generated/@termbridge/linux-x64 \
+                   packaging/npm-platform/generated/@termbridge/darwin-arm64; do
+            npm publish "$p" --access public
+          done
+          ( cd packaging/npm-platform && npm publish )

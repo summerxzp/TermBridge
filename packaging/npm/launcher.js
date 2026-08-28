@@ -1,12 +1,12 @@
 'use strict';
-// TermBridge npm 安装器壳（借鉴 chrome-devtools-mcp 的 npx 分发模式）：
-//   1. 启动 → 有本地缓存则立即转发执行（不联网，启动快）
-//   2. 后台异步检查 GitHub 最新 release（24h 限频），发现新版则下载到缓存，下次启动生效
-//   3. 首次运行（无缓存）→ 阻塞下载对应平台最新二进制，校验 sha256 后解压启动
-// 失败静默：任何下载/网络异常不影响已缓存版本的使用，下次运行重试。
-//
-// 与 Rust 侧 update_check 的分工：本壳负责"拿到并更新二进制"；二进制内部的
-// update_check 负责"提示用户手动下载时用的包装版"（npx 场景下二进制更新由本壳完成）。
+// TermBridge 过渡期 npm 壳（长期方向见 packaging/npm-platform/ 平台包方案）：
+//   1. npm 包版本 = GitHub Release 版本（v<PKG_VERSION>，严格绑定）——
+//      `npx termbridge-mcp@0.2.1` 就精确下载并运行 v0.2.1，符合 npm 锁语义
+//   2. 首次运行：下载对应平台资产 → sha256 校验 → 解压缓存 → 启动完整目录中的
+//      二进制（trio 同目录、agentd 相对路径均保持 release 原布局）
+//   3. 后续运行：缓存命中即启动，零联网；无后台自动升级（版本由 npm 决定）
+//   4. 网络受限：TERMBRIDGE_NPM_MIRROR 覆盖下载源
+// 失败静默：下载/网络异常不阻塞，给出明确错误；不破坏已缓存版本。
 
 const fs = require('fs');
 const os = require('os');
@@ -15,20 +15,20 @@ const https = require('https');
 const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 
+// npm 包版本与 GitHub Release tag 严格一致（v<PKG_VERSION>）
+const PKG_VERSION = require('./package.json').version;
 const REPO = 'summerxzp/TermBridge';
-const API_LATEST = `https://api.github.com/repos/${REPO}/releases/latest`;
-const CACHE_ROOT = path.join(os.homedir(), '.cache', 'termbridge-npm');
-const STATE_FILE = path.join(CACHE_ROOT, 'state.json');
+const CACHE_ROOT = path.join(os.homedir(), '.cache', 'termbridge-npm'); // <CACHE_ROOT>/<version>/
 const LOCK_DIR = path.join(CACHE_ROOT, '.lock');
-const THROTTLE_MS = 24 * 60 * 60 * 1000; // 24h，与 Rust 侧 update_check 一致
 const MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024; // 防呆上限（正常包远小于此）
 const UA = 'termbridge-npm-launcher';
 
-// GitHub 直连不稳定时的镜像兜底（仅覆盖下载与 /releases/latest 解析）
+// GitHub 直连不稳定时的下载源兜底（仅资产下载）
 const MIRROR = (process.env.TERMBRIDGE_NPM_MIRROR || '').trim().replace(/\/+$/, '');
 const WEB_BASE = MIRROR || 'https://github.com';
 
-// 发布矩阵与 release.yml 保持一致：windows .zip，其他 .tar.gz
+// 发布矩阵与 release.yml 一致。Unix 归档 0.2.x 曾带顶层目录（assetBase/），
+// 新版本已改扁平；wrapper 在启动时对两种布局都做探测（findBinary）。
 const PLATFORMS = {
   'win32-x64': {
     asset: 'termbridge-windows-x86_64.zip',
@@ -66,6 +66,7 @@ const PLATFORMS = {
 async function main(name) {
   try {
     const bin = await ensureBinary(name);
+    // 不设置 cwd：继承调用方工作目录，避免改变 path_policy 的本地路径语义
     const r = spawnSync(bin, process.argv.slice(2), { stdio: 'inherit' });
     if (r.error) throw r.error;
     process.exitCode = r.status ?? 1;
@@ -75,7 +76,7 @@ async function main(name) {
   }
 }
 
-/** 解析本机对应平台的二进制路径（快速路径不联网，首次运行会阻塞下载） */
+/** 解析本机平台二进制路径（缓存命中零联网；首次运行阻塞下载 v<PKG_VERSION>） */
 async function ensureBinary(name) {
   const platform = PLATFORMS[`${process.platform}-${process.arch}`];
   if (!platform) {
@@ -86,110 +87,43 @@ async function ensureBinary(name) {
   const rel = platform.bins[name];
   if (!rel) throw new Error(`未知二进制：${name}`);
 
-  const state = readState();
-  // 快速路径：已有可用缓存 → 立即启动，后台异步刷新
-  if (state && state.version) {
-    const bin = path.join(CACHE_ROOT, state.version, rel);
-    if (fs.existsSync(bin)) {
-      maybeBackgroundRefresh(state, platform); // fire-and-forget
-      return bin;
-    }
-  }
+  const installDir = path.join(CACHE_ROOT, PKG_VERSION);
+  const cached = findBinary(installDir, rel);
+  if (cached) return cached; // 快速路径：已缓存（含已下载的完整版本目录）
 
-  // 首次运行（无缓存）：阻塞下载最新 release
-  console.error('TermBridge：首次运行，正在下载最新版二进制（完成后缓存于本地）…');
-  const latest = await fetchLatestVersion();
-  await downloadAndExtract(latest, platform);
-  writeState({ version: latest, checkedAt: Date.now() });
-  return path.join(CACHE_ROOT, latest, rel);
-}
-
-/** 后台检查新版本（24h 限频）：先占位刷新 checkedAt，下载新包写回缓存供下次启动 */
-function maybeBackgroundRefresh(state, platform) {
-  if (Date.now() - state.checkedAt < THROTTLE_MS) return;
-  if (!writeState({ version: state.version, checkedAt: Date.now() })) return; // 占位限频
-  setTimeout(async () => {
-    try {
-      const latest = await fetchLatestVersion();
-      if (!latest || latest === state.version) return;
-      await downloadAndExtract(latest, platform);
-      writeState({ version: latest, checkedAt: Date.now() });
-      console.error(`TermBridge 已自动缓存新版 v${latest}（下次启动生效）`);
-    } catch {
-      // 失败静默，checkedAt 已占位 → 24h 后重试
-    }
-  }, 0);
-}
-
-// ───────────────────────────────────────────────────────────────────────
-// GitHub / 缓存 / 下载
-// ───────────────────────────────────────────────────────────────────────
-
-function readState() {
-  try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-function writeState(state) {
-  try {
-    fs.mkdirSync(CACHE_ROOT, { recursive: true });
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state));
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** 解析最新版本号：优先 GitHub API（免认证），失败/被限频则退化为
- *  `GET /releases/latest` 的 302 Location（免 API 配额，GitHub 网页重定向，
- *  镜像场景也走这条路）。返回去掉前导 v 的版本号 */
-async function fetchLatestVersion() {
-  if (!MIRROR) {
-    try {
-      const res = await httpsGet(API_LATEST, 1024 * 1024, {
-        timeoutMs: 15_000,
-        deadlineMs: 20_000,
-      });
-      const tag = JSON.parse(res.body.toString('utf8')).tag_name;
-      if (typeof tag === 'string' && tag) return tag.replace(/^v/, '');
-    } catch {
-      // 静默降级到重定向法
-    }
-  }
-  const res = await httpsGet(
-    `${WEB_BASE}/${REPO}/releases/latest`,
-    4096,
-    { timeoutMs: 15_000, deadlineMs: 20_000, followRedirect: false },
+  console.error(
+    `TermBridge：首次运行，正在下载 v${PKG_VERSION} 二进制（完成后缓存于本地）…`,
   );
-  const loc = res.headers.location || res.body.toString('utf8');
-  const m = String(loc).match(/\/tag\/([^\/?#]+)/);
-  if (!m) throw new Error('无法解析最新版本号');
-  return m[1].replace(/^v/, '');
+  await downloadAndExtract(PKG_VERSION, platform);
+  const bin = findBinary(installDir, rel);
+  if (!bin) throw new Error(`解压完成但找不到 ${rel}（归档布局异常）`);
+  return bin;
 }
 
-/** 下载 release 资产 → sha256 校验 → 解压到缓存目录（跨进程互斥，避免并发下载） */
+// ───────────────────────────────────────────────────────────────────────
+// 下载 / 校验 / 解压
+// ───────────────────────────────────────────────────────────────────────
+
+/** 下载 release 资产 → sha256 校验 → 解压（跨进程互斥） */
 async function downloadAndExtract(version, platform) {
   return withLock(async () => {
-    const destDir = path.join(CACHE_ROOT, version);
-    const probe = path.join(destDir, platform.bins.termbridge);
-    if (fs.existsSync(probe)) return destDir; // 已就绪
+    const installDir = path.join(CACHE_ROOT, version);
+    if (findBinary(installDir, platform.bins.termbridge)) return; // 已就绪
 
     const base = `${WEB_BASE}/${REPO}/releases/download/v${version}/${platform.asset}`;
-    console.error(`  - 下载 ${platform.asset} …`);
     const dl = await httpsGet(base, MAX_DOWNLOAD_BYTES, {
       timeoutMs: 60_000,
       deadlineMs: 300_000, // 5 分钟硬截止，网络半断时干净失败（不挂起）
+    }).catch((e) => {
+      throw new Error(`下载 ${platform.asset} 失败（${e.message}）。` +
+        `确认 v${version} 已在 GitHub Releases 发布；或设置 TERMBRIDGE_NPM_MIRROR 指定镜像源`);
     });
     const buf = dl.body;
 
-    const expected = (await httpsGet(`${base}.sha256`, 4096, {
-      timeoutMs: 15_000,
-      deadlineMs: 20_000,
-    }))
-      .body.toString('utf8')
+    const expected = (
+      await httpsGet(`${base}.sha256`, 4096, { timeoutMs: 15_000, deadlineMs: 20_000 })
+    ).body
+      .toString('utf8')
       .trim()
       .split(/\s+/)[0]
       .toLowerCase();
@@ -199,22 +133,44 @@ async function downloadAndExtract(version, platform) {
     }
 
     const tmp = path.join(CACHE_ROOT, `.tmp-${version}`);
-    fs.mkdirSync(destDir, { recursive: true }); // 系统 tar 的 -C 要求目标目录已存在
+    fs.mkdirSync(installDir, { recursive: true }); // 系统 tar 的 -C 要求目标目录已存在
     fs.writeFileSync(tmp, buf);
     try {
-      extractArchive(tmp, destDir, platform.kind);
+      extractArchive(tmp, installDir, platform.kind);
     } finally {
       fs.rmSync(tmp, { force: true });
     }
 
-    // 校验解压产物 + POSIX 可执行位
+    // 校验关键产物存在（根目录或带顶层目录的旧归档），POSIX 补执行位
     for (const rel of Object.values(platform.bins)) {
-      const p = path.join(destDir, rel);
-      if (!fs.existsSync(p)) throw new Error(`解压产物缺失：${rel}`);
+      const p = findBinary(installDir, rel);
+      if (!p) throw new Error(`解压产物缺失：${rel}`);
       if (process.platform !== 'win32') fs.chmodSync(p, 0o755);
     }
-    return destDir;
   });
+}
+
+/** 兼容两种归档布局：`<installDir>/<rel>` 或 `<installDir>/<assetBase>/<rel>` */
+function findBinary(installDir, rel) {
+  const root = path.join(installDir, rel);
+  if (fs.existsSync(root)) return root;
+  for (const sub of fs.existsSync(installDir) ? fs.readdirSync(installDir) : []) {
+    const candidate = path.join(installDir, sub, rel);
+    if (path.isAbsolute(sub) === false && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+/** 解压：统一走系统自带 tar（零运行时依赖）。Win10+/macOS 为 bsdtar（支持 zip），
+ *  Linux 为 GNU tar（只处理 tar.gz）——zip 仅在 windows 出现，恰好匹配 */
+function extractArchive(tmp, destDir, kind) {
+  const args = kind === 'zip' ? ['-xf', tmp, '-C', destDir] : ['-xzf', tmp, '-C', destDir];
+  const r = spawnSync('tar', args, { stdio: 'pipe' });
+  if (r.status !== 0) {
+    throw new Error(`解压失败（tar ${args.join(' ')}）: ${String(r.stderr).trim()}`);
+  }
 }
 
 async function withLock(fn) {
@@ -237,25 +193,14 @@ async function withLock(fn) {
   }
 }
 
-/** 解压：统一走系统自带 tar（零运行时依赖）。Win10+/macOS 为 bsdtar（支持 zip），
- *  Linux 为 GNU tar（只处理 tar.gz）——zip 仅在 windows 出现，恰好匹配 */
-function extractArchive(tmp, destDir, kind) {
-  const args = kind === 'zip' ? ['-xf', tmp, '-C', destDir] : ['-xzf', tmp, '-C', destDir];
-  const r = spawnSync('tar', args, { stdio: 'pipe' });
-  if (r.status !== 0) {
-    throw new Error(`解压失败（tar ${args.join(' ')}）: ${String(r.stderr).trim()}`);
-  }
-}
-
 function sha256(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
 /**
- * 极简 https GET：超时兜底（不挂起）+ 可关闭重定向跟随，返回
- *   { status, headers, body }（followRedirect: false 时 body 为空）
+ * 极简 https GET：超时兜底（不挂起）+ 重定向跟随，返回 { status, headers, body }
  */
-function httpsGet(url, maxBytes, { timeoutMs = 30_000, deadlineMs = timeoutMs * 4, followRedirect = true } = {}) {
+function httpsGet(url, maxBytes, { timeoutMs = 30_000, deadlineMs = timeoutMs * 4 } = {}) {
   return new Promise((resolve, reject) => {
     const doGet = (target, redirectsLeft) => {
       const req = https.get(target, { headers: { 'User-Agent': UA, Accept: 'application/vnd.github+json' } });
@@ -267,17 +212,12 @@ function httpsGet(url, maxBytes, { timeoutMs = 30_000, deadlineMs = timeoutMs * 
       });
       req.on('response', (res) => {
         const isRedirect = [301, 302, 303, 307, 308].includes(res.statusCode);
-        if (isRedirect && followRedirect) {
+        if (isRedirect) {
           res.resume();
           clearTimeout(deadline);
           const loc = res.headers.location;
           if (!loc || redirectsLeft <= 0) return reject(new Error('重定向异常'));
           return doGet(new URL(loc, target).toString(), redirectsLeft - 1);
-        }
-        if (!followRedirect && isRedirect) {
-          clearTimeout(deadline);
-          res.resume();
-          return resolve({ status: res.statusCode, headers: res.headers, body: Buffer.alloc(0) });
         }
         if (res.statusCode !== 200) {
           clearTimeout(deadline);
@@ -309,4 +249,4 @@ function httpsGet(url, maxBytes, { timeoutMs = 30_000, deadlineMs = timeoutMs * 
   });
 }
 
-module.exports = { main, extractArchive, httpsGet, sha256 };
+module.exports = { main, findBinary, extractArchive, sha256 };

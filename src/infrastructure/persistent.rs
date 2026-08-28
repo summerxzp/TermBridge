@@ -32,8 +32,9 @@
 //! ```
 
 use std::collections::HashMap;
+use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -943,13 +944,14 @@ impl PersistentProvider {
     /// 5. SSH exec 写 version 文件
     /// 6. 任一步失败 → `RuntimeDeployFailed`
     async fn deploy_runtime(&self, host: &Host) -> Result<(), TermError> {
-        let local_path = Self::local_agentd_path();
-        if !local_path.exists() {
+        // 首次使用自动从发布包内置 resources/agentd 自举到本地缓存（wrapper/平台包
+        // 均保持 exe 同目录布局，故可稳定解析）；都不可用才报 RuntimeMissing
+        let Some(local_path) = Self::ensure_local_agentd() else {
             return Err(TermError::RuntimeMissing(format!(
-                "local agentd binary not found: {}",
-                local_path.display()
+                "local agentd binary not found: {}（发布包应包含 resources/agentd/linux-x86_64/termbridge-agentd）",
+                Self::local_agentd_path().display()
             )));
-        }
+        };
 
         tracing::info!(
             host = %host.name,
@@ -1078,6 +1080,51 @@ impl PersistentProvider {
             .join("agentd")
             .join("termbridge-agentd")
     }
+
+    /// 确保本地 agentd 就绪：本地缓存存在则直接用；否则从当前可执行文件同目录的
+    /// `resources/agentd/linux-x86_64/termbridge-agentd`（发布包内嵌，wrapper/平台包
+    /// 保持同目录布局）自动复制到 `local_agentd_path()`。都不可用 → None。
+    fn ensure_local_agentd() -> Option<PathBuf> {
+        let local = Self::local_agentd_path();
+        let bundled = Self::bundled_agentd_path()?; // 无发布包布局（如开发机）→ None
+        ensure_agentd_copy(&local, &bundled)
+    }
+
+    /// 发布包内嵌 agentd 的路径：`<exe 同目录>/resources/agentd/linux-x86_64/termbridge-agentd`
+    fn bundled_agentd_path() -> Option<PathBuf> {
+        let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        Some(
+            dir.join("resources")
+                .join("agentd")
+                .join("linux-x86_64")
+                .join("termbridge-agentd"),
+        )
+    }
+}
+
+/// 纯函数：目标已存在 → 直接返回；bundled 存在 → 复制（含父目录创建 + POSIX 执行位）；
+/// 否则 None。（可单测）
+fn ensure_agentd_copy(local: &Path, bundled: &Path) -> Option<PathBuf> {
+    if local.is_file() {
+        return Some(local.to_path_buf());
+    }
+    let copied = bundled.is_file()
+        && local.parent().map(|p| fs::create_dir_all(p).is_ok()).unwrap_or(false)
+        && fs::copy(bundled, local).is_ok();
+    if !copied {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(local, fs::Permissions::from_mode(0o755));
+    }
+    tracing::info!(
+        bundled = %bundled.display(),
+        local = %local.display(),
+        "agentd: copied bundled binary into local cache"
+    );
+    Some(local.to_path_buf())
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1136,6 +1183,49 @@ mod tests {
             Some(v) => std::env::set_var("LOCALAPPDATA", v),
             None => std::env::remove_var("LOCALAPPDATA"),
         }
+    }
+
+    #[test]
+    fn ensure_agentd_copy_copies_bundled_into_cache() {
+        let dir = std::env::temp_dir().join(format!("tb-agentd-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let bundled = dir.join("resources/agentd/linux-x86_64/termbridge-agentd");
+        fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        fs::write(&bundled, b"agentd-bin").unwrap();
+        let local = dir.join("LocalAppData/TermBridge/agentd/termbridge-agentd");
+
+        let result = ensure_agentd_copy(&local, &bundled).expect("copy should succeed");
+        assert_eq!(result, local);
+        assert!(local.is_file());
+        assert_eq!(fs::read(&local).unwrap(), b"agentd-bin");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_agentd_copy_keeps_existing_cache() {
+        let dir = std::env::temp_dir().join(format!("tb-agentd-test2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let bundled = dir.join("resources/agentd/linux-x86_64/termbridge-agentd");
+        fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        fs::write(&bundled, b"new").unwrap();
+        let local = dir.join("LocalAppData/TermBridge/agentd/termbridge-agentd");
+        fs::create_dir_all(local.parent().unwrap()).unwrap();
+        fs::write(&local, b"existing").unwrap();
+
+        let result = ensure_agentd_copy(&local, &bundled).unwrap();
+        assert_eq!(result, local);
+        assert_eq!(fs::read(&local).unwrap(), b"existing", "已有缓存不应被覆盖");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_agentd_copy_missing_bundled_returns_none() {
+        let dir = std::env::temp_dir().join(format!("tb-agentd-test3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let bundled = dir.join("missing/termbridge-agentd");
+        let local = dir.join("LocalAppData/TermBridge/agentd/termbridge-agentd");
+        assert!(ensure_agentd_copy(&local, &bundled).is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -12,9 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **更新检查**（借鉴 chrome-devtools-mcp）：`termbridge-mcp` 与 `termbridge` 启动时检查 GitHub Releases 是否有新版本，有则 stderr 提示下载（仅提示，不自动安装）
   - 本地缓存 `dirs::cache_dir()/termbridge/update-check.json`，24h 内不重复联网检查；网络/解析失败静默，24h 后重试
   - 版本刷新在后台线程异步完成，不阻塞启动；可用 `TERMBRIDGE_NO_UPDATE_CHECK=1` 关闭
-- **npm 安装器壳**（`packaging/npm`，发布为 `termbridge-mcp` npm 包）：`npx -y termbridge-mcp` 即可自动下载 GitHub Releases 对应平台二进制（sha256 校验后缓存于 `~/.cache/termbridge-npm`），获得与 chrome-devtools-mcp 一致的 npx 安装/更新体验
-  - 零运行时依赖（Node 内置模块 + 系统 `tar`）；后台每 24h 检查新版本自动缓存，下次启动生效
-  - 网络受限环境可用 `TERMBRIDGE_NPM_MIRROR` 指向镜像源
+- **agentd 自动自举**（修复 `persistent=true` 全新安装报 `RuntimeMissing`）：首次部署时若本地缓存缺失，自动从发布包同目录的 `resources/agentd/linux-x86_64/termbridge-agentd` 复制到 `%LOCALAPPDATA%\TermBridge\agentd\`（POSIX 自动补执行位），不再需要手动放置；新增 3 个单元测试
+- **npm 平台包方案（长期主渠道，`packaging/npm-platform`）**：薄主包 `termbridge-mcp` + 平台包 `@termbridge/win32-x64|linux-x64|darwin-arm64`（每包含完整 release 目录，保持 exe 同目录 / `current_exe()` / agentd 布局语义）
+  - `scripts/build-platform-packages.mjs`：从 release staging 生成 3 个平台包并同步主包版本与 optionalDependencies（版本取自 git tag，单源）
+  - release.yml 新增 `npm-packages` job：默认生成 + `npm pack` 校验；配置 `NPM_TOKEN` 后才真正 `npm publish`
+  - release.yml 发布矩阵归档统一为**扁平结构**（Windows zip 与 Unix tar.gz 解压层级一致）
+- **npm 壳过渡方案修正（`packaging/npm`）**：
+  - 版本严格绑定：下载的二进制版本 = npm 包版本（`npx termbridge-mcp@0.2.1` 精确运行 v0.2.1），不再拉 GitHub latest；移除后台 24h 自动升级（更新交给 npm）
+  - 兼容带顶层目录的旧归档（`findBinary` 两级探测）
+  - 下载失败给出明确提示（确认 tag 已发布 / `TERMBRIDGE_NPM_MIRROR` 镜像兜底）
 
 ## [0.2.1] - 2026-08-14
 

@@ -33,6 +33,9 @@ gui/src-tauri/gen/
 # npm 安装器壳依赖
 packaging/npm/node_modules/
 
+# 平台包生成产物（由 scripts/build-platform-packages.mjs 生成，发版时才产出）
+packaging/npm-platform/generated/
+
 # Internal development docs (phase reports, plans, etc.)
 docs/internal/
 
