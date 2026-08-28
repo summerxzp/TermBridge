@@ -199,7 +199,7 @@ async function downloadAndExtract(version, platform) {
     }
 
     const tmp = path.join(CACHE_ROOT, `.tmp-${version}`);
-    fs.mkdirSync(CACHE_ROOT, { recursive: true });
+    fs.mkdirSync(destDir, { recursive: true }); // 系统 tar 的 -C 要求目标目录已存在
     fs.writeFileSync(tmp, buf);
     try {
       extractArchive(tmp, destDir, platform.kind);
