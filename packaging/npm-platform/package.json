@@ -1,7 +1,7 @@
 {
   "name": "termbridge-mcp",
-  "version": "0.2.1",
-  "description": "TermBridge — Remote Terminal Runtime for AI Agents (MCP)。薄主包：解析当前平台的 @termbridge/* 平台包并启动二进制，更新/安装全走 npm registry。",
+  "version": "0.3.0",
+  "description": "TermBridge — Remote Terminal Runtime for AI Agents (MCP)。薄主包：解析当前平台的 termbridge-<os>-<arch> 平台包并启动二进制，更新/安装全走 npm registry。",
   "license": "Apache-2.0",
   "keywords": [
     "termbridge",

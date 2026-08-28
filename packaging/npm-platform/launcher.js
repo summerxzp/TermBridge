@@ -1,6 +1,6 @@
 'use strict';
 // 薄主包启动器（平台包方案，长期主渠道）：
-//   1. 平台包 @termbridge/<os>-<arch> 内是完整 release 目录（trio 同目录 +
+//   1. 平台包 termbridge-<os>-<arch> 内是完整 release 目录（trio 同目录 +
 //      resources/agentd + SKILL.md + 配置），安装时由 npm optionalDependencies 装好；
 //   2. 本启动器仅需：解析本机平台包路径 → 启动其中二进制，零网络、零下载、零缓存；
 //   3. 不设置 cwd：继承调用方工作目录，避免改变 path_policy 的本地路径语义；

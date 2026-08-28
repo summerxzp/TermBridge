@@ -14,7 +14,7 @@
 //     [--os-arch darwin-arm64 --staging ./staging/termbridge-macos-arm64] \
 //     [--main ../package.json] [--out ./generated]
 //
-// 生成产物：./generated/@termbridge/<os-arch>/（完整目录 + package.json）
+// 生成产物：./generated/termbridge-<os-arch>/（完整目录 + package.json）
 // 并更新主包 package.json 的 optionalDependencies 与版本。
 
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';

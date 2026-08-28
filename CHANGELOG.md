@@ -5,7 +5,7 @@ All notable changes to TermBridge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] - 2026-08-28
 
 ### Added
 
@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 本地缓存 `dirs::cache_dir()/termbridge/update-check.json`，24h 内不重复联网检查；网络/解析失败静默，24h 后重试
   - 版本刷新在后台线程异步完成，不阻塞启动；可用 `TERMBRIDGE_NO_UPDATE_CHECK=1` 关闭
 - **agentd 自动自举**（修复 `persistent=true` 全新安装报 `RuntimeMissing`）：首次部署时若本地缓存缺失，自动从发布包同目录的 `resources/agentd/linux-x86_64/termbridge-agentd` 复制到 `%LOCALAPPDATA%\TermBridge\agentd\`（POSIX 自动补执行位），不再需要手动放置；新增 3 个单元测试
-- **npm 平台包方案（长期主渠道，`packaging/npm-platform`）**：薄主包 `termbridge-mcp` + 平台包 `@termbridge/win32-x64|linux-x64|darwin-arm64`（每包含完整 release 目录，保持 exe 同目录 / `current_exe()` / agentd 布局语义）
+- **npm 平台包方案（长期主渠道，`packaging/npm-platform`）**：薄主包 `termbridge-mcp` + 平台包 `termbridge-win32-x64|linux-x64|darwin-arm64`（每包含完整 release 目录，保持 exe 同目录 / `current_exe()` / agentd 布局语义）
   - `scripts/build-platform-packages.mjs`：从 release staging 生成 3 个平台包并同步主包版本与 optionalDependencies（版本取自 git tag，单源）
   - release.yml 新增 `npm-packages` job：默认生成 + `npm pack` 校验；配置 `NPM_TOKEN` 后才真正 `npm publish`
   - release.yml 发布矩阵归档统一为**扁平结构**（Windows zip 与 Unix tar.gz 解压层级一致）
@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 版本严格绑定：下载的二进制版本 = npm 包版本（`npx termbridge-mcp@0.2.1` 精确运行 v0.2.1），不再拉 GitHub latest；移除后台 24h 自动升级（更新交给 npm）
   - 兼容带顶层目录的旧归档（`findBinary` 两级探测）
   - 下载失败给出明确提示（确认 tag 已发布 / `TERMBRIDGE_NPM_MIRROR` 镜像兜底）
+
+### Security
+
+- **SFTP 远端路径策略重做（ADR-0005 §4）**：从"整目录封死"改为**范围(scope) + 操作(operation) 分离**模型
+  - 新增 `RemoteOperation` 分级（Read / Write / Create / Delete / Chmod），hard safety 规则只拦高风险操作：
+    - `~/.ssh/authorized_keys`：写/建/删/改权限一律硬拒（公钥部署唯一通道是 `bootstrap_host`）
+    - `/proc`、`/sys`：写/建/删硬拒（内核接口）；读不受限
+    - `/etc` 等系统目录的正常读/写仍放行（改 nginx.conf、部署应用等运维场景不受影响）
+  - `hosts.toml` 新增 per-host `allowed_remote_paths`（ADR-0017 Host Policy 扩展）：按主机声明可触及范围，未配置回退全局 `TERMBRIDGE_ALLOWED_REMOTE_PATHS`（默认 `["/"]`，不缩小 SSH 账号已具备权限）
+  - `~` / `~/...` 远端路径经 `realpath("~")`（通道级缓存）正确展开；`Create` 目标不存在时校验父目录；null 字节路径一律拒绝
 
 ## [0.2.1] - 2026-08-14
 

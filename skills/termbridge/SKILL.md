@@ -2,7 +2,7 @@
 name: "termbridge"
 description: "Operate remote Linux hosts via TermBridge terminal runtime. Invoke when user asks to run commands on, manage, debug, or deploy to a remote SSH host."
 metadata:
-  version: "0.2.1"
+  version: "0.3.0"
   mcp-server: termbridge
 ---
 
