@@ -220,9 +220,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for p in packaging/npm-platform/generated/@termbridge/win32-x64 \
-                   packaging/npm-platform/generated/@termbridge/linux-x64 \
-                   packaging/npm-platform/generated/@termbridge/darwin-arm64; do
+          for p in packaging/npm-platform/generated/termbridge-win32-x64 \
+                   packaging/npm-platform/generated/termbridge-linux-x64 \
+                   packaging/npm-platform/generated/termbridge-darwin-arm64; do
             ( cd "$p" && npm pack --dry-run )
           done
           ( cd packaging/npm-platform && npm pack --dry-run )
@@ -234,9 +234,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for p in packaging/npm-platform/generated/@termbridge/win32-x64 \
-                   packaging/npm-platform/generated/@termbridge/linux-x64 \
-                   packaging/npm-platform/generated/@termbridge/darwin-arm64; do
-            npm publish "$p" --access public
+          for p in packaging/npm-platform/generated/termbridge-win32-x64 \
+                   packaging/npm-platform/generated/termbridge-linux-x64 \
+                   packaging/npm-platform/generated/termbridge-darwin-arm64; do
+            npm publish "$p"
           done
           ( cd packaging/npm-platform && npm publish )

@@ -1,8 +1,11 @@
-# termbridge-mcp（npm 安装器壳）
+# termbridge-mcp-downloader（npm 安装器壳 · 过渡方案）
 
 TermBridge 是原生 Rust 二进制，通过 GitHub Releases 发布。本 npm 包只是一个
-**下载器壳**：自动下载当前平台的最新二进制到本地缓存并启动，让用户获得与
-`npx -y chrome-devtools-mcp@latest` 一致的安装体验。
+**下载器壳**：自动下载当前平台的最新二进制到本地缓存并启动，获得与
+`npx -y chrome-devtools-mcp@latest` 一致的体验。
+
+> 注意：本包是**过渡方案**，通常不发布；长期主渠道是
+> [`npm-platform`](../npm-platform) 平台包方案（`npx -y termbridge-mcp`）。
 
 ## 用法
 

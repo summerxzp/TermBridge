@@ -3,7 +3,7 @@
 Rust 二进制通过 npm **平台包**分发（借鉴 esbuild / Biome / SWC 的主包 + 平台包模式）：
 
 - 主包 `termbridge-mcp`：薄启动器，仅解析本机平台包并启动二进制（零网络/零下载）。
-- 平台包 `@termbridge/win32-x64|linux-x64|darwin-arm64`：每个包内含**完整 release
+- 平台包 `termbridge-win32-x64|linux-x64|darwin-arm64`：每个包内含**完整 release
   目录**（trio 二进制同目录 + `resources/agentd` + `SKILL.md` + 配置），
   保证 `current_exe()`（helper 同目录）与 agentd/LOCALAPPDATA 布局语义不受影响。
 - 安装/更新全走 npm registry（可配 npmmirror/内网源）；`npx -y termbridge-mcp@latest`
@@ -33,9 +33,9 @@ node scripts/build-platform-packages.mjs \
   --os-arch darwin-arm64 --staging <dir>/termbridge-macos-arm64
 
 # 2. 逐个 npm publish（平台包在前，主包最后）
-npm publish generated/@termbridge/win32-x64 --access public
-npm publish generated/@termbridge/linux-x64 --access public
-npm publish generated/@termbridge/darwin-arm64 --access public
+npm publish generated/termbridge-win32-x64
+npm publish generated/termbridge-linux-x64
+npm publish generated/termbridge-darwin-arm64
 npm publish .
 ```
 

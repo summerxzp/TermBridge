@@ -1,7 +1,7 @@
 {
-  "name": "termbridge-mcp",
+  "name": "termbridge-mcp-downloader",
   "version": "0.2.1",
-  "description": "TermBridge 的 npm 安装器壳：npx -y termbridge-mcp 即可自动下载 GitHub Releases 对应平台二进制并启动（含 termbridge CLI 与 termbridge-auth-helper）",
+  "description": "TermBridge 过渡期安装器壳：npx -y termbridge-mcp-downloader 自动下载 GitHub Releases 对应平台二进制并启动（通常不发布，长期主渠道见 packaging/npm-platform）",
   "license": "Apache-2.0",
   "keywords": [
     "termbridge",

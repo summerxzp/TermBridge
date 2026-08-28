@@ -23,8 +23,8 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "@termbridge/win32-x64": "0.2.1",
-    "@termbridge/linux-x64": "0.2.1",
-    "@termbridge/darwin-arm64": "0.2.1"
+    "termbridge-win32-x64": "0.2.1",
+    "termbridge-linux-x64": "0.2.1",
+    "termbridge-darwin-arm64": "0.2.1"
   }
 }

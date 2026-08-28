@@ -1,8 +1,10 @@
 // build-platform-packages.mjs
 //
-// 从 release staging 目录生成 3 个平台包（@termbridge/<os>-<arch>）并同步主包版本。
+// 从 release staging 目录生成 3 个平台包（termbridge-<os>-<arch>）并同步主包版本。
 // 每个平台包内是「完整 release 目录」（trio 二进制 + resources/agentd + SKILL.md + 配置），
 // 保证 exe 同目录布局与 Rust 侧 current_exe()/相对路径语义，与 esbuild 式"单二进制拆包"不同。
+// 命名：无 scope（termbridge-mcp / termbridge-win32-x64 …），与 chrome-devtools-mcp 习惯一致，
+//       也避免 @termbridge org 抢注的不确定性；成熟后可再迁入组织 scope。
 //
 // 用法：
 //   node scripts/build-platform-packages.mjs \
@@ -68,15 +70,15 @@ for (const { key, staging } of args.platforms) {
     console.error(`staging 目录不存在：${staging}`);
     process.exit(2);
   }
-  const destDir = path.join(args.outDir, '@termbridge', key);
+  const destDir = path.join(args.outDir, `termbridge-${key}`);
   rmSync(destDir, { recursive: true, force: true });
   // 复制完整 release 目录内容
   cpSync(staging, destDir, { recursive: true });
 
   const pkg = {
-    name: `@termbridge/${key}`,
+    name: `termbridge-${key}`,
     version: args.version,
-    description: `TermBridge runtime for ${key}(完整 release 目录，含 trio 二进制 / resources/agentd / SKILL.md)`,
+    description: `TermBridge runtime for ${key} (完整 release 目录，含 trio 二进制 / resources/agentd / SKILL.md)`,
     license: 'Apache-2.0',
     os: meta.os,
     cpu: meta.cpu,
@@ -91,7 +93,7 @@ const mainPkgPath = args.main;
 const mainPkg = JSON.parse(readFileSync(mainPkgPath, 'utf8'));
 mainPkg.version = args.version;
 for (const key of Object.keys(PLATFORM_META)) {
-  mainPkg.optionalDependencies[`@termbridge/${key}`] = args.version;
+  mainPkg.optionalDependencies[`termbridge-${key}`] = args.version;
 }
 writeFileSync(mainPkgPath, JSON.stringify(mainPkg, null, 2) + '\n');
 console.log(`✓ 主包 ${mainPkg.name}@${args.version}  版本与 optionalDependencies 已同步`);

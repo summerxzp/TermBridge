@@ -10,9 +10,9 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const PLATFORMS = {
-  'win32-x64': { pkg: '@termbridge/win32-x64', exe: true },
-  'linux-x64': { pkg: '@termbridge/linux-x64', exe: false },
-  'darwin-arm64': { pkg: '@termbridge/darwin-arm64', exe: false },
+  'win32-x64': { pkg: 'termbridge-win32-x64', exe: true },
+  'linux-x64': { pkg: 'termbridge-linux-x64', exe: false },
+  'darwin-arm64': { pkg: 'termbridge-darwin-arm64', exe: false },
 };
 const BIN_NAMES = {
   termbridge: 'termbridge',
