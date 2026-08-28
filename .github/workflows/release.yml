@@ -228,12 +228,18 @@ jobs:
           ( cd packaging/npm-platform && npm pack --dry-run )
 
       - name: Publish to npm (only when NPM_TOKEN is configured)
-        if: ${{ secrets.NPM_TOKEN != '' }}
         env:
+          # secrets 不能在 if 条件中引用（GitHub Actions 解析限制），
+          # 改为注入 env 后在脚本内判断
+          NPM_TOKEN_VAL: ${{ secrets.NPM_TOKEN }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
+          if [ -z "${NPM_TOKEN_VAL:-}" ]; then
+            echo "NPM_TOKEN 未配置，跳过 npm publish（pack 校验已通过）"
+            exit 0
+          fi
           for p in packaging/npm-platform/generated/termbridge-win32-x64 \
                    packaging/npm-platform/generated/termbridge-linux-x64 \
                    packaging/npm-platform/generated/termbridge-darwin-arm64; do
