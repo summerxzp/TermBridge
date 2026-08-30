@@ -32,7 +32,9 @@ use crate::domain::provider::{
 use crate::domain::session::{Session, SessionId, SessionSummary};
 use crate::domain::timeline::TimelineEvent;
 use crate::infrastructure::daemon_proto::SessionInfo;
-use crate::infrastructure::persistent::{PersistentProvider, PersistentTerminalHandle};
+use crate::infrastructure::persistent::{
+    PersistentProvider, PersistentTerminalHandle, RemoteDaemonRestartReport,
+};
 use crate::infrastructure::ssh::SshTerminalHandle;
 use crate::infrastructure::sshconfig;
 use crate::application::host_policy::{AuthMode, HostPolicyResolver, SessionMode};
@@ -982,6 +984,31 @@ impl SessionManager {
         self.sessions.remove(session_id);
         tracing::info!(session = %session_id, "detach_session: detached, remote PTY kept alive");
         Ok(())
+    }
+
+    // ── agentd 升级路径：远端 daemon 重启 ──────────────────────────
+
+    /// 重启远端 daemon（restart_remote_daemon 工具后端）。
+    ///
+    /// 流程：ssh -G 解析 → 确保 runtime 就绪（Missing / NeedsUpgrade → 部署）→
+    /// 停止运行中的 daemon（pid 文件 + comm 校验，绝不盲杀）→ bootstrap 全新
+    /// daemon → hello 握手验证版本。
+    ///
+    /// 杀 daemon 会使本 MCP 进程内连到该 daemon 的所有 session 失效（read task
+    /// 收到 channel EOF → session 转 Lost），这是升级语义本身；工具描述已向
+    /// Agent 声明。需要底层 provider 为 PersistentProvider。
+    pub async fn restart_remote_daemon(
+        &self,
+        host_alias: &HostName,
+    ) -> Result<RemoteDaemonRestartReport, TermError> {
+        // 低频、破坏性操作：info 级别 tracing
+        tracing::info!(host = %host_alias, "restart_remote_daemon");
+        let host = sshconfig::resolve(host_alias).await?;
+        let provider = self.provider.as_any().downcast_ref::<PersistentProvider>()
+            .ok_or_else(|| TermError::InvalidArgument(
+                "restart_remote_daemon requires persistent provider".into()
+            ))?;
+        provider.restart_remote_daemon(&host).await
     }
 
     // ── Phase 6-A：断线感知 + 手动重连 ────────────────────────────

@@ -11,7 +11,10 @@
 //!   ├── request.persistent == false → 委托 SshProvider.open（Phase 1/2 路径）
 //!   └── request.persistent == true  → 走 daemon 路径：
 //!         1. check_remote_runtime(host) → RemoteRuntimeState
-//!         2. Missing → deploy_runtime(host)（SFTP 上传 agentd 二进制 + version 文件）
+//!         2. Missing → deploy_runtime(host)（SFTP 上传 agentd 二进制 + version 文件）；
+//!            NeedsUpgrade → deploy_runtime(host) + stop_remote_daemon(host)：
+//!            升级部署后旧 daemon 仍在运行旧二进制，必须先停掉，随后的
+//!            bootstrap_daemon 才会以新二进制 spawn 全新 serve 进程
 //!         3. bootstrap_daemon(host) → socket_path（幂等：已运行则返回现有 socket）
 //!         4. DaemonClient::connect(ssh, host, socket_path) → hello 握手 + 协议版本校验
 //!         5. daemon.session_create(...) → remote_session_id
@@ -36,7 +39,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -74,11 +77,62 @@ type ReadHalf = russh::ChannelReadHalf;
 ///   不一致（或内容无法解析）——远端 agentd 需随客户端升级重新部署
 /// - `Stopped`：二进制已部署且版本一致，但 daemon 进程未运行（`pgrep` 无输出）
 /// - `Running`：daemon 进程已在运行（`pgrep` 有输出）
+#[derive(Debug)]
 enum RemoteRuntimeState {
     Missing,
     NeedsUpgrade,
     Stopped,
     Running,
+}
+
+/// check_remote_runtime 的探测结果：状态 + version 文件中记录的旧 build。
+struct RemoteRuntimeProbe {
+    state: RemoteRuntimeState,
+    /// version 文件中的远端 build（Missing / 内容无法解析时为 None）。
+    /// 升级路径用它打 "agentd 已升级 x→y" 日志 / 填充 restart 报告的 version_before。
+    remote_build: Option<String>,
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 远端 daemon 停止 / 重启结果类型
+// ───────────────────────────────────────────────────────────────────────────
+
+/// stop_remote_daemon 的结果。
+///
+/// 用 `status` 标签区分"daemon 本来就没在运行"（`not_running`，未执行任何
+/// kill——包括 pid 文件缺失、内容非法、pid 进程已消失、pid 被其他进程复用
+/// 等安全分支）与"daemon 已停止"（`stopped`），调用方不应把前者当失败。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RemoteDaemonStopResult {
+    /// daemon 未在运行，未执行 kill。`reason` 为诊断信息（中文，进日志）。
+    NotRunning { reason: String },
+    /// daemon 进程已停止。
+    Stopped {
+        /// 被停止的 daemon pid（来自 pid 文件且 comm 校验通过）
+        pid: u32,
+        /// SIGTERM 宽限期内未退出、动用了 kill -9 兜底
+        forced: bool,
+    },
+}
+
+/// restart_remote_daemon 的结构化报告（MCP 工具返回体）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RemoteDaemonRestartReport {
+    /// 本次是否停止了正在运行的旧 daemon
+    pub stopped: bool,
+    /// 重启前 daemon 是否在运行（= stopped，成功路径下二者同值）
+    pub was_running: bool,
+    /// 本次调用是否部署了 agentd 二进制（Missing / NeedsUpgrade 触发）
+    pub deployed: bool,
+    /// 部署前 version 文件记录的远端 build（缺失 / 无法解析时省略）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_before: Option<String>,
+    /// 重启后 hello 握手返回的 daemon build（未真正重启时即旧 daemon 的 build）
+    pub version_after: String,
+    /// 是否 spawn 了全新 daemon 进程；false = bootstrap 复用了仍在运行的旧 daemon
+    /// （如 pid 文件丢失导致 stop 判定"未运行"），此时升级尚未生效
+    pub restarted: bool,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -102,6 +156,12 @@ struct DaemonClientInner {
     pty_data_subscribers: ParkingMutex<Vec<mpsc::Sender<Bytes>>>,
     /// 事件广播：pty_exit / session_lost。PersistentTerminalHandle::read 监听以返回 EOF。
     event_tx: broadcast::Sender<Event>,
+    /// hello 握手返回的 daemon build（agentd 编译期 BUILD_VERSION）。
+    ///
+    /// reader task 持有 inner 的 clone，hello 又只能在 connect 后期完成，
+    /// 用 OnceLock 允许握手后一次性写入（restart_remote_daemon 据此报告
+    /// version_after，判断升级是否真正生效）。
+    daemon_build: OnceLock<String>,
     /// 连接是否已关闭（reader task EOF / write 失败）。call() 前检查。
     closed: AtomicBool,
 }
@@ -149,6 +209,7 @@ impl DaemonClient {
             pending: ParkingMutex::new(HashMap::new()),
             pty_data_subscribers: ParkingMutex::new(Vec::new()),
             event_tx,
+            daemon_build: OnceLock::new(),
             closed: AtomicBool::new(false),
         });
 
@@ -194,8 +255,18 @@ impl DaemonClient {
             .and_then(|v| v.as_str())
             .unwrap_or("?")
             .to_string();
+        // 记录 daemon build（restart_remote_daemon 的 version_after 数据源）
+        let _ = client
+            .inner
+            .daemon_build
+            .set(result.get("daemon_build").and_then(|v| v.as_str()).unwrap_or("?").to_string());
         tracing::info!(daemon_id, daemon_version, "daemon hello ok");
         Ok(client)
+    }
+
+    /// daemon hello 握手返回的 build（未握手/字段缺失时为 "?"）。
+    pub fn daemon_build(&self) -> &str {
+        self.inner.daemon_build.get().map(|s| s.as_str()).unwrap_or("?")
     }
 
     /// 发送 Request 并等待 Response（30s 超时）。
@@ -783,17 +854,53 @@ impl TerminalProvider for PersistentProvider {
         );
 
         // 1. 检查远端 runtime 状态
-        let state = self.check_remote_runtime(host).await?;
+        let probe = self.check_remote_runtime(host).await?;
         if matches!(
-            state,
+            probe.state,
             RemoteRuntimeState::Missing | RemoteRuntimeState::NeedsUpgrade
         ) {
+            let old_build = probe.remote_build.clone().unwrap_or_else(|| "?".into());
             tracing::info!(host = %host.name, "remote runtime missing or outdated, deploying");
             self.deploy_runtime(host).await?;
+
+            // 升级部署（NeedsUpgrade）语义：mv -f 原子替换只换磁盘上的二进制，
+            // 旧 daemon 进程仍在内存里跑旧版本、继续服务——必须先停掉它，下面的
+            // bootstrap_daemon 才会以新二进制 spawn 全新 serve 进程，升级在同一次
+            // open 流程内生效。state == Missing（首次部署）时远端从未有过 daemon，
+            // 无需 stop。
+            //
+            // 注意：stop 失败会让本次 open 显式失败（宁可报错也不静默跑旧版本）。
+            // 此时 version 文件已写入新 build，后续 open 不会再触发升级路径，
+            // 须调用 restart_remote_daemon 工具显式重启使升级生效。
+            // 另：停 daemon 会让本 MCP 进程内所有连到该 daemon 的 session 变
+            // Lost（proxy channel 断开）——升级语义本身即如此。
+            if should_stop_daemon_after_deploy(&probe.state) {
+                match self.stop_remote_daemon(host).await? {
+                    RemoteDaemonStopResult::Stopped { pid, forced } => {
+                        tracing::info!(
+                            host = %host.name,
+                            from = %old_build,
+                            to = BUILD_VERSION,
+                            pid,
+                            forced,
+                            "agentd 已升级 {old_build}→{BUILD_VERSION}，旧 daemon（pid {pid}）已停止，bootstrap 将启动新 daemon"
+                        );
+                    }
+                    RemoteDaemonStopResult::NotRunning { reason } => {
+                        tracing::info!(
+                            host = %host.name,
+                            from = %old_build,
+                            to = BUILD_VERSION,
+                            reason,
+                            "agentd 已升级 {old_build}→{BUILD_VERSION}，旧 daemon 未在运行，跳过停止"
+                        );
+                    }
+                }
+            }
         }
 
         // 2. bootstrap daemon（幂等：已运行则返回现有 socket）
-        let socket_path = self.bootstrap_daemon(host).await?;
+        let socket_path = self.bootstrap_daemon(host).await?.socket;
         tracing::info!(host = %host.name, socket_path, "daemon bootstrapped");
 
         // 3. 连接 daemon + hello 握手
@@ -849,6 +956,14 @@ impl PersistentProvider {
     /// 远端路径约定（ADR-0004 §2）
     const REMOTE_BIN: &'static str = "~/.local/share/termbridge/termbridge-agentd";
     const REMOTE_VERSION: &'static str = "~/.local/share/termbridge/agentd.version";
+    /// 远端 daemon pid 文件：agentd/src/main.rs `default_pid_path()` 固定写
+    /// `$HOME/.local/share/termbridge/agentd.pid`（与 socket 不同，不受
+    /// XDG_RUNTIME_DIR 影响）。bootstrap spawn serve 时写入。
+    const REMOTE_PID_FILE: &'static str = "~/.local/share/termbridge/agentd.pid";
+    /// kill（SIGTERM）后的宽限秒数：远端 shell 每 1s 轮询一次 `kill -0`，
+    /// 超过仍未退出 → 升级 `kill -9`。agentd 未注册任何信号处理，SIGTERM
+    /// 即默认终止，正常情况下远小于该上限。
+    const DAEMON_TERM_GRACE_SECS: u64 = 5;
 
     /// 列出远端 daemon 上的所有 session（含 detached 的，用于跨 MCP 重启重连）。
     ///
@@ -858,7 +973,7 @@ impl PersistentProvider {
         &self,
         host: &Host,
     ) -> Result<Vec<SessionInfo>, TermError> {
-        let socket_path = self.bootstrap_daemon(host).await?;
+        let socket_path = self.bootstrap_daemon(host).await?.socket;
         let daemon = DaemonClient::connect(&self.ssh, host, &socket_path).await?;
         daemon.session_list().await
     }
@@ -877,7 +992,7 @@ impl PersistentProvider {
         host: &Host,
         remote_session_id: &str,
     ) -> Result<Arc<dyn TerminalHandle>, TermError> {
-        let socket_path = self.bootstrap_daemon(host).await?;
+        let socket_path = self.bootstrap_daemon(host).await?.socket;
         let daemon = DaemonClient::connect(&self.ssh, host, &socket_path).await?;
 
         // 订阅 pty_data（attach 前订阅，确保 event_pump 启动后不漏增量推送）
@@ -910,7 +1025,10 @@ impl PersistentProvider {
     /// 1. `test -x <bin> && cat <version>` → 失败 = Missing；成功后比对 version
     ///    文件的 build 字段与客户端 BUILD_VERSION，不一致/无法解析 = NeedsUpgrade
     /// 2. `pgrep -f termbridge-agentd` → 有输出 = Running；无输出/失败 = Stopped
-    async fn check_remote_runtime(&self, host: &Host) -> Result<RemoteRuntimeState, TermError> {
+    ///
+    /// 返回 `RemoteRuntimeProbe`：状态 + version 文件中的旧 build（升级日志 /
+    /// restart 报告的 version_before 用；Missing 或内容无法解析时为 None）。
+    async fn check_remote_runtime(&self, host: &Host) -> Result<RemoteRuntimeProbe, TermError> {
         // 1. 检查二进制 + version 文件
         let version_out = match self
             .ssh
@@ -927,19 +1045,27 @@ impl PersistentProvider {
             Ok(out) => out,
             Err(_) => {
                 tracing::info!(host = %host.name, "remote runtime: missing (binary/version not found)");
-                return Ok(RemoteRuntimeState::Missing);
+                return Ok(RemoteRuntimeProbe {
+                    state: RemoteRuntimeState::Missing,
+                    remote_build: None,
+                });
             }
         };
 
         // 2. 版本比对：远端 build 与客户端 BUILD_VERSION 不一致（或 version 文件
         //    内容无法解析）→ NeedsUpgrade，由调用方重新部署。早期实现只检查文件
         //    存在性，远端 agentd 版本落后时永远不会升级。
-        if !remote_version_matches(&version_out) {
+        let remote_build = parse_remote_build(&version_out);
+        if remote_build.as_deref() != Some(BUILD_VERSION) {
             tracing::info!(
                 host = %host.name,
+                remote_build = ?remote_build,
                 "remote runtime: version mismatch/unknown, needs upgrade"
             );
-            return Ok(RemoteRuntimeState::NeedsUpgrade);
+            return Ok(RemoteRuntimeProbe {
+                state: RemoteRuntimeState::NeedsUpgrade,
+                remote_build,
+            });
         }
 
         // 3. 检查 daemon 进程是否运行
@@ -947,10 +1073,16 @@ impl PersistentProvider {
         let running = matches!(pgrep, Ok(out) if !out.trim().is_empty());
         if running {
             tracing::info!(host = %host.name, "remote runtime: running");
-            Ok(RemoteRuntimeState::Running)
+            Ok(RemoteRuntimeProbe {
+                state: RemoteRuntimeState::Running,
+                remote_build,
+            })
         } else {
             tracing::info!(host = %host.name, "remote runtime: stopped");
-            Ok(RemoteRuntimeState::Stopped)
+            Ok(RemoteRuntimeProbe {
+                state: RemoteRuntimeState::Stopped,
+                remote_build,
+            })
         }
     }
 
@@ -1066,15 +1198,10 @@ impl PersistentProvider {
         Ok(())
     }
 
-    /// 启动 daemon（幂等），返回 socket_path。
-    ///
-    /// 1. 计算默认 socket 路径：`${XDG_RUNTIME_DIR:-$HOME/.local/share/termbridge}/termbridge.sock`
-    /// 2. 执行 `termbridge-agentd bootstrap --sock <path>`（幂等：已运行则返回现有信息）
-    /// 3. 解析 stdout JSON：`{ daemon_id, socket, protocol_version, build }`
-    /// 4. 返回 socket path（优先 JSON 中的 socket 字段，回退到计算的路径）
-    async fn bootstrap_daemon(&self, host: &Host) -> Result<String, TermError> {
-        // 计算默认 socket 路径
-        let default_socket = self
+    /// 计算远端默认 socket 路径（与 agentd/src/main.rs `default_socket_path`
+    /// 的解析规则一致，远端 shell 求值）。
+    async fn remote_socket_path(&self, host: &Host) -> Result<String, TermError> {
+        Ok(self
             .ssh
             .exec(
                 host,
@@ -1082,7 +1209,20 @@ impl PersistentProvider {
             )
             .await?
             .trim()
-            .to_string();
+            .to_string())
+    }
+
+    /// 启动 daemon（幂等），返回 socket 路径 + daemon_id。
+    ///
+    /// 1. 计算默认 socket 路径：`${XDG_RUNTIME_DIR:-$HOME/.local/share/termbridge}/termbridge.sock`
+    /// 2. 执行 `termbridge-agentd bootstrap --sock <path>`（幂等：已运行则返回现有信息）
+    /// 3. 解析 stdout JSON：`{ daemon_id, socket, protocol_version, build }`
+    ///
+    /// `daemon_id` 供调用方判断是否真的 spawn 了新 daemon：daemon 已在运行时
+    /// agentd bootstrap 返回字面量 `"existing"`，否则为新生成的 daemon id。
+    async fn bootstrap_daemon(&self, host: &Host) -> Result<DaemonBootstrapInfo, TermError> {
+        // 计算默认 socket 路径
+        let default_socket = self.remote_socket_path(host).await?;
 
         // 执行 bootstrap
         let stdout = self
@@ -1110,7 +1250,212 @@ impl PersistentProvider {
             .unwrap_or("?")
             .to_string();
         tracing::info!(host = %host.name, daemon_id, socket = %socket, "daemon bootstrapped");
-        Ok(socket)
+        Ok(DaemonBootstrapInfo { socket, daemon_id })
+    }
+
+    /// 停止远端 daemon（SSH exec，与 check_remote_runtime 同管道；restart_remote_daemon
+    /// 工具与 open() 升级路径共用）。
+    ///
+    /// 绝不盲杀——pid 文件会过期、pid 会被复用，kill 前必须校验进程身份：
+    /// 1. 读 pid 文件（`~/.local/share/termbridge/agentd.pid`）——缺失/内容非法
+    ///    → `NotRunning`（daemon 从未启动，或从未记录 pid）
+    /// 2. 校验 pid 身份：`/proc/<pid>/comm`（回退 `ps -p <pid> -o comm=`）必须是
+    ///    agentd —— 进程已消失 → `NotRunning`（pid 文件过期）；comm 不符（pid 被
+    ///    其他进程复用）→ `NotRunning` 并拒绝 kill
+    /// 3. `kill <pid>`（SIGTERM），远端 shell 每 1s 轮询 `kill -0`，至多
+    ///    `DAEMON_TERM_GRACE_SECS` 秒；仍未退出 → `kill -9` 兜底并复核
+    /// 4. `rm -f` 残留 socket 文件（尽力而为；新 daemon 的 serve 本也会 unlink
+    ///    stale socket，见 agentd/src/rpc.rs `RpcServer::serve`）
+    ///
+    /// 错误语义：步骤 1/2 中 SSH 连接级故障与"文件/进程不存在"无法区分，统一按
+    /// `NotRunning` 处理（安全方向：不做任何 kill），随后的 bootstrap 会以连接
+    /// 错误显式失败；kill 阶段的故障（SSH 失败 / SIGKILL 后进程仍存活 / 输出缺
+    /// 标记）→ `Err(TermError)`，调用方不应假定 daemon 已停止。
+    pub async fn stop_remote_daemon(
+        &self,
+        host: &Host,
+    ) -> Result<RemoteDaemonStopResult, TermError> {
+        tracing::info!(host = %host.name, "stopping remote daemon");
+
+        // 1. 读 pid 文件
+        let pid = match self
+            .ssh
+            .exec(
+                host,
+                &format!("cat {} 2>/dev/null", Self::REMOTE_PID_FILE),
+            )
+            .await
+        {
+            Ok(out) => match parse_pid_file(&out) {
+                Some(pid) => pid,
+                None => {
+                    let reason = "pid 文件内容为空或非法".to_string();
+                    tracing::info!(host = %host.name, reason, "remote daemon not running");
+                    return Ok(RemoteDaemonStopResult::NotRunning { reason });
+                }
+            },
+            Err(_) => {
+                // cat 失败 = pid 文件不存在（含 SSH 连接级故障，见函数注释）
+                let reason = "pid 文件不存在（daemon 从未启动或已被清理）".to_string();
+                tracing::info!(host = %host.name, reason, "remote daemon not running");
+                return Ok(RemoteDaemonStopResult::NotRunning { reason });
+            }
+        };
+
+        // 2. 校验 pid 身份：comm 必须是 agentd
+        let comm_out = self
+            .ssh
+            .exec(
+                host,
+                &format!(
+                    "cat /proc/{pid}/comm 2>/dev/null || ps -p {pid} -o comm= 2>/dev/null"
+                ),
+            )
+            .await;
+        match comm_out {
+            Ok(out) if is_agentd_comm(&out) => {}
+            Ok(out) => {
+                // pid 被其他进程复用：绝不能 kill
+                let comm = out.trim().to_string();
+                let reason = format!("pid {pid} 已被其他进程复用（comm={comm:?}），拒绝 kill");
+                tracing::warn!(host = %host.name, pid, comm, "remote daemon: pid reused, refusing to kill");
+                return Ok(RemoteDaemonStopResult::NotRunning { reason });
+            }
+            Err(_) => {
+                // 进程不存在（或 SSH 故障，安全方向按未运行处理）
+                let reason = format!("pid {pid} 对应进程不存在（pid 文件过期）");
+                tracing::info!(host = %host.name, pid, "remote daemon not running (stale pid file)");
+                return Ok(RemoteDaemonStopResult::NotRunning { reason });
+            }
+        }
+
+        // 3. SIGTERM + 有界等待。用 stdout 标记（GONE/ALIVE）区分结果，避免解析
+        //    exec 的 exit-code 错误文本；命令整体 exit 0，输出必带标记。
+        let grace_seq: Vec<String> = (1..=Self::DAEMON_TERM_GRACE_SECS)
+            .map(|i| i.to_string())
+            .collect();
+        let term_cmd = format!(
+            "kill {pid} 2>/dev/null; for i in {seq}; do sleep 1; kill -0 {pid} 2>/dev/null || {{ echo GONE; exit 0; }}; done; echo ALIVE",
+            seq = grace_seq.join(" "),
+        );
+        let forced = match self.ssh.exec(host, &term_cmd).await {
+            Ok(out) if out.contains("GONE") => false,
+            Ok(out) if out.contains("ALIVE") => {
+                tracing::warn!(
+                    host = %host.name,
+                    pid,
+                    grace_secs = Self::DAEMON_TERM_GRACE_SECS,
+                    "daemon 未在 SIGTERM 宽限期内退出，升级 kill -9"
+                );
+                let kill9_cmd = format!(
+                    "kill -9 {pid} 2>/dev/null; sleep 1; kill -0 {pid} 2>/dev/null || echo GONE"
+                );
+                let out9 = self.ssh.exec(host, &kill9_cmd).await?;
+                if !out9.contains("GONE") {
+                    return Err(TermError::ChannelError(format!(
+                        "daemon (pid {pid}) 在 SIGKILL 后依然存活"
+                    )));
+                }
+                true
+            }
+            Ok(_) => {
+                // 无标记输出（异常 shell 行为 / channel 未回 ExitStatus）：按失败
+                // 处理，绝不假定已停止
+                return Err(TermError::ChannelError(format!(
+                    "kill daemon (pid {pid}): 远端输出缺少 GONE/ALIVE 标记"
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+
+        // 4. 清理残留 socket 文件（尽力而为，失败不影响"已停止"结论）
+        match self.remote_socket_path(host).await {
+            Ok(socket) => {
+                if let Err(e) = self.ssh.exec(host, &format!("rm -f {socket}")).await {
+                    tracing::warn!(host = %host.name, socket, error = %e, "清理残留 socket 失败（尽力而为）");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(host = %host.name, error = %e, "计算 socket 路径失败，跳过残留 socket 清理");
+            }
+        }
+
+        tracing::info!(host = %host.name, pid, forced, "remote daemon stopped");
+        Ok(RemoteDaemonStopResult::Stopped { pid, forced })
+    }
+
+    /// 重启远端 daemon（restart_remote_daemon MCP 工具后端）。
+    ///
+    /// 流程：确保 runtime 就绪（Missing / NeedsUpgrade → deploy）→ 停止运行中的
+    /// daemon → bootstrap → hello 握手验证版本。
+    ///
+    /// 报告字段语义：
+    /// - `was_running` / `stopped`：重启前 daemon 是否在运行、是否被本次停止
+    ///   （kill 失败会直接 Err，不会以"未停止"成功返回）
+    /// - `restarted`：bootstrap 是否 spawn 了全新 daemon。false = bootstrap 复用
+    ///   了仍在运行的旧 daemon（如 pid 文件丢失导致 stop 判定"未运行"），此时
+    ///   部署的新二进制尚未生效，`version_after` 即旧 daemon 的 build，调用方
+    ///   （Agent）可据此重试或排查
+    pub async fn restart_remote_daemon(
+        &self,
+        host: &Host,
+    ) -> Result<RemoteDaemonRestartReport, TermError> {
+        tracing::info!(host = %host.name, "restart_remote_daemon: 开始");
+
+        // 1. 确保 runtime 就绪（缺失 / 版本不匹配 → 部署）
+        let probe = self.check_remote_runtime(host).await?;
+        let deployed = matches!(
+            probe.state,
+            RemoteRuntimeState::Missing | RemoteRuntimeState::NeedsUpgrade
+        );
+        if deployed {
+            tracing::info!(host = %host.name, "restart_remote_daemon: 部署 runtime");
+            self.deploy_runtime(host).await?;
+        }
+        let version_before = probe.remote_build;
+
+        // 2. 停止运行中的 daemon（未运行 → NotRunning，直接进入 bootstrap）
+        let (was_running, stopped) = match self.stop_remote_daemon(host).await? {
+            RemoteDaemonStopResult::Stopped { .. } => (true, true),
+            RemoteDaemonStopResult::NotRunning { reason } => {
+                tracing::info!(host = %host.name, reason, "restart_remote_daemon: daemon 未在运行");
+                (false, false)
+            }
+        };
+
+        // 3. bootstrap（幂等）：daemon 已停止 → spawn 全新进程
+        let info = self.bootstrap_daemon(host).await?;
+        let restarted = info.daemon_id != "existing";
+
+        // 4. hello 握手验证：connect 内校验协议版本（不匹配 → DaemonProtocolMismatch）
+        let daemon = DaemonClient::connect(&self.ssh, host, &info.socket).await?;
+        let version_after = daemon.daemon_build().to_string();
+        if deployed && !restarted {
+            tracing::warn!(
+                host = %host.name,
+                version_after,
+                "restart_remote_daemon: 已部署新二进制但 bootstrap 复用了旧 daemon，升级未生效"
+            );
+        }
+        tracing::info!(
+            host = %host.name,
+            was_running,
+            stopped,
+            deployed,
+            restarted,
+            version_before = ?version_before,
+            version_after,
+            "restart_remote_daemon: 完成"
+        );
+
+        Ok(RemoteDaemonRestartReport {
+            stopped,
+            was_running,
+            deployed,
+            version_before,
+            version_after,
+            restarted,
+        })
     }
 
     /// 本地 agentd 二进制路径：`<data_local_dir>/TermBridge/agentd/termbridge-agentd`。
@@ -1178,24 +1523,72 @@ fn ensure_agentd_copy(local: &Path, bundled: &Path) -> Option<PathBuf> {
     Some(local.to_path_buf())
 }
 
-/// 纯函数：比对远端 version 文件内容与客户端 BUILD_VERSION。
+/// bootstrap_daemon 的返回信息（模块内部使用）。
+struct DaemonBootstrapInfo {
+    /// socket 路径（优先 bootstrap JSON 的 socket 字段，回退远端计算路径）
+    socket: String,
+    /// daemon_id：daemon 已在运行时 agentd bootstrap 返回字面量 `"existing"`，
+    /// spawn 了全新进程时为新生成的 daemon id（restart 据此判定 restarted）
+    daemon_id: String,
+}
+
+/// 纯函数：解析 pid 文件内容为 daemon pid。
+///
+/// 要求：trim 后非空、全为十进制数字、可解析为非 0 的 u32。pid 文件由 agentd
+/// bootstrap 写入（`fs::write(path, format!("{pid}"))`），内容为一行十进制数。
+/// 空文件 / 损坏内容 / 负数 / 溢出 → None（调用方按"daemon 未运行"处理，绝不
+/// 盲杀）。（可单测）
+fn parse_pid_file(content: &str) -> Option<u32> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    trimmed.parse::<u32>().ok().filter(|&pid| pid != 0)
+}
+
+/// 纯函数：判断 `/proc/<pid>/comm`（或 `ps -p <pid> -o comm=`）输出是否为
+/// agentd 进程，用于 kill 前的身份校验。
+///
+/// Linux 内核把 comm 截断为 15 字符（TASK_COMM_LEN=16 含结尾 NUL），二进制名
+/// `termbridge-agentd`（17 字符）在 comm 里实际是 `termbridge-agen`；因此接受
+/// 完整名与恰好 15 字符的前缀截断两种形态。其余（bash、更短的前缀如
+/// `termbridge`、空输出等）一律拒绝——pid 被无关进程复用时绝不能 kill。（可单测）
+fn is_agentd_comm(comm_output: &str) -> bool {
+    const AGENTD_BIN: &str = "termbridge-agentd";
+    let comm = comm_output.trim();
+    if comm.is_empty() {
+        return false;
+    }
+    comm == AGENTD_BIN || (comm.len() == 15 && AGENTD_BIN.starts_with(comm))
+}
+
+/// 纯函数：从远端 version 文件内容提取 build 字段。
 ///
 /// version 文件由 deploy_runtime 写入：`{"protocol_version":1,"build":"0.1.0"}`。
-/// 内容为空 / JSON 解析失败 / build 字段缺失或类型不符 / 与 BUILD_VERSION 不一致
-/// → false（调用方视为 NeedsUpgrade 重新部署）。（可单测）
-fn remote_version_matches(version_file_stdout: &str) -> bool {
+/// 内容为空 / JSON 解析失败 / build 字段缺失或类型不符 → None（调用方视为
+/// NeedsUpgrade 重新部署；升级日志中显示为 "?"）。（可单测）
+fn parse_remote_build(version_file_stdout: &str) -> Option<String> {
     let trimmed = version_file_stdout.trim();
     if trimmed.is_empty() {
-        return false;
+        return None;
     }
     serde_json::from_str::<serde_json::Value>(trimmed)
         .ok()
         .and_then(|v| {
             v.get("build")
                 .and_then(|b| b.as_str())
-                .map(|b| b == BUILD_VERSION)
+                .map(|b| b.to_string())
         })
-        .unwrap_or(false)
+}
+
+/// 纯函数：部署 runtime 后是否需要停止旧 daemon（open() 升级路径的决策点）。
+///
+/// 仅 `NeedsUpgrade`（升级部署：磁盘上的二进制已被 mv -f 替换，但旧 daemon
+/// 进程仍在内存里跑旧版本）→ true；`Missing`（首次部署：远端从未有过 daemon，
+/// 没有东西可停）→ false；`Stopped` / `Running` 不走 deploy 分支，防御性返回
+/// false。（可单测）
+fn should_stop_daemon_after_deploy(state: &RemoteRuntimeState) -> bool {
+    matches!(state, RemoteRuntimeState::NeedsUpgrade)
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -1232,26 +1625,137 @@ mod tests {
     }
 
     #[test]
-    fn remote_version_matches_detects_mismatch() {
-        // 与 BUILD_VERSION 一致 → true
+    fn parse_remote_build_extracts_build_field() {
+        // 与 BUILD_VERSION 一致 → Some(BUILD_VERSION)（check_remote_runtime 视为版本匹配）
         let ok = format!(
             "{{\"protocol_version\":{},\"build\":\"{}\"}}",
             PROTOCOL_VERSION, BUILD_VERSION
         );
-        assert!(remote_version_matches(&ok), "相同 build 应匹配: {ok}");
-        // cat 输出带尾部换行 → 仍匹配
-        assert!(remote_version_matches(&format!("{ok}\n")));
+        assert_eq!(
+            parse_remote_build(&ok),
+            Some(BUILD_VERSION.to_string()),
+            "相同 build 应解析出来: {ok}"
+        );
+        // cat 输出带尾部换行 → 仍解析成功
+        assert_eq!(parse_remote_build(&format!("{ok}\n")), Some(BUILD_VERSION.to_string()));
 
-        // build 不一致 → NeedsUpgrade（重新部署）
-        assert!(!remote_version_matches(
-            r#"{"protocol_version":1,"build":"0.0.9"}"#
-        ));
-        // 内容为空 / 纯空白（version 文件缺失但 cat 未报错的兜底）
-        assert!(!remote_version_matches(""));
-        assert!(!remote_version_matches("   \n"));
-        // JSON 解析失败 / build 字段缺失 → NeedsUpgrade
-        assert!(!remote_version_matches("garbage"));
-        assert!(!remote_version_matches(r#"{"protocol_version":1}"#));
+        // build 不一致 → Some(旧版本)，调用方判 NeedsUpgrade（升级日志显示 x→y）
+        assert_eq!(
+            parse_remote_build(r#"{"protocol_version":1,"build":"0.0.9"}"#),
+            Some("0.0.9".to_string())
+        );
+        // 内容为空 / 纯空白（version 文件缺失但 cat 未报错的兜底）→ None
+        assert_eq!(parse_remote_build(""), None);
+        assert_eq!(parse_remote_build("   \n"), None);
+        // JSON 解析失败 / build 字段缺失或类型不符 → None
+        assert_eq!(parse_remote_build("garbage"), None);
+        assert_eq!(parse_remote_build(r#"{"protocol_version":1}"#), None);
+        assert_eq!(parse_remote_build(r#"{"build":123}"#), None, "build 非字符串");
+    }
+
+    // ── stop_remote_daemon / restart_remote_daemon 纯逻辑 ────────────────
+
+    #[test]
+    fn parse_pid_file_accepts_plain_decimal_pid() {
+        // agentd bootstrap 写入格式：一行十进制 pid（fs::write(path, format!("{pid}"))）
+        assert_eq!(parse_pid_file("1234\n"), Some(1234));
+        assert_eq!(parse_pid_file("  42  "), Some(42));
+        assert_eq!(parse_pid_file("4294967295"), Some(u32::MAX));
+    }
+
+    #[test]
+    fn parse_pid_file_rejects_invalid_content() {
+        // 空文件 / 纯空白 / 非数字 → daemon 视为未运行，绝不盲杀
+        assert_eq!(parse_pid_file(""), None);
+        assert_eq!(parse_pid_file("   \n"), None);
+        assert_eq!(parse_pid_file("abc"), None);
+        assert_eq!(parse_pid_file("0"), None, "pid 0 非法（kill 0 会打进程组）");
+        assert_eq!(parse_pid_file("-1"), None, "负号不是数字");
+        assert_eq!(parse_pid_file("99999999999"), None, "u32 溢出");
+        assert_eq!(parse_pid_file("12 34"), None, "中间空白 → 非全数字");
+    }
+
+    #[test]
+    fn is_agentd_comm_accepts_full_and_truncated_names() {
+        // /proc/<pid>/comm 截断为 15 字符（TASK_COMM_LEN=16 含 NUL）：
+        // termbridge-agentd（17 字符）→ "termbridge-agen"
+        assert!(is_agentd_comm("termbridge-agen\n"));
+        assert!(is_agentd_comm("termbridge-agentd"));
+        assert!(is_agentd_comm("  termbridge-agentd  \n"), "ps 输出前后空白应容忍");
+    }
+
+    #[test]
+    fn is_agentd_comm_rejects_other_processes() {
+        // kill 前身份校验：pid 被无关进程复用时必须拒绝
+        assert!(!is_agentd_comm("bash"));
+        assert!(!is_agentd_comm("sshd\n"));
+        assert!(!is_agentd_comm("termbridge"), "更短的前缀不算（防止误杀同名前缀进程）");
+        assert!(!is_agentd_comm("termbridge-agent"), "16 字符截断形态不存在且非精确匹配");
+        assert!(!is_agentd_comm(""));
+        assert!(!is_agentd_comm("\n"));
+        assert!(!is_agentd_comm("termbridge-agentdd"), "比完整名更长不算");
+    }
+
+    #[test]
+    fn should_stop_daemon_after_deploy_only_for_upgrade() {
+        // 升级部署（NeedsUpgrade）：旧 daemon 进程仍在跑旧二进制 → 需要先 stop，
+        // 随后的 bootstrap 才会以新二进制 spawn
+        assert!(should_stop_daemon_after_deploy(&RemoteRuntimeState::NeedsUpgrade));
+        // 首次部署（Missing）：远端从未有过 daemon → 不 stop
+        assert!(!should_stop_daemon_after_deploy(&RemoteRuntimeState::Missing));
+        // 不走 deploy 分支的状态：防御性 false
+        assert!(!should_stop_daemon_after_deploy(&RemoteRuntimeState::Stopped));
+        assert!(!should_stop_daemon_after_deploy(&RemoteRuntimeState::Running));
+    }
+
+    #[test]
+    fn remote_daemon_stop_result_serializes_with_status_tag() {
+        // tag = status：调用方可区分"没在跑"（非失败）与"已停止"
+        let stopped = serde_json::to_value(RemoteDaemonStopResult::Stopped {
+            pid: 4321,
+            forced: true,
+        })
+        .unwrap();
+        assert_eq!(stopped["status"], "stopped");
+        assert_eq!(stopped["pid"], 4321);
+        assert_eq!(stopped["forced"], true);
+
+        let not_running = serde_json::to_value(RemoteDaemonStopResult::NotRunning {
+            reason: "pid 文件不存在（daemon 从未启动或已被清理）".into(),
+        })
+        .unwrap();
+        assert_eq!(not_running["status"], "not_running");
+        assert_eq!(not_running["reason"], "pid 文件不存在（daemon 从未启动或已被清理）");
+    }
+
+    #[test]
+    fn restart_report_serialization_contract() {
+        let report = RemoteDaemonRestartReport {
+            stopped: true,
+            was_running: true,
+            deployed: true,
+            version_before: Some("0.0.9".into()),
+            version_after: BUILD_VERSION.to_string(),
+            restarted: true,
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["stopped"], true);
+        assert_eq!(json["was_running"], true);
+        assert_eq!(json["deployed"], true);
+        assert_eq!(json["version_before"], "0.0.9");
+        assert_eq!(json["version_after"], BUILD_VERSION);
+        assert_eq!(json["restarted"], true);
+
+        // version_before 未知（Missing / version 文件无法解析）→ 字段整体省略
+        let unknown = RemoteDaemonRestartReport {
+            version_before: None,
+            ..report
+        };
+        let json = serde_json::to_value(&unknown).unwrap();
+        assert!(
+            json.get("version_before").is_none(),
+            "未知 version_before 应省略字段: {json}"
+        );
     }
 
     #[test]

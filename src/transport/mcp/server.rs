@@ -1,4 +1,4 @@
-//! rmcp MCP server —— 20 工具映射到 application 层（§6 / §7.4 Phase 1-2 / Phase 3-B / Phase 4-A / Phase 5-A-B / ADR-0009）
+//! rmcp MCP server —— 21 工具映射到 application 层（§6 / §7.4 Phase 1-2 / Phase 3-B / Phase 4-A / Phase 5-A-B / ADR-0009 / agentd 升级路径）
 //!
 //! 工具：
 //! 1. `list_hosts`            → HostManager::list_hosts
@@ -21,6 +21,7 @@
 //! 18. `bootstrap_host`       → BootstrapHost::bootstrap（ADR-0009，首次 SSH key 部署）
 //! 19. `reconnect_session`    → SessionManager::reconnect_session（Phase 6-A，ADR-0010，断线重连）
 //! 20. `resize`               → SessionManager::resize（调整 PTY 尺寸）
+//! 21. `restart_remote_daemon` → SessionManager::restart_remote_daemon（agentd 升级路径，重启远端 daemon）
 //!
 //! 错误格式（§6.1）：`CallToolResult::structured_error({code, message, retriable})`
 //! 成功格式：`CallToolResult::structured({工具特定结构})`
@@ -317,6 +318,16 @@ pub struct BootstrapHostParams {
 pub struct ReconnectSessionParams {
     /// Session ID returned by open_session (must be in Lost state)
     pub session_id: String,
+}
+
+/// restart_remote_daemon 参数（agentd 升级路径）。
+///
+/// `host` 语义与 open_session 一致：SSH host alias / 直连主机名，
+/// 经 sshconfig::resolve（ssh -G）解析。
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct RestartRemoteDaemonParams {
+    /// SSH host alias (from ~/.ssh/config) or direct hostname/IP
+    pub host: String,
 }
 
 // ── 返回类型 ──────────────────────────────────────────────────────────────
@@ -917,6 +928,29 @@ async fn sftp_chmod(
         Parameters(params): Parameters<ReconnectSessionParams>,
     ) -> CallToolResult {
         match self.session_manager.reconnect_session(&params.session_id).await {
+            Ok(result) => ok_result(result),
+            Err(e) => err_result(&e),
+        }
+    }
+
+    /// Restart the remote agentd daemon（agentd 升级路径，Phase 3 升级闭环）。
+    ///
+    /// 945f014 落地的升级路径只原子替换磁盘上的二进制（mv -f），运行中的旧
+    /// daemon 会一直服务到进程重启——本工具补上"触发重启"这最后一环：确保
+    /// runtime → 停止旧 daemon → bootstrap 新 daemon → hello 验证版本。
+    ///
+    /// 破坏性：杀掉 daemon 会使所有经它接入的 session 失效（attached → Lost，
+    /// PTY 进程收 SIGHUP），工具描述必须向 Agent 声明。
+    #[tool(description = "Restart the remote termbridge-agentd daemon on a host. Ensures the remote runtime is present (deploys the local agentd binary when missing or version-mismatched), kills the running daemon (SIGTERM with a 5s grace period, then SIGKILL; the pid from the remote pid file is validated via /proc/<pid>/comm before any kill, so a stale or reused pid is never killed), then bootstraps a fresh daemon and verifies the hello/version handshake. WARNING: this kills the remote daemon - sessions currently attached through it will be lost (state becomes 'lost') and their PTY processes get SIGHUP; detached remote sessions are destroyed as well. Use this to apply a freshly deployed agentd upgrade (open_session only replaces the binary on disk; the running daemon keeps serving the old build until restarted). Returns {stopped, was_running, deployed, version_before?, version_after, restarted}. restarted=false means bootstrap found the daemon still alive (it was not killed, e.g. a stale pid file) and the old daemon keeps serving - version_after then reflects the old build.")]
+    async fn restart_remote_daemon(
+        &self,
+        Parameters(params): Parameters<RestartRemoteDaemonParams>,
+    ) -> CallToolResult {
+        match self
+            .session_manager
+            .restart_remote_daemon(&params.host)
+            .await
+        {
             Ok(result) => ok_result(result),
             Err(e) => err_result(&e),
         }

@@ -37,12 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 **SSH / PTY（termbridge core）**
 - PTY rows/cols 与 russh 参数顺序对齐（russh 为 col-first），修正初始窗口尺寸颠倒
 - SSH connect / exec / SFTP open / PTY write / `ssh -G` 全部补齐超时，无响应主机不再永久挂起；新增 host 别名注入防护与 known_hosts 引号路径解析
+- `SshProvider::exec` 收集循环加 120s 总超时（channel_open 同步加界）；`exec_stream`（proxy 长生命通道）仅 channel_open 加界，数据循环有意保持无界
+- SFTP 下载本地临时文件改 pid+毫秒命名（原固定 `.termbridge.tmp` 并发下载同一目标互覆）
 - 输出链路：`extract_context` 返回匹配文本；`strip_ansi` 修复 CSI 中间字节剥离与跨页状态；RingBuffer 改 watch 唤醒，避免读取空转
 - `sftp_chmod` 拒绝 mode=0（防止把文件权限清零）；SFTP 上传改原子写（temp + fsync + rename）；`sftp_transfer_dir` 下载校验目标目录名
 - Timeline 缓冲改用 `VecDeque`，避免大 session 下的频繁内存搬移
 - Unix 缓存路径统一走 `dirs` crate（遵循 XDG）；CLI 读消息增加长度边界校验；日志脱敏补全（Secret Debug redaction + URL userinfo redact）
 
 **agentd（远端 daemon；新增单元测试需 Linux CI 跑通）**
+- 新增 MCP 工具 `restart_remote_daemon`：pid 文件校验（/proc comm 防误杀）→ SIGTERM/5s 宽限/-9 兜底 → 清理 socket → bootstrap 新 daemon；升级部署（NeedsUpgrade）后同一流程内自动重启生效
 - 补齐 pty_exit / session_lost 事件 + 通知驱动泵 + tail flush；修复 disconnect→detach 后 reconnect 的输出丢失
 - `send_input` 改独立 writer 线程 + 背压，大输入不再阻塞 read loop
 - 进程安全：FD_CLOEXEC、fork 前完成内存分配（fork-before-exec）、进程组 kill + reap；日志改走 stderr，不污染 PTY
