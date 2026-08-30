@@ -186,7 +186,8 @@ impl SftpProvider {
     /// 下载远端文件到本地（**原子写**）。
     ///
     /// 流程（ADR-0005 §5）：
-    /// 1. 写到临时文件 `local + ".termbridge.tmp"`
+    /// 1. 写到临时文件 `<local>.termbridge-tmp-<pid>-<millis>`（同目录，pid +
+    ///    毫秒时间戳防并发下载互覆）
     /// 2. fsync 临时文件
     /// 3. rename 临时文件 → local（POSIX 原子）
     /// 4. 任一步失败 → 清理临时文件
@@ -195,9 +196,9 @@ impl SftpProvider {
     pub async fn download(&self, remote: &str, local: &Path) -> Result<(), TermError> {
         tracing::info!(remote = remote, local = ?local, "sftp download: starting");
 
-        // 临时文件路径：在目标路径后追加 ".termbridge.tmp"。
+        // 临时文件路径：与目标同目录，pid + 毫秒时间戳防并发互覆。
         // 不用 with_extension（会替换扩展名），直接拼接保证路径稳定。
-        let tmp: PathBuf = format!("{}.termbridge.tmp", local.to_string_lossy()).into();
+        let tmp = local_tmp_path(local);
 
         // 主流程：任一异常都跳到清理临时文件
         let result: Result<(), TermError> = async {
@@ -624,6 +625,23 @@ fn remote_tmp_path(remote: &str) -> String {
     format!("{parent}{name}.termbridge-tmp-{}-{millis}", std::process::id())
 }
 
+/// 本地临时文件路径（download 原子写用）：`<local>.termbridge-tmp-<pid>-<millis>`。
+///
+/// 与 `remote_tmp_path` 同策略——pid + 毫秒时间戳避免并发下载同一目标时
+/// 互相覆盖临时文件（旧固定名 `.termbridge.tmp` 会互踩）。
+fn local_tmp_path(local: &Path) -> PathBuf {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!(
+        "{}.termbridge-tmp-{}-{millis}",
+        local.to_string_lossy(),
+        std::process::id()
+    )
+    .into()
+}
+
 /// 用临时文件替换远端目标（upload 原子写的最后一步）。
 ///
 /// 优先直接 rename（目标不存在，或服务器允许覆盖 rename 时一步完成）；
@@ -835,23 +853,36 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
-    /// tmp 路径生成策略：`local + ".termbridge.tmp"`。
-    /// 验证不同扩展名的 local 路径都能生成稳定的 tmp 路径（不会被 with_extension 误改）。
+    /// tmp 路径生成策略：`<local>.termbridge-tmp-<pid>-<millis>`。
+    /// 验证不同扩展名的 local 路径都原样保留（不会被 with_extension 误改）、
+    /// 落在同一目录，且包含 pid 标识。
     #[test]
     fn tmp_path_appended_not_replaced() {
-        let local = Path::new("/tmp/foo.txt");
-        let tmp: PathBuf = format!("{}.termbridge.tmp", local.to_string_lossy()).into();
-        assert_eq!(tmp, PathBuf::from("/tmp/foo.txt.termbridge.tmp"));
-
-        // 无扩展名
-        let local = Path::new("/tmp/noext");
-        let tmp: PathBuf = format!("{}.termbridge.tmp", local.to_string_lossy()).into();
-        assert_eq!(tmp, PathBuf::from("/tmp/noext.termbridge.tmp"));
-
-        // 多扩展名
-        let local = Path::new("/tmp/a.tar.gz");
-        let tmp: PathBuf = format!("{}.termbridge.tmp", local.to_string_lossy()).into();
-        assert_eq!(tmp, PathBuf::from("/tmp/a.tar.gz.termbridge.tmp"));
+        let cases = [
+            "/tmp/foo.txt",
+            "/tmp/noext",
+            "/tmp/a.tar.gz",
+            "/tmp/dir with space/x",
+        ];
+        for local in cases {
+            let tmp = local_tmp_path(Path::new(local));
+            let s = tmp.to_string_lossy();
+            // 原路径完整保留在前（append 而非 replace）
+            assert!(
+                s.starts_with(&format!("{local}.termbridge-tmp-")),
+                "local '{local}' → '{s}'"
+            );
+            // 含 pid 标识
+            assert!(
+                s.contains(&format!(".termbridge-tmp-{}", std::process::id())),
+                "local '{local}' → '{s}'"
+            );
+            // 同目录
+            assert_eq!(
+                tmp.parent().map(|p| p.to_path_buf()),
+                Path::new(local).parent().map(|p| p.to_path_buf())
+            );
+        }
     }
 
     // ── 修复 P2-3：upload 远端临时文件路径 ────────────────────────
