@@ -6,6 +6,7 @@
 //! 传输层与业务逻辑通过 ControlHandler trait 解耦。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -38,7 +39,7 @@ impl ControlServer {
     /// - spawn 监听 task
     pub async fn start(handler: Arc<dyn ControlHandler>) -> std::io::Result<Self> {
         let token = generate_token();
-        let endpoint = generate_endpoint(&token);
+        let endpoint = generate_endpoint();
 
         // 创建 Unix socket 监听（Windows Named Pipe 第一版暂用 Unix socket 的
         // tokio 支持；Windows 实现见 TODO 注释）
@@ -69,8 +70,16 @@ impl ControlServer {
         endpoint: String,
         token: String,
     ) -> std::io::Result<Self> {
-        // 确保旧 socket 文件不存在
-        let _ = std::fs::remove_file(&endpoint);
+        // 仅当残留 socket 已死（connect 失败）时才删除：无条件的 remove_file
+        // 会在端点碰撞时把其他存活实例的 socket 一并删除（历史上端点 ID 仅
+        // 24 bit，见 generate_endpoint）。若 connect 成功（存活实例占用），
+        // 下方 bind 会以地址占用失败并向上返回错误。
+        if std::path::Path::new(&endpoint).exists() {
+            let stale = UnixStream::connect(&endpoint).await.is_err();
+            if stale {
+                let _ = std::fs::remove_file(&endpoint);
+            }
+        }
 
         // 确保父目录存在（bind 不创建父目录；XDG_RUNTIME_DIR 未设置时
         // 兜底 /tmp 下的 termbridge 目录可能不存在）
@@ -219,38 +228,53 @@ impl ControlServer {
         let mut reader = BufReader::new(read_half);
         let mut line = String::new();
 
-        // 1. HELLO 认证（第一条消息必须是 HELLO + token）
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            return Ok(()); // 连接立即关闭
-        }
+        // 1. HELLO 认证（第一条消息必须是 HELLO + token）。
+        //
+        //    威胁模型：Unix socket 为 0600，但 Windows TCP loopback 上任意本地
+        //    用户都可连接，可对认证 token 做本地跨用户暴力枚举。纵深防御：
+        //    - 每次失败响应前先 sleep HELLO_FAIL_DELAY，抬高枚举成本；
+        //    - 每连接最多容忍 MAX_HELLO_ATTEMPTS 次失败后断开。
+        //    token 本身为 128-bit CSPRNG（枚举空间不可行），限速是二道防线。
+        const MAX_HELLO_ATTEMPTS: u32 = 5;
+        const HELLO_FAIL_DELAY: Duration = Duration::from_millis(250);
 
-        let hello: HelloRequest = match serde_json::from_str(line.trim()) {
-            Ok(h) => h,
-            Err(_) => {
-                let resp = HelloResponse {
-                    ok: false,
-                    error: Some("expected HELLO with token".into()),
-                };
-                write_half
-                    .write_all(serde_json::to_string(&resp)?.as_bytes())
-                    .await?;
-                write_half.write_all(b"\n").await?;
-                return Ok(());
+        let mut authenticated = false;
+        for attempt in 1..=MAX_HELLO_ATTEMPTS {
+            line.clear();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                return Ok(()); // 连接立即关闭
             }
-        };
 
-        if hello.token != token {
+            // 解析失败与 token 错误同样计入失败次数（对恶意/失步客户端无差别限速）
+            let parsed: Option<HelloRequest> = serde_json::from_str(line.trim()).ok();
+            if parsed
+                .as_ref()
+                .map(|h| h.token == token)
+                .unwrap_or(false)
+            {
+                authenticated = true;
+                break;
+            }
+
+            tracing::warn!(attempt, "Control IPC: HELLO rejected");
+            tokio::time::sleep(HELLO_FAIL_DELAY).await;
             let resp = HelloResponse {
                 ok: false,
-                error: Some("invalid token".into()),
+                error: Some(if parsed.is_none() {
+                    "expected HELLO with token".into()
+                } else {
+                    "invalid token".into()
+                }),
             };
             write_half
                 .write_all(serde_json::to_string(&resp)?.as_bytes())
                 .await?;
             write_half.write_all(b"\n").await?;
-            tracing::warn!("Control IPC: HELLO token mismatch, rejecting");
+        }
+
+        if !authenticated {
+            tracing::warn!("Control IPC: HELLO failed too many times, closing connection");
             return Ok(());
         }
 
@@ -389,21 +413,34 @@ impl Drop for ControlServer {
     }
 }
 
-/// 生成随机 token（16 字符 hex）。
+/// 生成随机认证 token（32 字符 hex = 128 bit CSPRNG 熵）。
+///
+/// Control plane 的唯一认证手段（HELLO 通过后可 `session.set_approval_mode`
+/// 等修改会话策略），token 必须不可预测。早期实现用 `时间戳 ^ pid`，熵为零，
+/// 本地攻击者可直接推断，已改为 OS CSPRNG。
 fn generate_token() -> String {
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id() as u128;
-    format!("{:016x}", ts ^ (pid << 64))
+    use rand::Rng;
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// 生成 IPC 端点路径。
-fn generate_endpoint(token: &str) -> String {
-    let id = &token[..6.min(token.len())];
+///
+/// 端点 ID 含完整 pid + 随机后缀，保证跨进程唯一：早期实现取 token 前 6 个
+/// hex 字符（仅 24 bit），pid ≥ 2^24 时不同进程可能碰撞，`start_unix` 的无条件
+/// remove_file 会删掉其他存活实例的 socket（现已改为 liveness probe，双保险）。
+fn generate_endpoint() -> String {
+    use rand::Rng;
+    let mut suffix = [0u8; 4];
+    rand::rng().fill_bytes(&mut suffix);
+    let id = format!(
+        "{}-{}",
+        std::process::id(),
+        suffix.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    );
     if cfg!(target_os = "linux") || cfg!(target_os = "macos") {
-        // $XDG_RUNTIME_DIR/termbridge/mcp-<id>.sock
+        // $XDG_RUNTIME_DIR/termbridge/mcp-<pid>-<rand>.sock
         let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
         format!("{base}/termbridge/mcp-{id}.sock")
     } else {
@@ -416,6 +453,31 @@ fn generate_endpoint(token: &str) -> String {
 mod tests {
     use super::*;
     use super::super::proto::SessionControlInfo;
+
+    #[test]
+    fn generate_token_is_128bit_csprng_hex() {
+        let t1 = generate_token();
+        let t2 = generate_token();
+        assert_eq!(t1.len(), 32, "token 应为 32 个 hex 字符（128 bit）");
+        assert!(
+            t1.chars().all(|c| c.is_ascii_hexdigit()),
+            "token 应全部为 hex 字符: {t1}"
+        );
+        assert_ne!(t1, t2, "CSPRNG token 不应重复");
+    }
+
+    #[test]
+    fn generate_endpoint_is_unique_per_process() {
+        // 端点 ID 含 pid + 随机后缀：同进程内两次生成不应碰撞（历史实现取
+        // token 前 6 字符，仅 24 bit，跨进程碰撞会误删其他实例的 socket）
+        let e1 = generate_endpoint();
+        let e2 = generate_endpoint();
+        assert_ne!(e1, e2);
+        assert!(
+            e1.contains(&format!("mcp-{}-", std::process::id())),
+            "端点应包含 pid: {e1}"
+        );
+    }
 
     struct StubHandler {
         sessions: Vec<SessionControlInfo>,

@@ -7,6 +7,7 @@
 //! - Windows: %TEMP%/termbridge/mcp-<instance>.json
 //!
 //! 文件内容：pid / endpoint / token / started_at / protocol_version
+//! 文件权限（Unix）：0600，父目录由本进程新创建时 0700（文件含 token，不可全局可读）。
 //! MCP Server 退出时删除文件（Drop 时尽力清理）。
 
 use std::path::PathBuf;
@@ -45,13 +46,25 @@ impl InstanceRegistry {
     ///
     /// - `endpoint`: IPC 端点路径
     /// - `token`: 随机认证 token
+    ///
+    /// 权限（Unix）：文件写入后收紧为 0600（Windows 无 POSIX 权限模型，保持
+    /// 默认 ACL 不变）；父目录由本进程新创建时收紧为 0700（`/tmp/termbridge`
+    /// 回退路径默认 0755，目录列表 + 读文件会让同机其他用户拿到 token）。
     pub fn register(endpoint: String, token: String) -> std::io::Result<Self> {
         let instance_id = generate_instance_id();
         let file_path = instance_file_path(&instance_id);
 
         // 确保父目录存在
         if let Some(parent) = file_path.parent() {
+            #[cfg(unix)]
+            let created_by_us = !parent.exists();
             std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            if created_by_us {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
 
         let info = InstanceInfo {
@@ -66,6 +79,16 @@ impl InstanceRegistry {
         let json = serde_json::to_string_pretty(&info)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         std::fs::write(&file_path, json)?;
+
+        // discovery 文件含 pid/endpoint/token，收紧为 0600（Unix；Windows noop）
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(
+                &file_path,
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
 
         tracing::info!(
             file = %file_path.display(),

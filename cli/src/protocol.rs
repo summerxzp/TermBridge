@@ -15,6 +15,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// CLI build 版本
 pub const BUILD_VERSION: &str = "0.1.0";
 
+/// 单条消息最大长度（128MB，与 agentd/protocol.rs 的 MAX_MSG_LEN 保持一致）。
+/// 防止长度前缀被破坏 / 流失步时按任意 32-bit 长度分配内存（最大 ~4GiB）→ OOM。
+pub const MAX_MSG_LEN: u32 = 128 * 1024 * 1024;
+
 /// 请求（client → daemon）。`id` 用于匹配请求/响应。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
@@ -111,11 +115,23 @@ pub async fn write_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &impl Serialize) -
 }
 
 /// 异步读一条 length-prefixed JSON 消息，返回解析后的 JSON Value
+///
+/// 长度校验与 agentd 一致：`len == 0` 与 `len > MAX_MSG_LEN` 直接拒绝
+/// （防止失步/被篡改的长度前缀触发超大分配 → OOM）。
 pub async fn read_msg<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<serde_json::Value> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    let mut buf = vec![0u8; len];
+    let len = u32::from_be_bytes(len_buf);
+    if len == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "消息长度为 0"));
+    }
+    if len > MAX_MSG_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("消息长度 {} 超过上限 {}", len, MAX_MSG_LEN),
+        ));
+    }
+    let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf).await?;
     serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
@@ -274,5 +290,35 @@ mod tests {
         let mut cursor = std::io::Cursor::new(buf);
         let result = read_msg(&mut cursor).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_msg_rejects_zero_length() {
+        // len == 0：与 agentd 一致直接拒绝（InvalidData）
+        let buf = 0u32.to_be_bytes().to_vec();
+        let mut cursor = std::io::Cursor::new(buf);
+        let result = read_msg(&mut cursor).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn test_read_msg_rejects_oversized_length() {
+        // len > MAX_MSG_LEN：直接拒绝且不按该长度分配内存（OOM 防护）
+        let buf = (MAX_MSG_LEN + 1).to_be_bytes().to_vec();
+        let mut cursor = std::io::Cursor::new(buf);
+        let result = read_msg(&mut cursor).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn test_read_msg_rejects_u32_max_length() {
+        // 极端值：长度前缀为 0xFFFFFFFF（失步时常见的垃圾字节模式）同样拒绝
+        let buf = u32::MAX.to_be_bytes().to_vec();
+        let mut cursor = std::io::Cursor::new(buf);
+        let result = read_msg(&mut cursor).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 }

@@ -70,10 +70,13 @@ type ReadHalf = russh::ChannelReadHalf;
 /// 远端 daemon runtime 探测结果。
 ///
 /// - `Missing`：agentd 二进制未部署（`test -x` 失败或 version 文件不存在）
-/// - `Stopped`：二进制已部署但 daemon 进程未运行（`pgrep` 无输出）
+/// - `NeedsUpgrade`：二进制已部署但 version 文件的 build 与客户端 BUILD_VERSION
+///   不一致（或内容无法解析）——远端 agentd 需随客户端升级重新部署
+/// - `Stopped`：二进制已部署且版本一致，但 daemon 进程未运行（`pgrep` 无输出）
 /// - `Running`：daemon 进程已在运行（`pgrep` 有输出）
 enum RemoteRuntimeState {
     Missing,
+    NeedsUpgrade,
     Stopped,
     Running,
 }
@@ -781,8 +784,11 @@ impl TerminalProvider for PersistentProvider {
 
         // 1. 检查远端 runtime 状态
         let state = self.check_remote_runtime(host).await?;
-        if matches!(state, RemoteRuntimeState::Missing) {
-            tracing::info!(host = %host.name, "remote runtime missing, deploying");
+        if matches!(
+            state,
+            RemoteRuntimeState::Missing | RemoteRuntimeState::NeedsUpgrade
+        ) {
+            tracing::info!(host = %host.name, "remote runtime missing or outdated, deploying");
             self.deploy_runtime(host).await?;
         }
 
@@ -901,11 +907,12 @@ impl PersistentProvider {
 
     /// 探测远端 runtime 状态。
     ///
-    /// 1. `test -x <bin> && cat <version>` → 失败 = Missing；成功 = 二进制存在
+    /// 1. `test -x <bin> && cat <version>` → 失败 = Missing；成功后比对 version
+    ///    文件的 build 字段与客户端 BUILD_VERSION，不一致/无法解析 = NeedsUpgrade
     /// 2. `pgrep -f termbridge-agentd` → 有输出 = Running；无输出/失败 = Stopped
     async fn check_remote_runtime(&self, host: &Host) -> Result<RemoteRuntimeState, TermError> {
         // 1. 检查二进制 + version 文件
-        let bin_check = self
+        let version_out = match self
             .ssh
             .exec(
                 host,
@@ -915,13 +922,27 @@ impl PersistentProvider {
                     Self::REMOTE_VERSION
                 ),
             )
-            .await;
-        if bin_check.is_err() {
-            tracing::info!(host = %host.name, "remote runtime: missing (binary/version not found)");
-            return Ok(RemoteRuntimeState::Missing);
+            .await
+        {
+            Ok(out) => out,
+            Err(_) => {
+                tracing::info!(host = %host.name, "remote runtime: missing (binary/version not found)");
+                return Ok(RemoteRuntimeState::Missing);
+            }
+        };
+
+        // 2. 版本比对：远端 build 与客户端 BUILD_VERSION 不一致（或 version 文件
+        //    内容无法解析）→ NeedsUpgrade，由调用方重新部署。早期实现只检查文件
+        //    存在性，远端 agentd 版本落后时永远不会升级。
+        if !remote_version_matches(&version_out) {
+            tracing::info!(
+                host = %host.name,
+                "remote runtime: version mismatch/unknown, needs upgrade"
+            );
+            return Ok(RemoteRuntimeState::NeedsUpgrade);
         }
 
-        // 2. 检查 daemon 进程是否运行
+        // 3. 检查 daemon 进程是否运行
         let pgrep = self.ssh.exec(host, "pgrep -f termbridge-agentd").await;
         let running = matches!(pgrep, Ok(out) if !out.trim().is_empty());
         if running {
@@ -933,16 +954,19 @@ impl PersistentProvider {
         }
     }
 
-    /// 部署远端 runtime：SFTP 上传 agentd 二进制 + 写 version 文件。
+    /// 部署远端 runtime：SFTP 上传 agentd 二进制 + 写 version 文件（原子替换）。
     ///
     /// 流程：
     /// 1. 检查本地 agentd 二进制存在（`local_agentd_path()`），不存在 → `RuntimeMissing`
     /// 2. SSH exec `mkdir -p <remote_dir>`
-    /// 3. SFTP upload 本地二进制 → 远端 `<remote_bin>`
-    ///    （通过临时 SSH session + `SshTerminalHandle::open_sftp_provider`）
-    /// 4. SSH exec `chmod +x <remote_bin>`
-    /// 5. SSH exec 写 version 文件
-    /// 6. 任一步失败 → `RuntimeDeployFailed`
+    /// 3. SFTP upload 本地二进制 → 远端 `<remote_bin>.termbridge-tmp`
+    ///    （同目录临时文件；通过临时 SSH session + `SshTerminalHandle::open_sftp_provider`）
+    /// 4. SSH exec `chmod 0755 <tmp>` + `mv -f <tmp> <remote_bin>`（同目录 → 同一
+    ///    文件系统 → rename(2) 原子替换；直接上传到最终路径被中断会留下"可执行
+    ///    但截断"的二进制，且 check_remote_runtime 不再报 Missing → 主机永久损坏
+    ///    需手工清理）
+    /// 5. SSH exec 写 version 文件（在成功替换之后写，保证 version 与实际二进制一致）
+    /// 6. 任一步失败 → `RuntimeDeployFailed`（尽力清理 tmp 残留）
     async fn deploy_runtime(&self, host: &Host) -> Result<(), TermError> {
         // 首次使用自动从发布包内置 resources/agentd 自举到本地缓存（wrapper/平台包
         // 均保持 exe 同目录布局，故可稳定解析）；都不可用才报 RuntimeMissing
@@ -969,13 +993,15 @@ impl PersistentProvider {
         let remote_dir = format!("{home}/.local/share/termbridge");
         let remote_bin = format!("{remote_dir}/termbridge-agentd");
         let remote_version = format!("{remote_dir}/agentd.version");
+        // 原子部署的临时文件：与最终路径同目录（同一文件系统，mv 才是 rename(2)）
+        let remote_tmp = format!("{remote_bin}.termbridge-tmp");
 
         // mkdir
         self.ssh
             .exec(host, &format!("mkdir -p {remote_dir}"))
             .await?;
 
-        // SFTP upload（开临时 SSH session，复用 SshTerminalHandle::open_sftp_provider）
+        // SFTP upload → tmp 文件（开临时 SSH session，复用 SshTerminalHandle::open_sftp_provider）
         let temp_req = OpenTerminalRequest {
             host: host.clone(),
             pty_size: PtySize::default(),
@@ -994,21 +1020,38 @@ impl PersistentProvider {
                     )
                 })?;
             let sftp = ssh_handle.open_sftp_provider().await?;
-            sftp.upload(&local_path, &remote_bin).await?;
+            sftp.upload(&local_path, &remote_tmp).await?;
             sftp.close().await.ok();
             Ok(())
         }
         .await;
         // 无论上传成功与否都 close 临时 session
         let _ = handle.close().await;
-        deploy_result?;
+        if let Err(e) = deploy_result {
+            // 上传失败：清理半成品 tmp（尽力而为）
+            let _ = self.ssh.exec(host, &format!("rm -f {remote_tmp}")).await;
+            return Err(e);
+        }
 
-        // chmod +x
-        self.ssh
-            .exec(host, &format!("chmod +x {remote_bin}"))
-            .await?;
+        // chmod 0755 + 原子替换（同目录 mv → rename(2)）：最终路径要么是完整的
+        // 旧版本，要么是完整的新版本，不会出现截断的可执行文件
+        let finalize = async {
+            self.ssh
+                .exec(host, &format!("chmod 0755 {remote_tmp}"))
+                .await?;
+            self.ssh
+                .exec(host, &format!("mv -f {remote_tmp} {remote_bin}"))
+                .await?;
+            Ok::<(), TermError>(())
+        }
+        .await;
+        if let Err(e) = finalize {
+            // 改名失败：清理 tmp（尽力而为，避免遗留垃圾文件）
+            let _ = self.ssh.exec(host, &format!("rm -f {remote_tmp}")).await;
+            return Err(e);
+        }
 
-        // 写 version 文件
+        // 写 version 文件（成功替换之后，保证 version 与实际二进制一致）
         self.ssh
             .exec(
                 host,
@@ -1070,13 +1113,21 @@ impl PersistentProvider {
         Ok(socket)
     }
 
-    /// 本地 agentd 二进制路径：`%LOCALAPPDATA%\TermBridge\agentd\termbridge-agentd`
+    /// 本地 agentd 二进制路径：`<data_local_dir>/TermBridge/agentd/termbridge-agentd`。
     ///
-    /// Windows 环境变量 LOCALAPPDATA。不存在时返回空基路径（后续 exists() 检查会失败）。
+    /// 基目录用 `dirs::data_local_dir()`：Windows = `%LOCALAPPDATA%`（路径与早期
+    /// 实现完全一致）、Linux = `~/.local/share`、macOS = `~/Library/Application
+    /// Support`。早期实现只读 LOCALAPPDATA 环境变量，Unix 上基目录为空 → 相对
+    /// 路径跟随 MCP 进程 cwd（IDE 拉起时不可控）。data_local_dir() 不可用时回退
+    /// 旧行为（LOCALAPPDATA / 空基路径，后续 exists() 检查会失败）并告警。
     fn local_agentd_path() -> PathBuf {
-        let base = std::env::var("LOCALAPPDATA").unwrap_or_default();
-        PathBuf::from(base)
-            .join("TermBridge")
+        let base = dirs::data_local_dir().unwrap_or_else(|| {
+            tracing::warn!(
+                "dirs::data_local_dir() unavailable, falling back to LOCALAPPDATA (cwd-relative on Unix)"
+            );
+            std::env::var("LOCALAPPDATA").unwrap_or_default().into()
+        });
+        base.join("TermBridge")
             .join("agentd")
             .join("termbridge-agentd")
     }
@@ -1127,6 +1178,26 @@ fn ensure_agentd_copy(local: &Path, bundled: &Path) -> Option<PathBuf> {
     Some(local.to_path_buf())
 }
 
+/// 纯函数：比对远端 version 文件内容与客户端 BUILD_VERSION。
+///
+/// version 文件由 deploy_runtime 写入：`{"protocol_version":1,"build":"0.1.0"}`。
+/// 内容为空 / JSON 解析失败 / build 字段缺失或类型不符 / 与 BUILD_VERSION 不一致
+/// → false（调用方视为 NeedsUpgrade 重新部署）。（可单测）
+fn remote_version_matches(version_file_stdout: &str) -> bool {
+    let trimmed = version_file_stdout.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|v| {
+            v.get("build")
+                .and_then(|b| b.as_str())
+                .map(|b| b == BUILD_VERSION)
+        })
+        .unwrap_or(false)
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // 单元测试
 // ───────────────────────────────────────────────────────────────────────────
@@ -1137,11 +1208,10 @@ mod tests {
     use crate::domain::credential::Secret;
 
     #[test]
-    fn local_agentd_path_uses_localappdata() {
-        // 设置临时 LOCALAPPDATA，验证路径拼接
-        let saved = std::env::var_os("LOCALAPPDATA");
-        std::env::set_var("LOCALAPPDATA", "/tmp/fake_localappdata");
-
+    fn local_agentd_path_layout() {
+        // 路径布局固定：基目录（dirs::data_local_dir()，Windows = %LOCALAPPDATA%）
+        // + TermBridge/agentd/termbridge-agentd；早期实现只读 LOCALAPPDATA 环境变量，
+        // Unix 上基目录为空 → cwd 相对路径，已改为 dirs::data_local_dir()
         let path = PersistentProvider::local_agentd_path();
         assert!(
             path.to_string_lossy().contains("TermBridge"),
@@ -1159,30 +1229,29 @@ mod tests {
             "path should end with termbridge-agentd, got: {}",
             path.display()
         );
-
-        match saved {
-            Some(v) => std::env::set_var("LOCALAPPDATA", v),
-            None => std::env::remove_var("LOCALAPPDATA"),
-        }
     }
 
     #[test]
-    fn local_agentd_path_handles_missing_env() {
-        // LOCALAPPDATA 不存在时返回相对路径（exists() 会 false → RuntimeMissing）
-        let saved = std::env::var_os("LOCALAPPDATA");
-        std::env::remove_var("LOCALAPPDATA");
-
-        let path = PersistentProvider::local_agentd_path();
-        assert!(
-            path.to_string_lossy().ends_with("termbridge-agentd"),
-            "path should still end with termbridge-agentd, got: {}",
-            path.display()
+    fn remote_version_matches_detects_mismatch() {
+        // 与 BUILD_VERSION 一致 → true
+        let ok = format!(
+            "{{\"protocol_version\":{},\"build\":\"{}\"}}",
+            PROTOCOL_VERSION, BUILD_VERSION
         );
+        assert!(remote_version_matches(&ok), "相同 build 应匹配: {ok}");
+        // cat 输出带尾部换行 → 仍匹配
+        assert!(remote_version_matches(&format!("{ok}\n")));
 
-        match saved {
-            Some(v) => std::env::set_var("LOCALAPPDATA", v),
-            None => std::env::remove_var("LOCALAPPDATA"),
-        }
+        // build 不一致 → NeedsUpgrade（重新部署）
+        assert!(!remote_version_matches(
+            r#"{"protocol_version":1,"build":"0.0.9"}"#
+        ));
+        // 内容为空 / 纯空白（version 文件缺失但 cat 未报错的兜底）
+        assert!(!remote_version_matches(""));
+        assert!(!remote_version_matches("   \n"));
+        // JSON 解析失败 / build 字段缺失 → NeedsUpgrade
+        assert!(!remote_version_matches("garbage"));
+        assert!(!remote_version_matches(r#"{"protocol_version":1}"#));
     }
 
     #[test]
