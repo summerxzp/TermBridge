@@ -15,7 +15,7 @@
 //! │   settle /    多 consumer                   │
 //! │   wait_for    增量读                        │
 //! │                                            │
-//! │   Waiter: wait_for 正则 + Notify 唤醒        │
+//! │   Waiter: wait_for 正则 + watch 唤醒        │
 //! └──────────────────────────────────────────────┘
 //! ```
 //!
@@ -37,8 +37,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tokio::time::timeout;
+
+use crate::domain::ansi_strip::{strip_control_sequences, strip_page};
 
 // ───────────────────────────────────────────────────────────────────────────
 // OutputRingBuffer —— 物理环形 buf[] + 逻辑单调 written 计数器
@@ -57,14 +59,16 @@ struct BufferInner {
     written: u64, // 单调递增总写入字节数（永不回绕，作绝对游标）
 }
 
-/// 物理环形 buffer + 单调 written 计数器 + Notify 唤醒
+/// 物理环形 buffer + 单调 written 计数器 + watch 唤醒
 ///
 /// 线程安全：内部 `parking_lot::Mutex`，临界区极短（仅 buf 操作）。
-/// `Notify` 在锁外，支持多等待者被唤醒。
+/// `watch<u64>`（written 游标）在锁外，唤醒语义见 `subscribe_written`。
 #[derive(Clone)]
 pub struct OutputRingBuffer {
     inner: Arc<Mutex<BufferInner>>,
-    notify: Arc<Notify>,
+    /// written 游标变更通知（修复 P3-1：watch 永不丢唤醒，
+    /// 替代原 `Notify::notify_one` 在多 waiter 下互相抢唤醒的问题）
+    written_tx: watch::Sender<u64>,
 }
 
 /// `ReadSinceMax` 返回结果（§5.3 since_cursor 模式）
@@ -85,6 +89,7 @@ impl OutputRingBuffer {
 
     /// 创建指定容量的 RingBuffer，不 clamp（测试用，但也被 new() 调用）
     pub(crate) fn new_raw(size: usize) -> Self {
+        let (written_tx, _) = watch::channel(0u64);
         Self {
             inner: Arc::new(Mutex::new(BufferInner {
                 buf: vec![0u8; size],
@@ -92,17 +97,17 @@ impl OutputRingBuffer {
                 head: 0,
                 written: 0,
             })),
-            notify: Arc::new(Notify::new()),
+            written_tx,
         }
     }
 
-    /// 写入数据（PTY output 入口）。推进 written + notify 唤醒等待者。
+    /// 写入数据（PTY output 入口）。推进 written + 通知等待者。
     /// 满则丢最旧（环形覆盖）。
     pub fn write(&self, data: &[u8]) {
         if data.is_empty() {
             return;
         }
-        {
+        let new_written = {
             let mut g = self.inner.lock();
             let len = data.len();
             // 单次写入超过容量：只保留最后 size 字节
@@ -111,24 +116,28 @@ impl OutputRingBuffer {
                 g.buf.copy_from_slice(&data[start..]);
                 g.head = 0;
                 g.written += len as u64;
-                return;
+            } else {
+                // 分段拷贝（可能回绕）
+                let mut remaining = len;
+                let mut src = 0;
+                while remaining > 0 {
+                    let head = g.head;
+                    let space = g.size - head;
+                    let n = remaining.min(space);
+                    g.buf[head..head + n].copy_from_slice(&data[src..src + n]);
+                    g.head = (head + n) % g.size;
+                    src += n;
+                    remaining -= n;
+                }
+                g.written += len as u64;
             }
-            // 分段拷贝（可能回绕）
-            let mut remaining = len;
-            let mut src = 0;
-            while remaining > 0 {
-                let head = g.head;
-                let space = g.size - head;
-                let n = remaining.min(space);
-                g.buf[head..head + n].copy_from_slice(&data[src..src + n]);
-                g.head = (head + n) % g.size;
-                src += n;
-                remaining -= n;
-            }
-            g.written += len as u64;
-        }
-        // 锁外唤醒（非阻塞，丢一次无所谓——只是信号）
-        self.notify.notify_one();
+            g.written
+        };
+        // 锁外通知。watch 语义：每个 Receiver 独立记录"已见"值，任何一次 write
+        // 都会让所有等待中的 `changed()` 返回——不会像 notify_one 那样只唤醒一个
+        // 等待者、使其他并发 wait_for 白等到超时（修复 P3-1）。
+        // 无 receiver 时 send 返回 Err，属正常情况（无人等待），忽略。
+        let _ = self.written_tx.send(new_written);
     }
 
     /// 当前 written 快照（绝对游标，单调递增）
@@ -201,9 +210,23 @@ impl OutputRingBuffer {
         out
     }
 
-    /// 等待新 output（用于 wait_for / settle 的阻塞等待）
+    /// 等待新 output（阻塞直到下一次 write 或超时）。
+    ///
+    /// watch 语义：Receiver 以订阅时刻的 written 为"已见"，之后的每次 write
+    /// 都会让 `changed()` 返回——不会漏掉任何一次写入。
     pub async fn wait_for_notify(&self, dur: Duration) -> bool {
-        timeout(dur, self.notify.notified()).await.is_ok()
+        let mut rx = self.written_tx.subscribe();
+        timeout(dur, rx.changed()).await.is_ok()
+    }
+
+    /// 新建一个 written 游标 watch Receiver（wait_for 循环用，修复 P3-1）。
+    ///
+    /// 典型用法（无丢唤醒竞态）：
+    /// 1. 先 `subscribe()`（记录当前 written 为已见）
+    /// 2. 再扫描已有数据并检查谓词（覆盖订阅前已到达的数据）
+    /// 3. 最后 await `changed()`（覆盖 scan 与 await 之间到达的数据）
+    pub fn subscribe_written(&self) -> watch::Receiver<u64> {
+        self.written_tx.subscribe()
     }
 
     fn is_truncated_inner(g: &BufferInner, cursor: u64) -> bool {
@@ -308,6 +331,23 @@ const MAX_TIMEOUT_SECS: u64 = 60;
 const MAX_TAIL_LINES: usize = 100;
 const MAX_CONTEXT_LINES: usize = 50;
 
+/// since_cursor 模式单次读取的默认最大字节（64KB）
+pub const DEFAULT_READ_MAX_BYTES: usize = 64 * 1024;
+
+/// strip_ansi 跨页续接状态（修复 P1-11b）。
+///
+/// 记录上次 since_cursor 剥离的结束游标与该页尾部不完整的转义序列字节；
+/// 下次读取起点与结束游标完全一致（顺序分页）时拼接遗留字节再剥离。
+#[derive(Default)]
+struct StripCarry {
+    /// 是否已有续接点（首次剥离前为 false，任意起点都可开始状态化剥离）
+    armed: bool,
+    /// 上一页剥离结束的绝对游标
+    next_cursor: u64,
+    /// 上一页尾部不完整的转义序列字节
+    pending: Vec<u8>,
+}
+
 /// OutputEngine = RingBuffer + mark_cursor（内部消费游标）
 ///
 /// 一个 Session 持有一个 OutputEngine。
@@ -316,6 +356,8 @@ const MAX_CONTEXT_LINES: usize = 50;
 pub struct OutputEngine {
     buffer: OutputRingBuffer,
     mark_cursor: Mutex<u64>,
+    /// strip_ansi 跨页续接状态（见 StripCarry）
+    strip_carry: Mutex<StripCarry>,
 }
 
 impl OutputEngine {
@@ -323,6 +365,7 @@ impl OutputEngine {
         Self {
             buffer: OutputRingBuffer::new(buffer_size),
             mark_cursor: Mutex::new(0),
+            strip_carry: Mutex::new(StripCarry::default()),
         }
     }
 
@@ -332,6 +375,7 @@ impl OutputEngine {
         Self {
             buffer,
             mark_cursor: Mutex::new(0),
+            strip_carry: Mutex::new(StripCarry::default()),
         }
     }
 
@@ -354,6 +398,11 @@ impl OutputEngine {
     // ── read_output 三模式调度（§5.3）──────────────────────────────────
 
     /// 读取输出。模式优先级：since_cursor > tail_lines > wait_for > 默认 settle
+    ///
+    /// `strip_ansi = true` 时剥离返回数据中的终端控制序列（不改 RingBuffer）：
+    /// - since_cursor 模式：状态化剥离（修复 P1-11b）——顺序连续分页时跨页
+    ///   截断的转义序列在下一页续接剥离；非连续读退化为无状态剥离（best-effort）
+    /// - tail / wait_for / settle 模式：无状态剥离（这些模式无"顺序分页"语义）
     pub async fn read_output(&self, params: ReadOutputParams) -> ReadOutputResult {
         let timeout_secs = params
             .timeout_secs
@@ -363,10 +412,15 @@ impl OutputEngine {
 
         // 模式 1：since_cursor（增量读，不推进 mark_cursor）
         if let Some(cursor) = params.since_cursor {
-            let max = params.max_bytes.unwrap_or(64 * 1024);
+            let max = params.max_bytes.unwrap_or(DEFAULT_READ_MAX_BYTES);
             let r = self.buffer.read_since_max(cursor, max);
+            let output = if params.strip_ansi {
+                self.strip_since_page(cursor, r.new_cursor, r.output)
+            } else {
+                r.output
+            };
             return ReadOutputResult {
-                output: r.output,
+                output,
                 cursor: r.new_cursor,
                 has_more: r.has_more,
                 is_truncated: r.is_truncated,
@@ -379,7 +433,7 @@ impl OutputEngine {
         // 模式 2：tail_lines（peek，不推进任何 cursor）
         if let Some(n) = params.tail_lines {
             let n = n.min(MAX_TAIL_LINES);
-            let output = self.buffer.tail(n);
+            let output = strip_stateless(params.strip_ansi, self.buffer.tail(n));
             return ReadOutputResult {
                 output,
                 cursor: self.mark_cursor(),
@@ -393,11 +447,42 @@ impl OutputEngine {
 
         // 模式 3：wait_for（阻塞匹配）
         if let Some(pattern) = params.wait_for {
-            return self.read_with_wait_for(pattern, params.context_lines, dur).await;
+            let mut result = self
+                .read_with_wait_for(pattern, params.context_lines, dur)
+                .await;
+            result.output = strip_stateless(params.strip_ansi, result.output);
+            return result;
         }
 
         // 模式 4：默认 settle
-        self.read_with_settle(dur).await
+        let mut result = self.read_with_settle(dur).await;
+        result.output = strip_stateless(params.strip_ansi, result.output);
+        result
+    }
+
+    // ── strip_ansi 状态化剥离（修复 P1-11b）──────────────────────────
+
+    /// since_cursor 页的状态化 ANSI 剥离。
+    ///
+    /// 仅当本次读取起点与上次剥离结束位置完全一致（顺序分页）且起点未被环形
+    /// 覆盖时，拼接上次遗留的不完整序列前缀；否则（任意 since / 并发 peek /
+    /// 数据已被环形覆盖）退化为无状态剥离（best-effort），且**不更新**续接状态，
+    /// 保证原分页流之后仍可正确续接。
+    fn strip_since_page(&self, read_start: u64, read_end: u64, page: Vec<u8>) -> Vec<u8> {
+        let mut carry = self.strip_carry.lock();
+        let contiguous =
+            !self.buffer.is_truncated(read_start) && (!carry.armed || carry.next_cursor == read_start);
+        if !contiguous {
+            return strip_control_sequences(&page);
+        }
+        let pending = std::mem::take(&mut carry.pending);
+        let res = strip_page(&page, &pending);
+        *carry = StripCarry {
+            armed: true,
+            next_cursor: read_end,
+            pending: res.trailing,
+        };
+        res.text
     }
 
     // ── wait_for 模式（§5.3 + 契约 5）──────────────────────────────────
@@ -415,7 +500,13 @@ impl OutputEngine {
         let re = regex::Regex::new(&pattern).ok();
         let plain = pattern.as_bytes();
 
-        // ① 先扫已有 unread（mark → written）
+        // ① 先订阅 written watch（记录当前 written 为"已见"），再扫已有 unread。
+        //    顺序保证不丢唤醒（修复 P3-1）：订阅前的写入由 ② 的 scan 覆盖，
+        //    订阅后、scan 前的写入由 changed() 捕获（watch 每个接收者独立记录
+        //    已见值，并发多个 waiter 不会互相抢走唤醒）。
+        let mut written_rx = self.buffer.subscribe_written();
+
+        // ② 扫已有 unread（mark → written）
         let existing = self.buffer.read_since(mark);
         if let Some(m) = match_pattern(&existing, re.as_ref(), plain) {
             // 命中 → 推进 mark 到最新（契约 5：命中推进）
@@ -455,8 +546,23 @@ impl OutputEngine {
                         mode: ReadMode::WaitFor,
                     };
                 }
-                _ = self.buffer.wait_for_notify(Duration::from_secs(MAX_TIMEOUT_SECS)) => {
-                    // 新数据到达，全量重扫（mark → written）
+                res = written_rx.changed() => {
+                    // 新数据到达（watch 永不丢更新），全量重扫（mark → written）。
+                    // 发送端随 OutputRingBuffer 存活，Err（发送端已 drop）实际不可达；
+                    // 保险起见按超时返回（不推进 mark，同时避免 Err 分支忙转）。
+                    if res.is_err() {
+                        let unread = self.buffer.read_since(mark);
+                        let has_more = !unread.is_empty();
+                        return ReadOutputResult {
+                            output: unread,
+                            cursor: mark,
+                            has_more,
+                            is_truncated: self.buffer.is_truncated(mark),
+                            matched: false,
+                            timed_out: true,
+                            mode: ReadMode::WaitFor,
+                        };
+                    }
                     let unread = self.buffer.read_since(mark);
                     if let Some(m) = match_pattern(&unread, re.as_ref(), plain) {
                         // 命中 → 推进 mark 到最新（契约 5：命中推进）
@@ -548,6 +654,19 @@ impl OutputEngine {
 // 辅助函数
 // ───────────────────────────────────────────────────────────────────────────
 
+/// 无状态 ANSI 剥离（tail / wait_for / settle 模式用）。
+///
+/// 这些模式没有"顺序分页"语义（wait_for 扫描的是 mark → written 全量、
+/// tail 是 peek、settle 依赖 poll），跨页截断的序列按 best-effort 处理，
+/// 与旧 server.rs 的行为一致。
+fn strip_stateless(strip: bool, data: Vec<u8>) -> Vec<u8> {
+    if strip {
+        strip_control_sequences(&data)
+    } else {
+        data
+    }
+}
+
 /// 匹配结果（字节区间）
 struct Match {
     start: usize,
@@ -590,21 +709,58 @@ fn extract_context(data: &[u8], m: Match, context_lines: usize) -> Vec<u8> {
         let line_end = data[m.end..].iter().position(|&b| b == b'\n').map(|p| m.end + p + 1).unwrap_or(data.len());
         return data[line_start..line_end].to_vec();
     }
-    // 有上下文：前后各 context_lines 行
-    let before = data[..m.start].split(|&b| b == b'\n').collect::<Vec<_>>();
-    let after = data[m.end..].split(|&b| b == b'\n').collect::<Vec<_>>();
-    let before_start = before.len().saturating_sub(context_lines + 1);
+    // 有上下文：前 context_lines 行 + 匹配所在行（含匹配本身，修复 P1-10：
+    // 旧实现只取 m.start 前 / m.end 后的行，匹配文本被整体丢弃，且因为
+    // "after" 的第一个元素是匹配行剩余部分，实际还多丢一行前文）+ 后 context_lines 行
+    let line_start = data[..m.start].iter().rposition(|&b| b == b'\n').map(|p| p + 1).unwrap_or(0);
+    // 匹配行行尾（含换行符）之后的下一行行首；无换行则为数据末尾
+    let match_line_end = data[m.end..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|p| m.end + p + 1)
+        .unwrap_or(data.len());
+
     let mut out = Vec::new();
-    for (i, line) in before[before_start..].iter().enumerate() {
-        if i > 0 {
+    fn push_line(out: &mut Vec<u8>, line: &[u8]) {
+        if !out.is_empty() {
             out.push(b'\n');
         }
         out.extend_from_slice(line);
     }
-    // 匹配行之后取 context_lines 行
-    for line in after.iter().take(context_lines) {
-        out.push(b'\n');
-        out.extend_from_slice(line);
+
+    // 前文：line_start 之前的完整行（line_start 总是 0 或紧跟 '\n'，
+    // 因此非空时以 '\n' 结尾——split 产生的末尾空段是换行符伪影，丢弃）
+    let before = &data[..line_start];
+    let before_lines: Vec<&[u8]> = if before.is_empty() {
+        Vec::new()
+    } else {
+        let mut lines: Vec<&[u8]> = before.split(|&b| b == b'\n').collect();
+        lines.pop();
+        lines
+    };
+    let before_start = before_lines.len().saturating_sub(context_lines);
+    for line in &before_lines[before_start..] {
+        push_line(&mut out, line);
+    }
+
+    // 匹配所在行（去掉行尾换行符；跨行匹配时覆盖 m.start 与 m.end 所在行区间）
+    let match_line = &data[line_start..match_line_end];
+    let match_line = match_line.strip_suffix(b"\n").unwrap_or(match_line);
+    push_line(&mut out, match_line);
+
+    // 后文：匹配行下一行起的 context_lines 行（同样丢弃末尾换行伪影段）
+    let after = &data[match_line_end..];
+    let after_lines: Vec<&[u8]> = if after.is_empty() {
+        Vec::new()
+    } else {
+        let mut lines: Vec<&[u8]> = after.split(|&b| b == b'\n').collect();
+        if after.ends_with(b"\n") {
+            lines.pop();
+        }
+        lines
+    };
+    for line in after_lines.iter().take(context_lines) {
+        push_line(&mut out, line);
     }
     out
 }
@@ -984,5 +1140,250 @@ mod tests {
         // prompt 检测应立即返回（不用等 300ms）
         assert!(!r.timed_out);
         assert_eq!(r.mode, ReadMode::Settle);
+    }
+
+    // ── extract_context（修复 P1-10：匹配文本不得被丢弃）──────────────
+
+    /// 在 data 中定位 pattern 的字节区间
+    fn find_match(data: &[u8], pattern: &str) -> Match {
+        let pos = find_subslice(data, pattern.as_bytes()).expect("pattern must be present");
+        Match {
+            start: pos,
+            end: pos + pattern.len(),
+        }
+    }
+
+    #[test]
+    fn extract_context_includes_match_mid_line() {
+        // 匹配在行中间：前 1 行 + 匹配行 + 后 1 行
+        let data = b"l1\nl2\nxxMATCHyy\nl4\nl5\n";
+        let m = find_match(data, "MATCH");
+        assert_eq!(extract_context(data, m, 1), b"l2\nxxMATCHyy\nl4");
+    }
+
+    #[test]
+    fn extract_context_repro_from_review() {
+        // review 原始复现：旧实现返回 "l2\n\n"（匹配与 l4 都被丢）
+        let data = b"l1\nl2\nMATCH\nl4\nl5\n";
+        assert_eq!(extract_context(data, find_match(data, "MATCH"), 1), b"l2\nMATCH\nl4");
+        assert_eq!(
+            extract_context(data, find_match(data, "MATCH"), 2),
+            b"l1\nl2\nMATCH\nl4\nl5"
+        );
+    }
+
+    #[test]
+    fn extract_context_match_at_line_start_and_buffer_edges() {
+        // 匹配在行首
+        let data = b"l1\nMATCH\nl4\nl5\n";
+        let m = find_match(data, "MATCH");
+        assert_eq!(extract_context(data, m, 1), b"l1\nMATCH\nl4");
+
+        // 匹配在 buffer 开头（无前文）
+        let data = b"MATCH\nl4\nl5\n";
+        let m = find_match(data, "MATCH");
+        assert_eq!(extract_context(data, m, 1), b"MATCH\nl4");
+
+        // 匹配在 buffer 末尾（无后文、无行尾换行）
+        let data = b"l1\nl2\nMATCH";
+        let m = find_match(data, "MATCH");
+        assert_eq!(extract_context(data, m, 1), b"l2\nMATCH");
+    }
+
+    #[test]
+    fn extract_context_no_trailing_newline_in_data() {
+        // 数据末尾无换行：后文取到数据末尾为止
+        let data = b"l1\nl2\nMATCH\nl4\nl5";
+        let m = find_match(data, "MATCH");
+        assert_eq!(extract_context(data, m, 1), b"l2\nMATCH\nl4");
+    }
+
+    #[test]
+    fn extract_context_zero_returns_match_line_only() {
+        // context_lines=0 行为不变：返回匹配所在行（含行尾换行）
+        let data = b"l1\nMATCH\nl4\n";
+        let m = find_match(data, "MATCH");
+        assert_eq!(extract_context(data, m, 0), b"MATCH\n");
+    }
+
+    // ── strip_ansi 状态化剥离（修复 P1-11b）──────────────────────────
+
+    #[tokio::test]
+    async fn test_strip_ansi_csi_split_across_contiguous_pages() {
+        // max_bytes=8 分页时 CSI \x1b[?2004l 恰好被拦腰截断：
+        // 页 1 尾丢弃半个 CSI（不泄漏 "200"），页 2 续接后正常剥离
+        let engine = mk_engine_raw(1024);
+        engine.buffer().write(b"ab\x1b[?2004lhello");
+        let r1 = engine
+            .read_output(ReadOutputParams {
+                since_cursor: Some(0),
+                max_bytes: Some(8),
+                strip_ansi: true,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(r1.output, b"ab");
+        assert_eq!(r1.cursor, 8);
+        let r2 = engine
+            .read_output(ReadOutputParams {
+                since_cursor: Some(r1.cursor),
+                max_bytes: Some(8),
+                strip_ansi: true,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(r2.output, b"hello");
+        assert_eq!(r2.cursor, 15);
+    }
+
+    #[tokio::test]
+    async fn test_strip_ansi_osc_split_across_contiguous_pages() {
+        // 未终止的 OSC 吞掉页尾：页 1 只剩 'x'（而非把 "0;tit" 泄漏成正文），
+        // 页 2 拼接遗留后 BEL 终止，只剩 'y'
+        let engine = mk_engine_raw(1024);
+        engine.buffer().write(b"x\x1b]0;title\x07y");
+        let r1 = engine
+            .read_output(ReadOutputParams {
+                since_cursor: Some(0),
+                max_bytes: Some(8),
+                strip_ansi: true,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(r1.output, b"x");
+        let r2 = engine
+            .read_output(ReadOutputParams {
+                since_cursor: Some(r1.cursor),
+                max_bytes: Some(8),
+                strip_ansi: true,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(r2.output, b"y");
+    }
+
+    #[tokio::test]
+    async fn test_strip_ansi_non_contiguous_read_falls_back_stateless() {
+        // 非连续读（任意 since）：退化为无状态剥离（best-effort，跨页序列的
+        // 尾部按正文返回——与旧 server.rs 行为一致），且不破坏续接状态：
+        // 之后的连续分页读取仍能正确拼接遗留字节
+        let engine = mk_engine_raw(1024);
+        engine.buffer().write(b"ab\x1b[?2004lhello");
+        let r1 = engine
+            .read_output(ReadOutputParams {
+                since_cursor: Some(0),
+                max_bytes: Some(8),
+                strip_ansi: true,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(r1.output, b"ab");
+
+        // cursor=3 的非连续读：无状态剥离页内容 "[?2004lh"（bytes 3..11）
+        let r2 = engine
+            .read_output(ReadOutputParams {
+                since_cursor: Some(3),
+                max_bytes: Some(8),
+                strip_ansi: true,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(r2.output, b"[?2004lh");
+
+        // 连续分页从上次剥离点恢复：遗留 "\x1b[?200" 正确拼接
+        let r3 = engine
+            .read_output(ReadOutputParams {
+                since_cursor: Some(8),
+                max_bytes: Some(8),
+                strip_ansi: true,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(r3.output, b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_strip_ansi_empty_page_keeps_pending() {
+        // 空页（cursor 已追平 written，无新数据）：遗留字节原样保留，
+        // 新数据到达后从同一续接点仍可拼接
+        let engine = mk_engine_raw(1024);
+        // 页 1 恰好结束在半个 CSI 处（written=8）
+        engine.buffer().write(b"ab\x1b[?200");
+        let r1 = engine
+            .read_output(ReadOutputParams {
+                since_cursor: Some(0),
+                max_bytes: Some(8),
+                strip_ansi: true,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(r1.output, b"ab");
+        assert_eq!(r1.cursor, 8);
+
+        // 空页：无新数据
+        let r2 = engine
+            .read_output(ReadOutputParams {
+                since_cursor: Some(r1.cursor),
+                strip_ansi: true,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(r2.output, b"");
+        assert_eq!(r2.cursor, 8);
+
+        // 新数据到达后续接成功
+        engine.buffer().write(b"4lhello");
+        let r3 = engine
+            .read_output(ReadOutputParams {
+                since_cursor: Some(r2.cursor),
+                strip_ansi: true,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(r3.output, b"hello");
+        assert_eq!(r3.cursor, 15);
+    }
+
+    #[test]
+    fn default_read_max_bytes_is_64kib() {
+        // since_cursor 分页默认单次 64KB（review P1-11b 的假设核实）
+        assert_eq!(DEFAULT_READ_MAX_BYTES, 64 * 1024);
+    }
+
+    // ── wait_for 并发唤醒（修复 P3-1）────────────────────────────────
+
+    #[tokio::test]
+    async fn test_wait_for_two_concurrent_waiters_both_wake() {
+        // notify_one 语义下两个并发 wait_for 会互相抢唤醒（只有一个被唤醒，
+        // 另一个白等到超时）；watch 语义下两者都应在同一次 write 后命中
+        let engine = Arc::new(mk_engine(64 * 1024));
+        engine.buffer().write(b"booting...\n");
+
+        let e1 = engine.clone();
+        let e2 = engine.clone();
+        let t1 = tokio::spawn(async move {
+            e1.read_output(ReadOutputParams {
+                wait_for: Some("READY".to_string()),
+                timeout_secs: Some(5),
+                ..Default::default()
+            })
+            .await
+        });
+        let t2 = tokio::spawn(async move {
+            e2.read_output(ReadOutputParams {
+                wait_for: Some("READY".to_string()),
+                timeout_secs: Some(5),
+                ..Default::default()
+            })
+            .await
+        });
+        // 让两个 waiter 都进入等待状态
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        engine.buffer().write(b"READY\n$ ");
+
+        let r1 = t1.await.unwrap();
+        let r2 = t2.await.unwrap();
+        assert!(r1.matched, "waiter 1 应命中");
+        assert!(r2.matched, "waiter 2 应命中");
     }
 }

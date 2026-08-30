@@ -42,9 +42,17 @@ use zeroize::Zeroizing;
 /// - 把 `reveal()` 的返回值存入任何长生命周期结构
 /// - 写入日志 / 文件 / MCP 返回
 /// - 经过 MCP transport / LLM context
-#[derive(Debug)]
 pub struct Secret {
     inner: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 修复 P2-9：zeroize 1.9 的 Zeroizing derive(Debug) 会**打印**内部明文，
+        // 派生 Debug 会把密码泄漏进任何 format!("{:?}")（含含 Secret 的
+        // OpenTerminalRequest 等）。手动实现只输出占位符。
+        f.debug_struct("Secret").finish_non_exhaustive()
+    }
 }
 
 impl Secret {
@@ -159,5 +167,32 @@ impl CredentialProvider for NoopCredentialProvider {
         Err(CredentialError::Unsupported(
             "NoopCredentialProvider: no credential provider configured".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── 修复 P2-9：Debug 不得泄漏明文 ────────────────────────────────
+
+    #[test]
+    fn debug_does_not_leak_secret() {
+        let s = Secret::new("hunter2-super-secret".to_string());
+        let dbg = format!("{:?}", s);
+        assert!(!dbg.contains("hunter2-super-secret"), "Debug 泄漏明文: {dbg}");
+        assert!(dbg.contains("Secret"), "Debug 应保留类型名: {dbg}");
+    }
+
+    #[test]
+    fn debug_of_secret_vector_does_not_leak() {
+        // 容器 / 多行 format! 场景（如日志打印请求列表）同样不泄漏
+        let secrets = vec![
+            Secret::new("alpha-pass".to_string()),
+            Secret::new("beta-pass".to_string()),
+        ];
+        let dbg = format!("{secrets:?}");
+        assert!(!dbg.contains("alpha-pass"));
+        assert!(!dbg.contains("beta-pass"));
     }
 }

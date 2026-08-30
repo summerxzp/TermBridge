@@ -6,9 +6,10 @@
 //! 设计要点：
 //! - 只记元数据，不双份存储输出内容（输出内容在 RingBuffer，Timeline 只记 cursor 范围 + bytes）
 //! - 环形淘汰，默认保留 1000 条
-//! - 线程安全：`Arc<Mutex<Vec<_>>>` + `AtomicU64`，read task 和 send_input 可并发访问
+//! - 线程安全：`Arc<Mutex<VecDeque<_>>>` + `AtomicU64`，read task 和 send_input 可并发访问
 //! - Timeline 是 Clone（内部 Arc），Session 持有原件，read task 持有 clone
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,7 +53,9 @@ pub enum TimelineEvent {
 /// Clone（内部 Arc）：Session 持有原件，PTY read task 持有 clone 以记录 output 事件。
 #[derive(Clone)]
 pub struct Timeline {
-    events: Arc<Mutex<Vec<TimelineEvent>>>,
+    /// 事件队列（头部最旧，尾部最新）。`VecDeque` 使淘汰为 O(1) `pop_front`
+    /// （修复 P3-3：`Vec::remove(0)` 在每次 output 事件上都是 O(n) 热路径）。
+    events: Arc<Mutex<VecDeque<TimelineEvent>>>,
     next_command_id: Arc<AtomicU64>,
     max_events: usize,
 }
@@ -64,7 +67,7 @@ impl Timeline {
 
     pub fn with_capacity(max_events: usize) -> Self {
         Self {
-            events: Arc::new(Mutex::new(Vec::with_capacity(max_events.min(1024)))),
+            events: Arc::new(Mutex::new(VecDeque::with_capacity(max_events.min(1024)))),
             next_command_id: Arc::new(AtomicU64::new(1)),
             max_events,
         }
@@ -116,18 +119,19 @@ impl Timeline {
     /// 返回最近 limit 条事件（None 返回全部）。最旧的在前，最新的在后。
     pub fn events(&self, limit: Option<usize>) -> Vec<TimelineEvent> {
         let events = self.events.lock();
-        match limit {
-            Some(n) if n < events.len() => events[events.len() - n..].to_vec(),
-            _ => events.clone(),
-        }
+        let skip = match limit {
+            Some(n) if n < events.len() => events.len() - n,
+            _ => 0,
+        };
+        events.iter().skip(skip).cloned().collect()
     }
 
     fn push(&self, event: TimelineEvent) {
         let mut events = self.events.lock();
         if events.len() >= self.max_events {
-            events.remove(0); // 环形淘汰最旧
+            events.pop_front(); // 环形淘汰最旧（O(1)，修复 P3-3）
         }
-        events.push(event);
+        events.push_back(event);
     }
 }
 

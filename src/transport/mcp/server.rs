@@ -89,6 +89,24 @@ fn parse_octal_mode(mode: Option<&str>) -> Result<u32, String> {
         .map_err(|_| format!("invalid octal mode '{raw}'; expected e.g. '755' or '0o755'"))
 }
 
+/// chmod 模式校验（修复 P1-9）：拒绝 0。
+///
+/// 与 `sftp_mkdir` 的约定不同——mkdir 的 "0" 表示"服务器默认 umask"；
+/// 而 chmod 的 0 会真实执行 chmod 0000 锁死文件。Agent 模仿 mkdir 约定传
+/// mode:"0" 时必须显式拒绝，而不是静默锁文件。
+fn validate_chmod_mode(mode: u32) -> Result<(), String> {
+    if mode == 0 {
+        Err(
+            "sftp_chmod requires an explicit non-zero octal mode (e.g. \"644\"); mode \"0\" is \
+             rejected to avoid an accidental chmod 0000 (which would lock the file). Note: \
+             unlike sftp_mkdir, \"0\" here does NOT mean server default."
+                .to_string(),
+        )
+    } else {
+        Ok(())
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // 工具参数 / 返回类型
 // ───────────────────────────────────────────────────────────────────────────
@@ -140,6 +158,8 @@ pub struct ReadOutputParamsSchema {
     pub context_lines: Option<usize>,
     /// Strip terminal control sequences (CSI/OSC/DCS/APC) from output.
     /// Only affects returned data, not the ring buffer. Default false.
+    /// Note: stateful across contiguous since_cursor pages - an escape sequence
+    /// truncated at a page boundary is spliced and stripped correctly on the next page.
     #[serde(default)]
     pub strip_ansi: bool,
 }
@@ -222,7 +242,9 @@ pub struct SftpChmodParams {
     pub session_id: String,
     /// Remote file or directory path. Must exist. Path policy enforced.
     pub remote_path: String,
-    /// POSIX permissions as octal string, e.g. "755" or "644".
+    /// POSIX permissions as non-zero octal string, e.g. "755" or "644".
+    /// Must be explicit and non-zero: "0" is rejected because it would execute
+    /// chmod 0000 and lock the file (unlike sftp_mkdir, there is no server-default here).
     pub mode: String,
 }
 
@@ -481,7 +503,7 @@ impl TermBridgeServer {
     }
 
     /// Read output from a terminal session.
-    #[tool(description = "Read output from a terminal session. Supports 4 modes: (1) default settle - drain output until stable; (2) wait_for - block until regex/substring appears; (3) tail_lines - peek last N lines; (4) since_cursor - incremental read from cursor. Only one mode active per call. Set strip_ansi=true to strip terminal control sequences (CSI/OSC/DCS) from returned output.")]
+    #[tool(description = "Read output from a terminal session. Supports 4 modes: (1) default settle - drain output until stable; (2) wait_for - block until regex/substring appears; (3) tail_lines - peek last N lines; (4) since_cursor - incremental read from cursor. Only one mode active per call. Set strip_ansi=true to strip terminal control sequences (CSI/OSC/DCS) from returned output; stripping is stateful across contiguous since_cursor pages (escape sequences split at page boundaries are reassembled, non-contiguous reads fall back to best-effort).")]
     async fn read_output(
         &self,
         Parameters(params): Parameters<ReadOutputParamsSchema>,
@@ -503,19 +525,16 @@ impl TermBridgeServer {
                     crate::domain::output::ReadMode::WaitFor => "wait_for",
                     crate::domain::output::ReadMode::Settle => "settle",
                 };
-                // Phase 8：按 strip_ansi 剥离终端控制序列（只改返回，不改 RingBuffer）
-                let output_bytes = if params.strip_ansi {
-                    crate::domain::ansi_strip::strip_control_sequences(&r.output)
-                } else {
-                    r.output
-                };
+                // Phase 8 / 修复 P1-11b：strip_ansi 剥离已移入 OutputEngine——
+                // since_cursor 顺序分页时跨页截断的转义序列可在下一页续接剥离
+                // （此处不再做无状态二次剥离）
                 // Phase 6-A：填充 session_state 供 Agent 感知断线
                 let session_state = self
                     .session_manager
                     .session_state(&params.session_id)
                     .unwrap_or_else(|_| "unknown".to_string());
                 ok_result(ReadOutputDto {
-                    output: String::from_utf8_lossy(&output_bytes).into_owned(),
+                    output: String::from_utf8_lossy(&r.output).into_owned(),
                     cursor: r.cursor,
                     has_more: r.has_more,
                     is_truncated: r.is_truncated,
@@ -583,7 +602,7 @@ impl TermBridgeServer {
     }
 
     /// Transfer files via SFTP (Phase 1, upload/download only).
-    #[tool(description = "Transfer files via SFTP. Supports upload (local->remote) and download (remote->local). Path policy enforced: local paths must be under allowedLocalPaths (default: cwd + OS temp/termbridge, extendable via TERMBRIDGE_ALLOWED_LOCAL_PATHS); remote paths resolved via realpath to prevent ../ traversal and symlink escape, then checked against the effective remote scope: per-host `allowed_remote_paths` in hosts.toml, else TERMBRIDGE_ALLOWED_REMOTE_PATHS, else unrestricted (SSH account scope). Operations are guardrailed: SFTP write/create/delete/chmod of ~/.ssh/authorized_keys and /proc, /sys is hard-denied (authorized_keys deployment goes through bootstrap_host only). Download uses atomic write (temp + fsync + rename).")]
+    #[tool(description = "Transfer files via SFTP. Supports upload (local->remote) and download (remote->local). Path policy enforced: local paths must be under allowedLocalPaths (default: cwd + OS temp/termbridge, extendable via TERMBRIDGE_ALLOWED_LOCAL_PATHS); remote paths resolved via realpath to prevent ../ traversal and symlink escape, then checked against the effective remote scope: per-host `allowed_remote_paths` in hosts.toml, else TERMBRIDGE_ALLOWED_REMOTE_PATHS, else unrestricted (SSH account scope). Operations are guardrailed: SFTP write/create/delete/chmod of ~/.ssh/authorized_keys and /proc, /sys is hard-denied (authorized_keys deployment goes through bootstrap_host only). Both directions are atomic: the target is only replaced (rename) after the full content has been transferred and verified; a failed transfer never truncates the existing target.")]
     async fn sftp_transfer(
         &self,
         Parameters(params): Parameters<SftpTransferParams>,
@@ -701,22 +720,31 @@ impl TermBridgeServer {
         }
     }
 
-    /// Change remote file/directory permissions via SFTP (Phase 2).
-    #[tool(description = "Change remote file/directory permissions via SFTP (chmod). Mode is octal string like '755' or '644'. Path must exist. Policy: chmod 777 on system directories needs confirmation.")]
-    async fn sftp_chmod(
-        &self,
-        Parameters(params): Parameters<SftpChmodParams>,
-    ) -> CallToolResult {
-        let mode = match parse_octal_mode(Some(&params.mode)) {
-            Ok(m) => m,
-            Err(msg) => {
-                return CallToolResult::structured_error(json!(ToolError {
-                    code: "INVALID_ARGUMENT".to_string(),
-                    message: msg,
-                    retriable: false,
-                }));
-            }
-        };
+/// Change remote file/directory permissions via SFTP (Phase 2).
+#[tool(description = "Change remote file/directory permissions via SFTP (chmod). Mode is a non-zero octal string like '755' or '644'; mode '0' is rejected (it would execute chmod 0000 and lock the file). Path must exist. Policy: chmod 777 on system directories needs confirmation.")]
+async fn sftp_chmod(
+    &self,
+    Parameters(params): Parameters<SftpChmodParams>,
+) -> CallToolResult {
+    let mode = match parse_octal_mode(Some(&params.mode)) {
+        Ok(m) => m,
+        Err(msg) => {
+            return CallToolResult::structured_error(json!(ToolError {
+                code: "INVALID_ARGUMENT".to_string(),
+                message: msg,
+                retriable: false,
+            }));
+        }
+    };
+    // 修复 P1-9：拒绝 mode "0"，防止 Agent 模仿 sftp_mkdir 的 "0 = 服务器默认"
+    // 约定把文件权限设成 0000
+    if let Err(msg) = validate_chmod_mode(mode) {
+        return CallToolResult::structured_error(json!(ToolError {
+            code: "INVALID_ARGUMENT".to_string(),
+            message: msg,
+            retriable: false,
+        }));
+    }
         match self
             .session_manager
             .sftp_chmod(&params.session_id, params.remote_path.clone(), mode)
@@ -940,5 +968,33 @@ mod tests {
         assert!(parse_octal_mode(Some("abc")).is_err());
         assert!(parse_octal_mode(Some("8")).is_err()); // 8 is not valid octal
         assert!(parse_octal_mode(Some("rwxr-xr-x")).is_err());
+    }
+
+    // ── 修复 P1-9：sftp_chmod 拒绝 mode "0" ──────────────────────────
+
+    #[test]
+    fn validate_chmod_mode_accepts_nonzero() {
+        assert!(validate_chmod_mode(0o644).is_ok());
+        assert!(validate_chmod_mode(0o755).is_ok());
+        assert!(validate_chmod_mode(0o600).is_ok());
+    }
+
+    #[test]
+    fn validate_chmod_mode_rejects_zero() {
+        // parse_octal_mode 把 "0" / "" / None 都映射为 0（mkdir 约定），
+        // chmod 侧必须全部拒绝，避免 chmod 0000 锁死文件
+        let err = validate_chmod_mode(0).unwrap_err();
+        assert!(err.contains("non-zero"));
+        assert!(err.contains("chmod 0000"));
+        // 提示语应点明与 mkdir 约定的差异，避免 Agent 反复重试 "0"
+        assert!(err.contains("sftp_mkdir"));
+    }
+
+    #[test]
+    fn chmod_zero_roundtrip_is_rejected_end_to_end() {
+        // 端到端链路：mode "0" → parse → validate，必须走到拒绝分支
+        let parsed = parse_octal_mode(Some("0")).unwrap();
+        assert_eq!(parsed, 0);
+        assert!(validate_chmod_mode(parsed).is_err());
     }
 }
