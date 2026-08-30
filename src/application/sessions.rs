@@ -502,16 +502,24 @@ impl SessionManager {
     }
 
     /// 关闭 Session（§4.6 契约 9：Session close 才结束远端 shell）。
-    /// 幂等：已关闭的 session 直接移除并返回 Ok。
+    ///
+    /// 幂等（MCP 工具契约 "Idempotent"，P3-2）：session 已被关闭并移除、或
+    /// 从未存在 → 直接返回 Ok，Agent 重试安全。注意：不存在的 session 与
+    /// 已关闭的 session 不可区分——两者目标状态一致（gone），都返回 Ok。
     pub async fn close_session(&self, session_id: &str) -> Result<(), TermError> {
         // Phase 4-B：tracing（info 级别，低频重要操作）
         tracing::info!(session = %session_id, "close_session");
-        // DashMap::remove 返回 Option<(K, V)>，取 value
-        let session = self
-            .sessions
-            .remove(session_id)
-            .map(|(_, v)| v)
-            .ok_or_else(|| TermError::SessionNotFound(session_id.to_string()))?;
+        // DashMap::remove 返回 Option<(K, V)>，取 value；None → 已关闭/不存在，幂等返回
+        let session = match self.sessions.remove(session_id) {
+            Some((_, v)) => v,
+            None => {
+                tracing::info!(
+                    session = %session_id,
+                    "close_session: session 不存在或已关闭，幂等返回 Ok"
+                );
+                return Ok(());
+            }
+        };
         session.close().await
     }
 
@@ -938,16 +946,26 @@ impl SessionManager {
     /// detach session（远端 PTY 保活，本地释放连接，供后续 attach 重连）。
     ///
     /// 仅 persistent session 支持 detach；非 persistent handle 返回 InvalidArgument。
-    /// 调用后 session 从本地 map 移除，远端 session 转 Detached。
+    /// 成功后 session 从本地 map 移除，远端 session 转 Detached。
+    ///
+    /// 失败语义（P1-8）——**先校验 / detach 成功，才从 map 移除**：
+    /// - session 不存在 → `SESSION_NOT_FOUND`
+    /// - 非 persistent handle → `INVALID_ARGUMENT`，session **保留**在 map
+    ///   （可改走 close_session 或继续其他操作）
+    /// - `detach()` 远端网络调用失败 → 错误向上传播，session **保留**在 map
+    ///   （远端可能仍处于 Attached 状态；调用方可重试 detach，或显式
+    ///   close_session 放弃远端）
+    ///
+    /// 旧实现先 `remove` 再 downcast 校验：校验失败时 session 已从 map 消失，
+    /// 最后一个 Arc drop → read task abort / 连接释放 → 远端 shell 被终止，
+    /// 且后续所有调用 SESSION_NOT_FOUND。现改为 get → 校验 → detach → remove。
     pub async fn detach_session(&self, session_id: &str) -> Result<(), TermError> {
         // Phase 4-B：tracing（info 级别，低频重要操作）
         tracing::info!(session = %session_id, "detach_session");
-        let session = self
-            .sessions
-            .remove(session_id)
-            .map(|(_, v)| v)
-            .ok_or_else(|| TermError::SessionNotFound(session_id.to_string()))?;
+        // 1. get（非 remove）：校验失败时 session 不应从 map 消失
+        let session = self.get_session(session_id)?;
 
+        // 2. 校验 handle 为 persistent
         let handle = session.handle();
         let persistent = handle
             .as_any()
@@ -956,9 +974,13 @@ impl SessionManager {
                 "session does not support detach (non-persistent handle)".into()
             ))?;
 
+        // 3. 远端 detach（网络调用）：失败 → session 保留在 map，错误向上传播
         persistent.detach().await?;
+
+        // 4. 全部成功才移除：session drop 时 read_task 被 abort，
+        //    handle drop 时 daemon 连接关闭
+        self.sessions.remove(session_id);
         tracing::info!(session = %session_id, "detach_session: detached, remote PTY kept alive");
-        // session drop 时 read_task 被 abort，handle drop 时 daemon 连接关闭
         Ok(())
     }
 
@@ -1808,11 +1830,8 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), "SESSION_NOT_FOUND");
 
-        let err = mgr
-            .close_session("nonexistent")
-            .await
-            .unwrap_err();
-        assert_eq!(err.code(), "SESSION_NOT_FOUND");
+        // close_session 不在此断言：幂等契约（P3-2）下不存在的 session 返回 Ok，
+        // 见 close_session_unknown_id_is_idempotent_ok
     }
 
     #[tokio::test]
@@ -2135,7 +2154,8 @@ mod tests {
         assert_eq!(err.code(), "SESSION_CLOSED");
     }
 
-    /// Lost 状态下 close_session 幂等：首次成功（Lost → Closed），再次 SESSION_NOT_FOUND。
+    /// Lost 状态下 close_session 幂等（P3-2）：首次成功（Lost → Closed），
+    /// 再次调用返回 Ok（MCP 工具契约 "Idempotent"，Agent 重试安全）。
     #[tokio::test]
     async fn close_session_on_lost_state_is_idempotent() {
         let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
@@ -2146,8 +2166,45 @@ mod tests {
             .await
             .expect("Lost 状态 close_session 应成功");
 
-        // 再次 close：已从 map 移除 → SESSION_NOT_FOUND
-        let err = mgr.close_session(&id).await.unwrap_err();
+        // 再次 close：已从 map 移除 → 幂等返回 Ok（不再 SESSION_NOT_FOUND）
+        mgr.close_session(&id)
+            .await
+            .expect("close_session 应幂等：已关闭/不存在的 session 返回 Ok");
+    }
+
+    /// 从未存在的 session_id 调 close_session 同样幂等返回 Ok（P3-2）。
+    #[tokio::test]
+    async fn close_session_unknown_id_is_idempotent_ok() {
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        assert!(mgr.close_session("never-existed").await.is_ok());
+        assert!(mgr.list_sessions().is_empty());
+    }
+
+    // ── P1-8：detach_session 校验失败不得销毁 session ──────────────
+
+    /// 旧实现 remove 先于 downcast 校验：非 persistent session 返回
+    /// InvalidArgument 但已从 map 移除，最后一个 Arc drop → read task abort /
+    /// 连接释放 → 远端 shell 终止，后续所有调用 SESSION_NOT_FOUND。
+    /// 修复后：校验失败 session 必须保留在 map（可重试 / 改走 close_session）。
+    #[tokio::test]
+    async fn detach_session_non_persistent_keeps_session_in_map() {
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let session = make_fake_session("sess_detach");
+        mgr.sessions.insert("sess_detach".into(), session.clone());
+
+        let err = mgr.detach_session("sess_detach").await.unwrap_err();
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+        assert!(
+            mgr.sessions.contains_key("sess_detach"),
+            "detach 校验失败后 session 应保留在 map（不被误杀）"
+        );
+    }
+
+    /// detach 不存在的 session → SESSION_NOT_FOUND（且 map 仍为空）。
+    #[tokio::test]
+    async fn detach_session_unknown_returns_session_not_found() {
+        let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
+        let err = mgr.detach_session("nonexistent").await.unwrap_err();
         assert_eq!(err.code(), "SESSION_NOT_FOUND");
     }
 

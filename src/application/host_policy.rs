@@ -151,40 +151,68 @@ impl ResolvedPolicy {
 // HostPolicyResolver
 // ───────────────────────────────────────────────────────────────────────────
 
+/// 配置损坏时的全拒哨兵 scope（P2-2 fail-closed）。
+///
+/// `is_under_remote` 要求 canonical == root 或以其 + "/" 开头；远端正常情况下
+/// 不存在该路径（需 root 特意创建），任何真实 SFTP 目标都不会命中——即
+/// "除该哨兵路径本身外全拒"，绝不等价于 `["/"]` 全放行。
+const CORRUPT_DENY_ALL_SCOPE: &str = "/__termbridge_host_policy_corrupt_deny_all__";
+
 /// HostPolicy 解析器：加载 hosts.toml + 按优先级合并（ADR-0017 §2.4）。
 ///
 /// 不可变原则（ADR-0017 §2.2）：本结构只读不写。配置文件由用户显式编辑，
 /// TermBridge 永不作为操作副作用修改它。
 pub struct HostPolicyResolver {
     config: HostPolicyConfig,
+    /// 配置损坏标记（P2-2 fail-closed）：hosts.toml 存在但不可读 / 不可解析时置位。
+    ///
+    /// 旧实现损坏 → 回退空配置 → `allowed_remote_paths_for` 返回 None → SFTP
+    /// scope 回退全局默认 `["/"]`（全放行）：一个 TOML 手误静默放宽**所有**主机的
+    /// SFTP 范围。损坏时改为 `allowed_remote_paths_for` 返回全拒哨兵 scope
+    /// （`CORRUPT_DENY_ALL_SCOPE`），fail-closed 直到用户修复配置；
+    /// auth / session 仍走 system default（保守）。
+    corrupt: bool,
 }
 
 impl HostPolicyResolver {
     /// 从默认平台路径加载（ADR-0017 §2.9）。
     ///
-    /// 容错策略（向后兼容）：
-    /// - 文件不存在 → 返回空配置（所有 host 走 system default）
-    /// - 解析失败 → 记录 WARN，返回空配置（不 panic，不阻断启动）
+    /// 容错策略（P2-2 fail-closed）：
+    /// - 文件不存在 → 空配置（所有 host 走 system default，正常首用场景）
+    /// - 文件存在但不可读 / 不可解析 → 记录 **error** 日志并置 `corrupt` 标记：
+    ///   `allowed_remote_paths_for` 返回全拒 scope（永不回退全局 `["/"]`
+    ///   全放行），修复 hosts.toml 后自动恢复。
     pub fn load_default() -> Self {
         let path = default_config_path();
         Self::load_from(&path)
     }
 
     /// 从指定路径加载（测试用）。
+    ///
+    /// 容错策略见 `load_default`：不存在 → 空配置；存在但不可读 / 不可解析
+    /// → fail-closed（corrupt 标记 + 全拒 SFTP scope）。
     pub fn load_from(path: &Path) -> Self {
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
-            Err(e) => {
-                // 文件不存在是正常情况（首次使用），不 WARN；其他错误 WARN
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "failed to read host policy config, falling back to empty config"
-                    );
-                }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 文件不存在是正常情况（首次使用），空配置 + 走 system default
                 return Self {
                     config: HostPolicyConfig::default(),
+                    corrupt: false,
+                };
+            }
+            Err(e) => {
+                // 文件存在但不可读（权限损坏等）→ fail-closed（P2-2）：
+                // 绝不回退到全局默认 `["/"]` 全放行
+                tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    "host policy config exists but cannot be read; failing closed: \
+                     SFTP remote scope denies all paths until the file is fixed"
+                );
+                return Self {
+                    config: HostPolicyConfig::default(),
+                    corrupt: true,
                 };
             }
         };
@@ -197,16 +225,23 @@ impl HostPolicyResolver {
                     host_count = cfg.hosts.len(),
                     "host policy config loaded"
                 );
-                Self { config: cfg }
+                Self {
+                    config: cfg,
+                    corrupt: false,
+                }
             }
             Err(e) => {
-                tracing::warn!(
+                // 解析失败 → fail-closed（P2-2）：静默回退空配置会让
+                // allowed_remote_paths 回退全局默认 ["/"]（全放行）
+                tracing::error!(
                     path = %path.display(),
                     error = %e,
-                    "failed to parse host policy config, falling back to empty config"
+                    "failed to parse host policy config; failing closed: \
+                     SFTP remote scope denies all paths until hosts.toml is fixed"
                 );
                 Self {
                     config: HostPolicyConfig::default(),
+                    corrupt: true,
                 }
             }
         }
@@ -216,12 +251,24 @@ impl HostPolicyResolver {
     pub fn empty() -> Self {
         Self {
             config: HostPolicyConfig::default(),
+            corrupt: false,
         }
     }
 
     /// 用预加载的配置创建（测试用）。
     pub fn with_config(config: HostPolicyConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            corrupt: false,
+        }
+    }
+
+    /// 配置是否处于损坏（fail-closed）状态（P2-2）。
+    ///
+    /// true 表示 hosts.toml 存在但不可读 / 不可解析：SFTP 远端 scope 全拒，
+    /// auth / session 走 system default。供 GUI / CLI 展示与诊断。
+    pub fn is_corrupt(&self) -> bool {
+        self.corrupt
     }
 
     /// 解析某 host 的最终策略（ADR-0017 §2.4 优先级）。
@@ -263,7 +310,19 @@ impl HostPolicyResolver {
     ///
     /// 未配置 → None（此时 SFTP 路径检查回退全局默认：
     /// `TERMBRIDGE_ALLOWED_REMOTE_PATHS` / `["/"]`）。
+    ///
+    /// P2-2 fail-closed：配置损坏（存在但不可读 / 不可解析）时**永不**返回
+    /// None——None 会回退全局默认（可能是 `["/"]` 全放行）。改为返回一个
+    /// 不可能匹配任何真实远端路径的哨兵 scope（`CORRUPT_DENY_ALL_SCOPE`），
+    /// check_remote_access 对所有目标报 REMOTE_PATH_NOT_ALLOWED，直到配置修复。
     pub fn allowed_remote_paths_for(&self, host_alias: &str) -> Option<Vec<String>> {
+        if self.corrupt {
+            tracing::warn!(
+                host = %host_alias,
+                "host policy config is corrupt; SFTP remote scope denied for host (fail-closed)"
+            );
+            return Some(vec![CORRUPT_DENY_ALL_SCOPE.to_string()]);
+        }
         self.config
             .hosts
             .get(host_alias)
@@ -639,6 +698,9 @@ mod tests {
         let p = resolver.resolve("any", None, None);
         assert_eq!(p, ResolvedPolicy::default_policy());
         assert!(resolver.list_configured_hosts().is_empty());
+        // 文件不存在不是损坏：SFTP scope 正常回退全局默认（P2-2 只针对"存在但坏"）
+        assert!(!resolver.is_corrupt());
+        assert!(resolver.allowed_remote_paths_for("any").is_none());
     }
 
     #[test]
@@ -673,13 +735,34 @@ session = "standard"
     }
 
     #[test]
-    fn load_from_invalid_toml_returns_empty() {
+    fn load_from_invalid_toml_fails_closed_not_empty_open() {
         let tmp = temp_file("this is not valid toml [[[[");
         let resolver = HostPolicyResolver::load_from(&tmp);
 
-        // 解析失败 → 空配置 → system default
+        // auth / session 走 system default（保守）
         let p = resolver.resolve("any", None, None);
         assert_eq!(p, ResolvedPolicy::default_policy());
+
+        // P2-2 fail-closed：SFTP scope 全拒，绝不回退全局默认 ["/"]（全放行）
+        assert!(resolver.is_corrupt());
+        let scope = resolver.allowed_remote_paths_for("any");
+        assert_eq!(scope, Some(vec![CORRUPT_DENY_ALL_SCOPE.to_string()]));
+    }
+
+    /// 损坏配置的全拒 scope 不会被 `is_under_remote` 命中（除哨兵路径本身）。
+    #[test]
+    fn corrupt_deny_all_scope_never_matches_normal_remote_paths() {
+        let tmp = temp_file("bad toml {{{{");
+        let resolver = HostPolicyResolver::load_from(&tmp);
+        let scope = resolver.allowed_remote_paths_for("prod").unwrap();
+        let root = scope[0].as_str();
+        // 正常目标（含允许根 "/" 下的任意路径）都不在前缀之下
+        for target in ["/etc/passwd", "/home/u/x", "/srv/app/file", "/"] {
+            let root_trimmed = root.trim_end_matches('/');
+            let matches = target == root_trimmed
+                || target.starts_with(&format!("{root_trimmed}/"));
+            assert!(!matches, "哨兵 scope 不应匹配 {target}");
+        }
     }
 
     #[test]
@@ -706,8 +789,8 @@ auth = "key"
     }
 
     #[test]
-    fn load_from_invalid_auth_value_returns_empty() {
-        // auth 值不在枚举内 → toml 解析失败 → 整个配置回退空
+    fn load_from_invalid_auth_value_fails_closed() {
+        // auth 值不在枚举内 → toml 解析失败 → fail-closed（P2-2）
         let toml = r#"
 [hosts.prod]
 auth = "biometric"
@@ -717,6 +800,12 @@ auth = "biometric"
 
         let p = resolver.resolve("prod", None, None);
         assert_eq!(p, ResolvedPolicy::default_policy());
+        // SFTP scope 全拒（而非回退全局 ["/"]）
+        assert!(resolver.is_corrupt());
+        assert_eq!(
+            resolver.allowed_remote_paths_for("prod"),
+            Some(vec![CORRUPT_DENY_ALL_SCOPE.to_string()])
+        );
     }
 
     // ── TOML 点号别名防护（IP 别名必须加引号）────────────────────────

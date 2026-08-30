@@ -18,7 +18,9 @@
 //!
 //! 关键约束（ADR-0009 / ADR-0017 §2.2）：
 //! - 密码经 `CredentialProvider` 获取，仅在 SSH 认证瞬间 `reveal()`，用完立即 drop（Zeroize）
-//! - 公钥部署幂等（`grep -qF` 检查已存在，避免重复写入）
+//! - 公钥部署幂等（`grep -qFe` 检查已存在，避免重复写入），且注入安全：
+//!   key 行经 base64 解码追加、grep 模式单引号转义（公钥 comment 字段用户可控，
+//!   原文不能拼进 shell 命令）
 //! - **不修改 hosts.toml**：bootstrap 只改变 Remote State（authorized_keys），
 //!   Host Policy 是用户意图，配置修改由用户显式完成（hint 仅为建议）
 //! - 不修改 `ssh.rs` 逻辑，仅复用 `connect_unauthenticated` / `authenticate_session` /
@@ -27,6 +29,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use base64::prelude::*;
 use russh::client::Handle;
 use russh::ChannelMsg;
 use serde::Serialize;
@@ -218,12 +221,20 @@ async fn ensure_identity_file(host: &Host) -> Result<PathBuf, TermError> {
     }
 
     tokio::fs::create_dir_all(&ssh_dir).await.ok();
+    // 非 UTF-8 的 HOME（Windows 上合法）不能 to_str().unwrap()（panic），
+    // 返回明确的 TermError
+    let key_path_str = key_path.to_str().ok_or_else(|| {
+        TermError::InvalidArgument(format!(
+            "identity file path is not valid UTF-8: {}",
+            key_path.display()
+        ))
+    })?;
     let output = tokio::process::Command::new("ssh-keygen")
         .args([
             "-t",
             "ed25519",
             "-f",
-            key_path.to_str().unwrap(),
+            key_path_str,
             "-N",
             "",
             "-q",
@@ -248,10 +259,38 @@ async fn read_public_key(key_path: &Path) -> Result<String, TermError> {
     Ok(content.trim().to_string())
 }
 
+/// shell 单引号字面量转义（POSIX sh）。
+///
+/// 把任意字符串包成安全的单引号字面量：单引号内除 `'` 外所有字符（`$`、
+/// 反引号、`\`、`;`、换行等）都是字面量；`'` 用 `'\''` 序列表示
+/// （闭引号 + 反斜杠转义引号 + 开引号）。用于把用户可控内容（公钥 comment
+/// 字段）拼进远端命令而不产生注入。
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// 构造公钥部署命令（幂等 + 注入安全，P2-11）。
+///
+/// - 幂等：`grep -qFe <key 字面量>` 检查已存在则不追加（与旧 `grep -qF` 行为
+///   一致，`-e` 防止模式以 `-` 开头被当作选项）。
+/// - 注入安全：公钥的 comment 字段用户可控，原文（含 `'`）不能直接拼进命令。
+///   key 行先本地 base64 编码，远端 `printf '%s' <b64> | base64 -d` 解码后追加，
+///   追加路径不含任何可被 shell 解释的原始内容；grep 模式经
+///   `shell_single_quote` 转义为字面量。
+fn build_deploy_public_key_cmd(public_key: &str) -> String {
+    let key_b64 = BASE64_STANDARD.encode(public_key.as_bytes());
+    format!(
+        r#"mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -qFe {key_pattern} ~/.ssh/authorized_keys || printf '%s' {b64} | base64 -d >> ~/.ssh/authorized_keys"#,
+        key_pattern = shell_single_quote(public_key),
+        b64 = shell_single_quote(&key_b64),
+    )
+}
+
 /// 在已认证的 session 上开 channel 执行公钥部署命令（幂等）。
 ///
-/// 命令：确保 `~/.ssh` 存在且权限正确 + 公钥未重复写入。
-/// `grep -qF` 检查公钥是否已在 authorized_keys 中，是则跳过追加。
+/// 命令：确保 `~/.ssh` 存在且权限正确 + 公钥未重复写入（`grep -qFe` 字面量
+/// 检查），不存在则经 base64 解码追加（注入安全，见
+/// `build_deploy_public_key_cmd`）。
 async fn deploy_public_key(
     session: &mut Handle<SshClientHandler>,
     public_key: &str,
@@ -261,10 +300,7 @@ async fn deploy_public_key(
         .await
         .map_err(|e| TermError::ChannelError(format!("open channel: {e}")))?;
 
-    let cmd = format!(
-        r#"mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && grep -qF '{}' ~/.ssh/authorized_keys || echo '{}' >> ~/.ssh/authorized_keys"#,
-        public_key, public_key
-    );
+    let cmd = build_deploy_public_key_cmd(public_key);
 
     channel
         .exec(true, cmd.as_str())
@@ -329,5 +365,72 @@ mod tests {
             !BOOTSTRAP_HINT.contains("changed host policy"),
             "hint 不得宣称已修改 host policy: {BOOTSTRAP_HINT}"
         );
+    }
+
+    // ── P2-11：shell 注入安全 + 非 UTF-8 HOME ──────────────────────────
+
+    #[test]
+    fn shell_single_quote_wraps_plain_string() {
+        assert_eq!(shell_single_quote("abc"), "'abc'");
+        assert_eq!(shell_single_quote(""), "''");
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_single_quotes() {
+        // ' → '\''（闭引号 + 反斜杠转义引号 + 开引号）
+        assert_eq!(shell_single_quote("it's"), "'it'\\''s'");
+        // 单个 ' → ''\'''（空串 + 转义引号 + 空串）
+        assert_eq!(shell_single_quote("'"), r"''\'''");
+        assert_eq!(shell_single_quote("a'b'c"), "'a'\\''b'\\''c'");
+    }
+
+    #[test]
+    fn shell_single_quote_keeps_metacharacters_literal() {
+        // $ ` \ ; 在单引号内均为字面量（除 `'` 外无需转义）
+        assert_eq!(
+            shell_single_quote("a$(touch /tmp/pwned)b"),
+            "'a$(touch /tmp/pwned)b'"
+        );
+        assert_eq!(shell_single_quote("a`id`b;c\\d"), "'a`id`b;c\\d'");
+    }
+
+    #[test]
+    fn deploy_cmd_appends_via_base64_and_escapes_grep_pattern() {
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI user@host";
+        let cmd = build_deploy_public_key_cmd(key);
+        // 追加走 base64 解码，原文不进入 shell 可解释位置
+        let expected_b64 = BASE64_STANDARD.encode(key.as_bytes());
+        assert!(
+            cmd.contains(&format!("printf '%s' {}", shell_single_quote(&expected_b64))),
+            "追加路径应为 base64: {cmd}"
+        );
+        assert!(
+            cmd.contains("| base64 -d >> ~/.ssh/authorized_keys"),
+            "追加路径应经 base64 -d: {cmd}"
+        );
+        // 旧的裸 `echo '<原文>'` 不应出现
+        assert!(!cmd.contains("echo '"), "不得再用 echo 拼原文: {cmd}");
+        // 幂等 grep 用转义后的字面量
+        assert!(
+            cmd.contains(&format!("grep -qFe {}", shell_single_quote(key))),
+            "grep 模式应转义: {cmd}"
+        );
+    }
+
+    #[test]
+    fn deploy_cmd_neutralizes_quote_injection_in_comment() {
+        // comment 字段含 `'`：旧实现 `echo '{}'` 会闭合引号执行注入片段；
+        // 新实现中 grep 模式必须完整转义（含 '\''），且追加路径只含 base64
+        let malicious = "ssh-ed25519 AAAA x' ; touch /tmp/pwned #";
+        let cmd = build_deploy_public_key_cmd(malicious);
+        // 完整转义后的字面量出现
+        assert!(cmd.contains(shell_single_quote(malicious).as_str()));
+        // 转义序列存在（原始 `'` 已被 '\'' 替换）
+        assert!(cmd.contains("'\\''"), "应含 \\'\\'' 转义序列: {cmd}");
+        // 追加路径只含 base64（原文不出现在 echo/printf 的可解释位置）
+        assert!(!cmd.contains("echo '"));
+        let b64 = BASE64_STANDARD.encode(malicious.as_bytes());
+        assert!(!b64.contains('\''), "base64 输出不应含引号");
+        assert!(cmd.contains(shell_single_quote(&b64).as_str()));
     }
 }

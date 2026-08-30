@@ -13,8 +13,11 @@
 //!   3. 远端 realpath 规范化
 //!   4. Effective scope：`host_roots`（hosts.toml per-host）优先，否则全局
 //!      （`TERMBRIDGE_ALLOWED_REMOTE_PATHS` 环境变量 → 默认 `["/"]`）前缀匹配
-//!   5. Hard safety（无条件、无论 scope 多宽松）：`~/.ssh/authorized_keys` 与
-//!      `/proc` `/sys` 的写/建/删 → 硬拒（authorized_keys 只能走 bootstrap_host）
+//!   5. Hard safety（无条件、无论 scope 多宽松）：`~/.ssh/authorized_keys`
+//!      （含 `authorized_keys2`）与 `/proc` `/sys` 的写/建/删 → 硬拒
+//!      （authorized_keys 只能走 bootstrap_host）。Create 目标不存在、走父目录
+//!      fallback 时，父目录（如 `~/.ssh`）永远匹配不到 authorized_keys 后缀，
+//!      因此必须对目标字面路径（词法规范化）再套一次硬安全规则。
 //!
 //! 默认：
 //! - `allowed_local_paths` = `[cwd, temp/termbridge]`（+ `TERMBRIDGE_ALLOWED_LOCAL_PATHS`）
@@ -228,8 +231,16 @@ impl PathPolicy {
     ///    校验其父目录（需已存在且被允许）。
     /// 4. Effective scope：`host_roots`（hosts.toml per-host，有则优先）或全局
     ///    （`TERMBRIDGE_ALLOWED_REMOTE_PATHS` / 默认 `["/"]`），前缀匹配。
-    /// 5. Hard safety（无条件）：`~/.ssh/authorized_keys` 与 `/proc` `/sys` 的
-    ///    写/建/删 → 硬拒（authorized_keys 只能经 `bootstrap_host` 部署）。
+    /// 5. Hard safety（无条件）：`~/.ssh/authorized_keys`（含 `authorized_keys2`）
+    ///    与 `/proc` `/sys` 的写/建/删 → 硬拒（authorized_keys 只能经
+    ///    `bootstrap_host` 部署）。
+    ///
+    /// Create fallback 的硬安全缺口（P1-2）：目标不存在时只有父目录被 realpath，
+    /// `hard_safety_deny` 的 `/.ssh/authorized_keys` 后缀匹配对父目录
+    /// `~/.ssh` 永远不命中——新建 `~/.ssh/authorized_keys` 会绕过不变量。
+    /// 因此 fallback 在父目录 scope 检查通过后，还要对**目标字面路径**
+    /// （`normalize_remote_path_lexical` 规范化，防 `//` / `..` 变体）套硬安全规则：
+    /// 父目录管 scope，目标管硬安全。
     pub async fn check_remote_access(
         &self,
         path: &str,
@@ -263,7 +274,7 @@ impl PathPolicy {
         };
         let expanded = expand_tilde(path, home.as_deref());
 
-        // 3. realpath 规范化（Create：目标不存在 → 校验父目录）
+        // 3. realpath 规范化（Create：目标不存在 → 校验父目录 + 目标自身硬安全）
         let canonical = match sftp.canonicalize(&expanded).await {
             Ok(c) => c,
             Err(TermError::SftpNoSuchFile(_)) if op == RemoteOperation::Create => {
@@ -273,13 +284,28 @@ impl PathPolicy {
                     ))
                 })?;
                 let parent_canonical = sftp.canonicalize(&parent).await?;
-                return self.check_scope_and_safety(
+                // 父目录管 scope（含父目录自身的硬安全，如 /proc 下建新文件）
+                self.check_scope_and_safety(
                     &parent_canonical,
                     path,
                     op,
                     host_roots,
                     home.as_deref(),
-                );
+                )?;
+                // 目标管硬安全（P1-2）：目标不存在无法 realpath，后缀匹配对父目录
+                // （`~/.ssh`）永远不命中，必须对目标字面路径再套一次硬安全规则，
+                // 否则新建 `~/.ssh/authorized_keys` 可绕过
+                // "公钥部署只能走 bootstrap_host" 不变量。
+                // 词法规范化先于匹配：堵住 `//` / `.` / `..` 变体
+                // （`~/.ssh//authorized_keys`、`~/.ssh/../.ssh/authorized_keys`）。
+                let target = normalize_remote_path_lexical(&expanded);
+                if let Some(reason) = hard_safety_deny(&target, op) {
+                    return Err(TermError::RemotePathNotAllowed(format!(
+                        "{reason}（path: '{path}' → '{target}', op: {}）",
+                        op.as_str()
+                    )));
+                }
+                return Ok(());
             }
             Err(e) => return Err(e),
         };
@@ -432,16 +458,21 @@ fn expand_tilde(path: &str, home: Option<&str>) -> String {
 /// 无条件硬安全规则（先于 allowlist 生效，任意命中即拒）。
 ///
 /// 只拦"高风险操作"（写/建/删/改权限），读不受限：
-/// - `~/.ssh/authorized_keys`：认证控制面文件，公钥部署唯一受控通道是
-///   `bootstrap_host`（SFTP 写会改变 SSH 登录权限，与受控流程冲突）
+/// - `~/.ssh/authorized_keys`（含 `authorized_keys2`，OpenSSH ≤8.6 兼容文件名）：
+///   认证控制面文件，公钥部署唯一受控通道是 `bootstrap_host`
+///   （SFTP 写会改变 SSH 登录权限，与受控流程冲突）
 /// - `/proc` / `/sys`：内核接口，禁止写 / 建 / 删
 fn hard_safety_deny(canonical: &str, op: RemoteOperation) -> Option<String> {
     use RemoteOperation::{Chmod, Create, Delete, Read, Write};
     match op {
         Read => None,
         Write | Create | Delete | Chmod => {
-            // 1. authorized_keys（end-suffix 匹配：无论 home 是否能解析都覆盖）
-            if canonical.ends_with("/.ssh/authorized_keys") {
+            // 1. authorized_keys / authorized_keys2（end-suffix 匹配：无论 home
+            //    是否能解析都覆盖；Create fallback 需调用方先对目标字面路径做
+            //    词法规范化，见 check_remote_access）
+            if canonical.ends_with("/.ssh/authorized_keys")
+                || canonical.ends_with("/.ssh/authorized_keys2")
+            {
                 return Some(
                     "~/.ssh/authorized_keys 是认证控制面文件，SFTP 写/删被禁止（公钥部署只能走 bootstrap_host）".to_string(),
                 );
@@ -460,6 +491,64 @@ fn hard_safety_deny(canonical: &str, op: RemoteOperation) -> Option<String> {
             None
         }
     }
+}
+
+/// 远端路径词法规范化（纯字符串处理，不访问文件系统 / 远端）。
+///
+/// Policy 层（policy.rs）的敏感路径 Confirm / Deny 检查发生在远端 realpath
+/// **之前**（SFTP channel 尚未打开），只能做词法规范化；PathPolicy 的
+/// Create fallback 也用它对不存在的目标字面路径做硬安全匹配。规则
+/// （POSIX 词法语义）：
+/// - 折叠连续 `/` 为单个 `/`（`//etc/passwd` → `/etc/passwd`）
+/// - 解析 `.` / `..` 段（`/tmp/../etc/x` → `/etc/x`）；绝对路径 `..` 越出根时
+///   钳制到根（realpath 语义）
+/// - `~` 开头：`~` 作为一个虚拟根段参与解析（策略层 home 未知）——`~/../etc/x`
+///   中 `..` 抵消 `~` → `/etc/x`（命中敏感表）；`~/etc/x` → `/~/etc/x`
+///   （不误伤用户家目录下自己的 etc 目录）
+/// - 相对路径保留相对语义（前导 `..` 保留，不虚构根）
+/// - 保留尾部斜杠（`/etc/` 是目录语义，敏感表前缀匹配依赖它）
+pub(crate) fn normalize_remote_path_lexical(path: &str) -> String {
+    let rooted = path.starts_with('/') || path.starts_with('~');
+    let trailing = path.ends_with('/');
+    // `~` 开头：剥掉 `~`（及紧随的 `/`）后按段解析，但先放一个 `~` 虚拟根段占位，
+    // 使 `..` 能抵消 `~`（`~/../etc/x` → `/etc/x`）
+    let body = if let Some(rest) = path.strip_prefix('~') {
+        rest.strip_prefix('/').unwrap_or(rest)
+    } else {
+        path
+    };
+    let mut segments: Vec<&str> = if path.starts_with('~') {
+        vec!["~"]
+    } else {
+        Vec::new()
+    };
+    for seg in body.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                if rooted {
+                    // 绝对 / `~` 根：`..` 弹栈，越出根时钳制（pop 空栈为 no-op）
+                    segments.pop();
+                } else if segments.last() == Some(&"..") || segments.is_empty() {
+                    // 相对路径：无根可钳制，前导 / 连续 `..` 保留
+                    segments.push("..");
+                } else {
+                    segments.pop();
+                }
+            }
+            s => segments.push(s),
+        }
+    }
+    let mut out = if rooted {
+        format!("/{}", segments.join("/"))
+    } else {
+        segments.join("/")
+    };
+    // 尾部斜杠保留（目录语义）
+    if trailing && !out.ends_with('/') {
+        out.push('/');
+    }
+    out
 }
 
 /// 取远端 POSIX 路径的父目录（Phase 2，check_remote_allow_new 用）。
@@ -1030,5 +1119,127 @@ mod tests {
             .check_remote_access("/home/u/x", RemoteOperation::Read, Some(&[]), &sftp)
             .await
             .is_ok(), "空 host scope 应回退全局");
+    }
+
+    // ── P1-2：Create 目标不存在的硬安全规则（authorized_keys 绕过修复）───
+
+    /// 上传（Create）到不存在的 `~/.ssh/authorized_keys` 必须硬拒：
+    /// 旧实现只 realpath 父目录 `/home/u/.ssh`，后缀匹配永远不命中 → 绕过
+    /// "authorized_keys 只能走 bootstrap_host" 不变量。
+    #[tokio::test]
+    async fn upload_create_to_nonexistent_authorized_keys_denied() {
+        let sftp = fake_home(vec![("/home/u/.ssh", "/home/u/.ssh")], Some("/home/u"));
+        let p = policy(vec![], vec!["/".into()]);
+        let err = p
+            .check_remote_access("~/.ssh/authorized_keys", RemoteOperation::Create, None, &sftp)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "REMOTE_PATH_NOT_ALLOWED");
+        assert!(!err.retriable());
+    }
+
+    /// 绝对路径形式同样拦截（父目录存在且在 scope 内也不能新建该文件）。
+    #[tokio::test]
+    async fn upload_create_to_nonexistent_authorized_keys_absolute_denied() {
+        let sftp = fake_home(vec![("/home/u/.ssh", "/home/u/.ssh")], Some("/home/u"));
+        let p = policy(vec![], vec!["/".into()]);
+        let err = p
+            .check_remote_access(
+                "/home/u/.ssh/authorized_keys",
+                RemoteOperation::Create,
+                None,
+                &sftp,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "REMOTE_PATH_NOT_ALLOWED");
+    }
+
+    /// `authorized_keys2`（OpenSSH ≤8.6 兼容文件名）同等硬拒。
+    #[tokio::test]
+    async fn upload_create_to_nonexistent_authorized_keys2_denied() {
+        let sftp = fake_home(vec![("/home/u/.ssh", "/home/u/.ssh")], Some("/home/u"));
+        let p = policy(vec![], vec!["/".into()]);
+        for path in ["~/.ssh/authorized_keys2", "/home/u/.ssh/authorized_keys2"] {
+            let err = p
+                .check_remote_access(path, RemoteOperation::Create, None, &sftp)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), "REMOTE_PATH_NOT_ALLOWED", "应硬拒: {path}");
+        }
+    }
+
+    /// 普通新文件不受影响：父目录在 scope 内 → 正常放行（不误伤）。
+    #[tokio::test]
+    async fn upload_create_to_nonexistent_regular_file_allowed() {
+        let sftp = fake_home(
+            vec![("/srv/app", "/srv/app"), ("/home/u/.ssh", "/home/u/.ssh")],
+            Some("/home/u"),
+        );
+        // per-host scope 收紧到 /srv/app 也不能误伤普通新文件
+        let roots = vec!["/srv/app".to_string()];
+        let p = policy(vec![], vec!["/srv/app".into()]);
+        assert!(p
+            .check_remote_access(
+                "/srv/app/newfile.txt",
+                RemoteOperation::Create,
+                Some(&roots),
+                &sftp,
+            )
+            .await
+            .is_ok());
+    }
+
+    /// 父目录自身的硬安全在 fallback 中仍然生效：/proc 下建新文件被拒。
+    #[tokio::test]
+    async fn upload_create_under_proc_parent_still_denied() {
+        let sftp = fake_home(vec![("/proc", "/proc")], None);
+        let p = policy(vec![], vec!["/".into()]);
+        let err = p
+            .check_remote_access("/proc/newfile", RemoteOperation::Create, None, &sftp)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "REMOTE_PATH_NOT_ALLOWED");
+    }
+
+    // ── normalize_remote_path_lexical 单元测试 ────────────────────
+
+    #[test]
+    fn normalize_lexical_folds_double_slashes_and_dotdot() {
+        assert_eq!(normalize_remote_path_lexical("//etc/passwd"), "/etc/passwd");
+        assert_eq!(normalize_remote_path_lexical("/tmp/../etc/x"), "/etc/x");
+        assert_eq!(
+            normalize_remote_path_lexical("/home/u/.ssh/../.ssh/authorized_keys"),
+            "/home/u/.ssh/authorized_keys"
+        );
+        assert_eq!(
+            normalize_remote_path_lexical("/a/b/./c"),
+            "/a/b/c"
+        );
+    }
+
+    #[test]
+    fn normalize_lexical_resolves_tilde_as_virtual_root() {
+        // `..` 抵消 `~` → 命中敏感表形态
+        assert_eq!(normalize_remote_path_lexical("~/../etc/x"), "/etc/x");
+        // 普通家目录路径不误伤（不会变成 /etc/...）
+        assert_eq!(normalize_remote_path_lexical("~/etc/x"), "/~/etc/x");
+        assert_eq!(normalize_remote_path_lexical("~"), "/~");
+    }
+
+    #[test]
+    fn normalize_lexical_clamps_above_root_and_keeps_relative() {
+        // 绝对路径越出根 → 钳制到根
+        assert_eq!(normalize_remote_path_lexical("/../etc/x"), "/etc/x");
+        // 相对路径保留相对语义
+        assert_eq!(normalize_remote_path_lexical("a/../b"), "b");
+        assert_eq!(normalize_remote_path_lexical("../etc"), "../etc");
+    }
+
+    #[test]
+    fn normalize_lexical_preserves_trailing_slash() {
+        // `/etc/`（目录语义）规范化后仍匹配 `/etc/` 前缀
+        assert_eq!(normalize_remote_path_lexical("/etc/"), "/etc/");
+        assert_eq!(normalize_remote_path_lexical("//etc//"), "/etc/");
     }
 }

@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
+use crate::application::path_policy::normalize_remote_path_lexical;
 use crate::domain::policy::{Action, ApprovalMode, Decision, Policy};
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -273,10 +274,16 @@ impl DefaultPolicy {
     /// 对 SFTP 传输动作检查。
     fn check_sftp_transfer(direction: &crate::domain::provider::TransferDirection, remote: &str) -> Decision {
         use crate::domain::provider::TransferDirection;
-        // upload 到敏感路径（/dev/、/etc/、/boot/、/sys/）→ Confirm
+        // upload 到敏感路径（/dev/、/etc/、/boot/、/sys/、/proc/）→ Confirm
+        //
+        // P2-1：匹配必须基于词法规范化后的路径。本检查在 raw 参数上进行
+        // （SFTP channel 尚未打开，realpath 在 PathPolicy 层才发生），不做规范化
+        // 时 `//etc/passwd`、`/tmp/../etc/x`、`~/../etc/x` 都能绕过 Confirm，
+        // 而实际 SFTP 操作会落在真正的敏感路径上。
         if matches!(direction, TransferDirection::Upload) {
             let sensitive = ["/dev/", "/etc/", "/boot/", "/sys/", "/proc/"];
-            if sensitive.iter().any(|p| remote.starts_with(p)) {
+            let normalized = normalize_remote_path_lexical(remote);
+            if sensitive.iter().any(|p| normalized.starts_with(p)) {
                 return Decision::Confirm;
             }
         }
@@ -286,9 +293,12 @@ impl DefaultPolicy {
     /// 对 SFTP 删除动作检查。
     fn check_sftp_remove(remote: &str, recursive: bool) -> Decision {
         // 递归删除根或 /etc / /usr 等系统目录 → Deny
+        // P2-1：critical 匹配同样基于词法规范化路径——`//etc` 不规范化时
+        // 不命中 Deny，会被降级为 Confirm（Deny 优先级被绕过）。
         if recursive {
             let critical = ["/", "/etc", "/usr", "/var", "/boot", "/sys", "/proc", "/lib", "/bin", "/sbin"];
-            if critical.iter().any(|p| remote == *p || remote.starts_with(&format!("{p}/"))) {
+            let normalized = normalize_remote_path_lexical(remote);
+            if critical.iter().any(|p| normalized == *p || normalized.starts_with(&format!("{p}/"))) {
                 return Decision::Deny;
             }
             // 其他递归删除 → Confirm
@@ -300,10 +310,11 @@ impl DefaultPolicy {
 
     /// 对 SFTP chmod 动作检查。
     fn check_sftp_chmod(remote: &str, mode: &str) -> Decision {
-        // chmod 777 系统目录 → Confirm
+        // chmod 777 系统目录 → Confirm（P2-1：匹配基于词法规范化路径）
         if mode == "777" || mode.contains("777") {
             let sensitive = ["/etc", "/var", "/usr", "/boot", "/sys", "/bin", "/sbin", "/lib"];
-            if sensitive.iter().any(|p| remote == *p || remote.starts_with(&format!("{p}/"))) {
+            let normalized = normalize_remote_path_lexical(remote);
+            if sensitive.iter().any(|p| normalized == *p || normalized.starts_with(&format!("{p}/"))) {
                 return Decision::Confirm;
             }
         }
@@ -758,6 +769,64 @@ mod tests {
             mode: "755".into(),
         });
         assert_eq!(d, Decision::Allow);
+    }
+
+    // ── P2-1：raw 路径绕过敏感表（词法规范化修复）────────────────────
+
+    /// upload 到敏感路径的 raw 变体必须与规范形态同判：
+    /// `//etc/passwd` / `/tmp/../etc/x` / `~/../etc/x` 在 realpath 前就能被
+    /// 词法规范化还原为 `/etc/...`，不得绕过 Confirm。
+    #[test]
+    fn sftp_transfer_upload_bypass_strings_hit_confirm() {
+        let p = DefaultPolicy::new();
+        for remote in ["//etc/passwd", "/tmp/../etc/x", "~/../etc/x", "//dev//sda"] {
+            let d = p.authorize(&Action::SftpTransfer {
+                direction: TransferDirection::Upload,
+                local: "/tmp/file".into(),
+                remote: remote.into(),
+            });
+            assert_eq!(d, Decision::Confirm, "应 Confirm: {remote}");
+        }
+    }
+
+    /// 词法规范化不得误伤：用户家目录下自己的 etc / tmp 目录仍 Allow。
+    #[test]
+    fn sftp_transfer_upload_tilde_paths_still_allow() {
+        let p = DefaultPolicy::new();
+        for remote in ["~/etc/x", "~/tmp/x"] {
+            let d = p.authorize(&Action::SftpTransfer {
+                direction: TransferDirection::Upload,
+                local: "/tmp/file".into(),
+                remote: remote.into(),
+            });
+            assert_eq!(d, Decision::Allow, "应 Allow（家目录不误伤）: {remote}");
+        }
+    }
+
+    /// 递归删除的 raw 变体不得把 Deny 降级为 Confirm（Deny 优先级保持）。
+    #[test]
+    fn sftp_remove_recursive_bypass_strings_hit_deny() {
+        let p = DefaultPolicy::new();
+        for remote in ["//etc", "/tmp/../etc", "//", "/../"] {
+            let d = p.authorize(&Action::SftpRemove {
+                remote: remote.into(),
+                recursive: true,
+            });
+            assert_eq!(d, Decision::Deny, "应 Deny: {remote}");
+        }
+    }
+
+    /// chmod 777 的 raw 变体与规范形态同判。
+    #[test]
+    fn sftp_chmod_bypass_strings_hit_confirm() {
+        let p = DefaultPolicy::new();
+        for remote in ["//etc/passwd", "/tmp/../etc/x", "~/../etc/passwd"] {
+            let d = p.authorize(&Action::SftpChmod {
+                remote: remote.into(),
+                mode: "777".into(),
+            });
+            assert_eq!(d, Decision::Confirm, "应 Confirm: {remote}");
+        }
     }
 
     // ── PolicyManager 链式判决测试 ───────────────────────────────────
