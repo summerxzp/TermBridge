@@ -13,9 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 本地缓存 `dirs::cache_dir()/termbridge/update-check.json`，24h 内不重复联网检查；网络/解析失败静默，24h 后重试
   - 版本刷新在后台线程异步完成，不阻塞启动；可用 `TERMBRIDGE_NO_UPDATE_CHECK=1` 关闭
 - **agentd 自动自举**（修复 `persistent=true` 全新安装报 `RuntimeMissing`）：首次部署时若本地缓存缺失，自动从发布包同目录的 `resources/agentd/linux-x86_64/termbridge-agentd` 复制到 `%LOCALAPPDATA%\TermBridge\agentd\`（POSIX 自动补执行位），不再需要手动放置；新增 3 个单元测试
-- **npm 平台包方案（长期主渠道，`packaging/npm-platform`）**：薄主包 `termbridge-mcp` + 平台包 `termbridge-win32-x64|linux-x64|darwin-arm64`（每包含完整 release 目录，保持 exe 同目录 / `current_exe()` / agentd 布局语义）
+- **npm 平台包方案（长期主渠道，`packaging/npm-platform`）**：薄主包 `@summerxzp/termbridge-mcp` + 平台包 `@summerxzp/termbridge-win32-x64|linux-x64|darwin-arm64`（每包含完整 release 目录，保持 exe 同目录 / `current_exe()` / agentd 布局语义）
   - `scripts/build-platform-packages.mjs`：从 release staging 生成 3 个平台包并同步主包版本与 optionalDependencies（版本取自 git tag，单源）
-  - release.yml 新增 `npm-packages` job：默认生成 + `npm pack` 校验；配置 `NPM_TOKEN` 后才真正 `npm publish`
+  - release.yml 的 `npm-packages` job：从 release staging 生成平台包 + `npm pack` 校验 + 经 **npm Trusted Publishing（OIDC）** 发布（各 npm 包已配置 `summerxzp/TermBridge` `release.yml` 为受信发布者，无需 NPM_TOKEN）
   - release.yml 发布矩阵归档统一为**扁平结构**（Windows zip 与 Unix tar.gz 解压层级一致）
 - **npm 壳过渡方案修正（`packaging/npm`）**：
   - 版本严格绑定：下载的二进制版本 = npm 包版本（`npx termbridge-mcp@0.2.1` 精确运行 v0.2.1），不再拉 GitHub latest；移除后台 24h 自动升级（更新交给 npm）
@@ -31,6 +31,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `/etc` 等系统目录的正常读/写仍放行（改 nginx.conf、部署应用等运维场景不受影响）
   - `hosts.toml` 新增 per-host `allowed_remote_paths`（ADR-0017 Host Policy 扩展）：按主机声明可触及范围，未配置回退全局 `TERMBRIDGE_ALLOWED_REMOTE_PATHS`（默认 `["/"]`，不缩小 SSH 账号已具备权限）
   - `~` / `~/...` 远端路径经 `realpath("~")`（通道级缓存）正确展开；`Create` 目标不存在时校验父目录；null 字节路径一律拒绝
+
+### Fixed
+
+**SSH / PTY（termbridge core）**
+- PTY rows/cols 与 russh 参数顺序对齐（russh 为 col-first），修正初始窗口尺寸颠倒
+- SSH connect / exec / SFTP open / PTY write / `ssh -G` 全部补齐超时，无响应主机不再永久挂起；新增 host 别名注入防护与 known_hosts 引号路径解析
+- 输出链路：`extract_context` 返回匹配文本；`strip_ansi` 修复 CSI 中间字节剥离与跨页状态；RingBuffer 改 watch 唤醒，避免读取空转
+- `sftp_chmod` 拒绝 mode=0（防止把文件权限清零）；SFTP 上传改原子写（temp + fsync + rename）；`sftp_transfer_dir` 下载校验目标目录名
+- Timeline 缓冲改用 `VecDeque`，避免大 session 下的频繁内存搬移
+- Unix 缓存路径统一走 `dirs` crate（遵循 XDG）；CLI 读消息增加长度边界校验；日志脱敏补全（Secret Debug redaction + URL userinfo redact）
+
+**agentd（远端 daemon；新增单元测试需 Linux CI 跑通）**
+- 补齐 pty_exit / session_lost 事件 + 通知驱动泵 + tail flush；修复 disconnect→detach 后 reconnect 的输出丢失
+- `send_input` 改独立 writer 线程 + 背压，大输入不再阻塞 read loop
+- 进程安全：FD_CLOEXEC、fork 前完成内存分配（fork-before-exec）、进程组 kill + reap；日志改走 stderr，不污染 PTY
+- daemon 升级路径 + 原子部署（升级不再中断既有 session）
+
+**策略 / 控制面安全**
+- 封堵 authorized_keys / authorized_keys2 经 SFTP create 的绕过；敏感路径词法归一化（`..` / 重复分隔符）；hosts.toml 解析失败 fail-closed；bootstrap 公钥部署注入安全 + 非 UTF-8 home 兼容
+- 控制面加固：IPC token 改用 CSPRNG、discovery 文件 0600、HELLO 限流、endpoint 唯一化
+
+**GUI / npm 分发**
+- 修复 React StrictMode 双挂载产生两条 PTY read loop（字节流被拆分、一半丢失）：后端重建前先 abort 同 session 旧任务 + 循环结束自清理（防 map 泄漏），前端 `startReadLoop` 补 disposed 检查
+- npm 平台包 package.json 补 `bin` 字段：修复 Linux/macOS 发布的二进制被 `npm pack` 归一为 0644（运行 EACCES）的发布阻断问题；launcher 失败提示改为 scoped 包名；release.yml 移除 `!cancelled()` 误用、新增 tag/Cargo.toml 版本一致性门禁、删除死代码兼容块；README 与内部文档同步（npm 主渠道、扁平归档结构、legacy 下载器说明）
 
 ## [0.2.1] - 2026-08-14
 
