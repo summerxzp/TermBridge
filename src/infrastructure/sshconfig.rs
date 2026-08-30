@@ -13,25 +13,73 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::domain::provider::Host;
 use crate::domain::provider::TermError;
+
+/// `ssh -G` 子进程超时（15s）。
+///
+/// 用户 ssh config 中 hung 的 `Match exec` 命令会让 `ssh -G` 永不退出 ——
+/// 不加界则 resolve（进而 open_session / connect_session）永久挂起。
+const SSH_G_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 校验 `ssh -G` 的 alias 参数（P1-4 参数注入防护），返回 trim 后的 alias。
+///
+/// alias 直接拼为 `.arg("-G").arg(alias)` —— 以 `-` 开头的值（如 `-F/path`）
+/// 会被 ssh 当作**选项**解析，可让 ssh 加载攻击者控制的 config 覆盖本次连接
+/// 全部配置（hostname / IdentityFile / proxyjump 等）。拒绝：
+/// - 空串 / 纯空白
+/// - 以 `-` 开头（含恰为 `--`，后者是 ssh 的选项结束符，非合法别名）
+///
+/// 首尾空白决策（P1-4 review 待定项）：**先 trim 再校验** —— 首尾空白视为
+/// 调用方噪音，trim 后的值同时用于 `ssh -G` 参数与 `Host.name`，避免空白
+/// 混入 config 查找；含**内部**空格的值（如 `my host`）不构成选项注入，
+/// 原样放行交给 ssh 报错。
+fn validate_alias(alias: &str) -> Result<&str, TermError> {
+    let trimmed = alias.trim();
+    if trimmed.is_empty() {
+        return Err(TermError::InvalidArgument(format!(
+            "ssh alias 为空（alias={alias:?}）"
+        )));
+    }
+    if trimmed.starts_with('-') {
+        return Err(TermError::InvalidArgument(format!(
+            "ssh alias 非法：以 '-' 开头会被 ssh 当作选项解析（疑似参数注入）: {alias:?}"
+        )));
+    }
+    Ok(trimmed)
+}
 
 /// 调用 `ssh -G <alias>` 并解析为 Host。
 ///
 /// `alias` 是 ssh config 里的 Host 别名（或直接 IP/hostname）。
 pub async fn resolve(alias: &str) -> Result<Host, TermError> {
+    // 入口校验（P1-4）：拒绝空串 / '-' 开头 / `--`，防 ssh 选项注入
+    let alias = validate_alias(alias)?;
+
     // ssh -G 走 stdio，快速返回，用 tokio::process 异步等。
     // stdin 置空：`ssh -G` 不读 stdin，但某些实现（如 Git for Windows 的
     // OpenSSH）会等 stdin EOF 才输出——MCP 场景 stdin 是长驻 transport，
     // 不置空会导致 open_session 永久挂起。
-    let output = tokio::process::Command::new("ssh")
+    //
+    // P1-12：整体加 15s 超时 —— 用户 config 中 hung 的 `Match exec` 命令会让
+    // `ssh -G` 永不退出，导致 resolve 永久挂起。
+    let spawn = tokio::process::Command::new("ssh")
         .arg("-G")
         .arg(alias)
         .stdin(std::process::Stdio::null())
-        .output()
-        .await
-        .map_err(|e| TermError::ConnectFailed(format!("spawn `ssh -G {alias}`: {e}")))?;
+        .output();
+    let output = match tokio::time::timeout(SSH_G_TIMEOUT, spawn).await {
+        Ok(res) => res
+            .map_err(|e| TermError::ConnectFailed(format!("spawn `ssh -G {alias}`: {e}")))?,
+        Err(_) => {
+            return Err(TermError::ConnectFailed(format!(
+                "`ssh -G {alias}` timed out after {}s（用户 ssh config 中可能有挂起的 Match exec 命令）",
+                SSH_G_TIMEOUT.as_secs()
+            )));
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -100,12 +148,16 @@ fn parse_ssh_g(alias: &str, stdout: &str) -> Result<Host, TermError> {
 
     // userknownhostsfile：可能含多个空格分隔路径（OpenSSH 默认 `~/.ssh/known_hosts ~/.ssh/known_hosts2`）。
     // Phase 2：收集全部路径并展开 ~（之前 Phase 1 仅取首个）。
+    // P3-6：按 OpenSSH token 语法切分 —— 双引号包裹的部分视为单个 token，
+    // 使含空格的路径（"C:\Users\my name\known_hosts"、"/home/my user/kh"）
+    // 不再被空白拆成多个 bogus 条目（与 identityfile 取整行 value 的处理同一精神）。
     // 不做 is_file 过滤——known_hosts 缺失本身是有意义状态（host 未知 / TOFU 首次写入），
     // 应让校验层报 "host 未知" 而非这里悄悄吞掉。空 Vec 表示 ssh -G 未输出该字段。
     let user_known_hosts_files: Vec<PathBuf> = single
         .get("userknownhostsfile")
         .map(|v| {
-            v.split_whitespace()
+            split_quoted_tokens(v)
+                .iter()
                 .map(|s| expand_tilde(s))
                 .collect()
         })
@@ -143,6 +195,46 @@ fn expand_tilde(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+/// 按 OpenSSH token 语法切分空格分隔的多 token 值（P3-6）。
+///
+/// 规则（与 OpenSSH config 的引号语义一致）：
+/// - 双引号包裹的片段视为**单个 token**，其内部空格保留（含空格路径的关键）
+/// - 引号可以与裸文本相邻（`"a b"c d` → `ab`、`d`），引号本身不出现在 token 中
+/// - 未闭合引号：宽容处理，剩余内容并入当前 token（不丢路径；OpenSSH 严格模式
+///   会报错，这里选择宽容 —— 误删用户 known_hosts 路径比接受残缺路径更危险）
+///
+/// 与 `identityfile` 的处理同一精神：identityfile 经 `splitn(2)` 取整行 value，
+/// 天然保留空格；本函数把同样的能力带给一行多值的 `userknownhostsfile`。
+fn split_quoted_tokens(value: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    // 当前 token 是否已有内容（引号本身也算内容：`" "` 是含一个空格的合法 token）
+    let mut started = false;
+    for c in value.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                started = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if started {
+                    tokens.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        tokens.push(cur);
+    }
+    tokens
 }
 
 /// 取 home 目录（不引入 dirs crate，用 std + 环境变量）。
@@ -587,5 +679,111 @@ port 22
             host.user_known_hosts_files.is_empty(),
             "缺省 userknownhostsfile 应为空 Vec"
         );
+    }
+
+    // ── P1-4：alias 入口校验（防 `ssh -G` 参数注入） ────────────────────
+
+    #[test]
+    fn validate_alias_rejects_dash_prefixed_injection() {
+        // 以 '-' 开头：ssh 会把 `-F /tmp/evil` 当选项解析（可加载攻击者控制的 config）
+        let err = validate_alias("-F /tmp/evil").unwrap_err();
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+        assert!(format!("{err}").contains("参数注入"));
+    }
+
+    #[test]
+    fn validate_alias_rejects_double_dash() {
+        // `--` 是 ssh 的选项结束符，作为别名同样拒绝
+        let err = validate_alias("--").unwrap_err();
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn validate_alias_rejects_single_dash_and_dash_only_prefixes() {
+        let err = validate_alias("-").unwrap_err();
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+        let err2 = validate_alias("-oProxyCommand=evil").unwrap_err();
+        assert_eq!(err2.code(), "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn validate_alias_rejects_empty() {
+        let err = validate_alias("").unwrap_err();
+        assert_eq!(err.code(), "INVALID_ARGUMENT");
+        // 纯空白 trim 后为空 → 同样拒绝
+        let err2 = validate_alias("   ").unwrap_err();
+        assert_eq!(err2.code(), "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn validate_alias_trims_surrounding_whitespace() {
+        // 决策：先 trim 再校验 —— 首尾空白视为调用方噪音，trim 后放行，
+        // 且返回值（trim 后）同时用于 ssh -G 参数与 Host.name
+        assert_eq!(validate_alias(" legitimate ").unwrap(), "legitimate");
+    }
+
+    #[test]
+    fn validate_alias_accepts_normal_aliases() {
+        assert_eq!(validate_alias("testhost").unwrap(), "testhost");
+        assert_eq!(validate_alias("203.0.113.140").unwrap(), "203.0.113.140");
+        // 内部空格不构成选项注入，原样放行（交给 ssh 报 unknown host）
+        assert_eq!(validate_alias("my host").unwrap(), "my host");
+    }
+
+    // ── P3-6：userknownhostsfile 引号 token（含空格路径） ───────────────
+
+    #[test]
+    fn split_quoted_tokens_basic() {
+        // 无引号：退化为普通空白切分
+        assert_eq!(split_quoted_tokens("a b c"), vec!["a", "b", "c"]);
+        // 引号包裹：内部空格保留为单 token
+        assert_eq!(split_quoted_tokens("\"a b\" c"), vec!["a b", "c"]);
+        // 连续引号段与裸文本相邻：引号本身不出现在 token 中（`"a b"c` → `a bc`）
+        assert_eq!(split_quoted_tokens("\"a b\"c d"), vec!["a bc", "d"]);
+        // 未闭合引号：剩余内容并入当前 token（宽容处理）
+        assert_eq!(split_quoted_tokens("\"a b"), vec!["a b"]);
+        // 空串 / 纯空白 → 空 Vec
+        assert!(split_quoted_tokens("").is_empty());
+        assert!(split_quoted_tokens("   ").is_empty());
+    }
+
+    #[test]
+    fn parse_user_known_hosts_file_quoted_path_with_spaces() {
+        // POSIX 风格含空格路径：引号包裹 → 单 token，空格保留
+        let g = "user u\nhostname h\nport 22\nuserknownhostsfile \"/home/my user/kh\"\n";
+        let host = parse_ssh_g("quoted", g).unwrap();
+        assert_eq!(
+            host.user_known_hosts_files.len(),
+            1,
+            "引号包裹的含空格路径应为单个 token"
+        );
+        assert_eq!(
+            host.user_known_hosts_files[0],
+            PathBuf::from("/home/my user/kh"),
+            "引号内的空格不应被拆分"
+        );
+    }
+
+    #[test]
+    fn parse_user_known_hosts_files_mixed_quoted_and_plain() {
+        // Windows 风格含空格引号路径 + 普通无引号路径混排
+        let g = "user u\nhostname h\nport 22\nuserknownhostsfile \"C:\\Users\\my name\\kh\" /tmp/kh2\n";
+        let host = parse_ssh_g("mixed", g).unwrap();
+        assert_eq!(host.user_known_hosts_files.len(), 2);
+        assert_eq!(
+            host.user_known_hosts_files[0],
+            PathBuf::from("C:\\Users\\my name\\kh")
+        );
+        assert_eq!(host.user_known_hosts_files[1], PathBuf::from("/tmp/kh2"));
+    }
+
+    #[test]
+    fn parse_user_known_hosts_files_unquoted_multi_path_still_works() {
+        // 回归保护：无引号多路径行为与之前一致（不依赖 HOME，路径不含 ~）
+        let g = "user u\nhostname h\nport 22\nuserknownhostsfile /tmp/kh1 /tmp/kh2\n";
+        let host = parse_ssh_g("plain", g).unwrap();
+        assert_eq!(host.user_known_hosts_files.len(), 2);
+        assert_eq!(host.user_known_hosts_files[0], PathBuf::from("/tmp/kh1"));
+        assert_eq!(host.user_known_hosts_files[1], PathBuf::from("/tmp/kh2"));
     }
 }

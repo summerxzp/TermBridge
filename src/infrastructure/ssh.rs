@@ -86,6 +86,38 @@ pub const KEEPALIVE_MAX_MISSES: u32 = 3;
 pub const MAX_PROXY_DEPTH: usize = 3;
 
 // ───────────────────────────────────────────────────────────────────────────
+// 超时配置常量（防半开连接上的无界 await 永久挂起）
+// ───────────────────────────────────────────────────────────────────────────
+
+/// SSH 连接 + 认证总超时（30s）。
+///
+/// 半开连接（对端失联但 TCP 未断）上 `client::connect` / `connect_stream` 与
+/// `authenticate_*` 可能永不返回；加界后映射为 `ConnectFailed`（消息含 "timed
+/// out"），避免 open_session / exec 永久挂起。
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 开新 channel 的超时（30s）。
+///
+/// `channel_open_session` 需等 server 回 CHANNEL_OPEN_CONFIRMATION；session
+/// 半开时无响应会永久等待。映射为 `ChannelError`。
+pub const CHANNEL_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// PTY 写入超时（60s）。
+///
+/// russh 在 channel 流控窗口耗尽时永久 park 等待窗口更新，而 session 死亡
+/// （半开连接）后没有任何机制唤醒窗口等待者 —— 不加界则 write 永久挂起。
+/// 取 60s（长于 CHANNEL_OPEN_TIMEOUT）：正常输出洪峰下窗口更新是毫秒级，
+/// 不应误伤合法的长时间写阻塞。映射为 `ChannelError`。
+pub const PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// SFTP provider 打开超时（30s）。
+///
+/// `SftpProvider::open` = channel_open + request_subsystem(sftp) + SFTP init
+/// 三个无界 await，且持 `session` 锁执行；超时后 future 连同锁 guard 一起被
+/// drop，最坏情况是 30s 有界阻塞而非永久 wedge 整个 session。映射为 `SftpError`。
+pub const SFTP_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+// ───────────────────────────────────────────────────────────────────────────
 // SshProvider
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -390,12 +422,14 @@ impl TerminalProvider for SshProvider {
             .await
             .map_err(|e| TermError::ChannelError(format!("channel_open_session: {e}")))?;
 
+        // russh 0.62 的 request_pty 参数顺序为 (cols, rows)：col_width 在前，
+        // row_height 在后（此前传反导致远端 PTY 尺寸颠倒）。
         channel
             .request_pty(
                 false,
                 "xterm-256color",
-                request.pty_size.rows as u32,
-                request.pty_size.cols as u32,
+                request.pty_size.cols as u32, // col_width —— 列在前
+                request.pty_size.rows as u32, // row_height —— 行在后
                 0,
                 0,
                 &[],
@@ -702,19 +736,33 @@ async fn connect_session(host: &Host, depth: usize) -> Result<ConnectResult, Ter
             host.hostname.clone(),
             host.port,
         );
-        let mut target_session = client::connect_stream(config, stream, target_handler)
-            .await
-            .map_err(|e| {
-                if let Some(reason) = rejection.lock().take() {
-                    tracing::warn!(host = %host.name, reason = %reason, "target host key rejected");
-                    TermError::HostKeyRejected(reason)
-                } else {
-                    map_connect_err(e, &host.name)
-                }
-            })?;
-
-        // 在目标 session 上认证
-        authenticate_session(&mut target_session, &host.user, &host.identity_files).await?;
+        // connect + auth 整体加 30s 超时（P1-12）：隧道上建 session 与认证在
+        // 半开连接上同样可能永不返回。
+        let target_session = with_timeout(
+            CONNECT_TIMEOUT,
+            async {
+                let mut session = client::connect_stream(config, stream, target_handler)
+                    .await
+                    .map_err(|e| {
+                        if let Some(reason) = rejection.lock().take() {
+                            tracing::warn!(host = %host.name, reason = %reason, "target host key rejected");
+                            TermError::HostKeyRejected(reason)
+                        } else {
+                            map_connect_err(e, &host.name)
+                        }
+                    })?;
+                authenticate_session(&mut session, &host.user, &host.identity_files).await?;
+                Ok(session)
+            },
+            || {
+                TermError::ConnectFailed(format!(
+                    "ssh connect+auth (proxyjump) timed out after {}s (host={}, 疑似半开连接或网络不可达)",
+                    CONNECT_TIMEOUT.as_secs(),
+                    host.name
+                ))
+            },
+        )
+        .await?;
 
         // 跳板机 handle 加入链（必须与 target_session 同生命周期）
         all_bastions.push(bastion_handle);
@@ -743,19 +791,34 @@ async fn connect_session(host: &Host, depth: usize) -> Result<ConnectResult, Ter
         host.hostname.clone(),
         host.port,
     );
-    let mut session = client::connect(config, addr, handler)
-        .await
-        .map_err(|e| {
-            // 若 check_server_key 拒绝，rejection 槽有原因 → 映射为 HostKeyRejected
-            if let Some(reason) = rejection.lock().take() {
-                tracing::warn!(host = %host.name, reason = %reason, "host key rejected");
-                TermError::HostKeyRejected(reason)
-            } else {
-                map_connect_err(e, &host.name)
-            }
-        })?;
-
-    authenticate_session(&mut session, &host.user, &host.identity_files).await?;
+    // connect + auth 整体加 30s 超时（P1-12）：半开连接上 client::connect 与
+    // authenticate_* 可能永不返回，导致调用方永久挂起。
+    let session = with_timeout(
+        CONNECT_TIMEOUT,
+        async {
+            let mut session = client::connect(config, addr, handler)
+                .await
+                .map_err(|e| {
+                    // 若 check_server_key 拒绝，rejection 槽有原因 → 映射为 HostKeyRejected
+                    if let Some(reason) = rejection.lock().take() {
+                        tracing::warn!(host = %host.name, reason = %reason, "host key rejected");
+                        TermError::HostKeyRejected(reason)
+                    } else {
+                        map_connect_err(e, &host.name)
+                    }
+                })?;
+            authenticate_session(&mut session, &host.user, &host.identity_files).await?;
+            Ok(session)
+        },
+        || {
+            TermError::ConnectFailed(format!(
+                "ssh connect+auth timed out after {}s (host={}, 疑似半开连接或网络不可达)",
+                CONNECT_TIMEOUT.as_secs(),
+                host.name
+            ))
+        },
+    )
+    .await?;
 
     Ok(ConnectResult {
         handle: session,
@@ -785,16 +848,31 @@ pub async fn connect_unauthenticated(host: &Host) -> Result<ConnectResult, TermE
         host.hostname.clone(),
         host.port,
     );
-    let session = client::connect(config, addr, handler)
-        .await
-        .map_err(|e| {
-            if let Some(reason) = rejection.lock().take() {
-                tracing::warn!(host = %host.name, reason = %reason, "host key rejected");
-                TermError::HostKeyRejected(reason)
-            } else {
-                map_connect_err(e, &host.name)
-            }
-        })?;
+    // 连接阶段加 30s 超时（P1-12）：半开连接上 client::connect 可能永不返回。
+    // 认证由调用方自行执行（本函数不认证）。
+    let session = with_timeout(
+        CONNECT_TIMEOUT,
+        async {
+            client::connect(config, addr, handler)
+                .await
+                .map_err(|e| {
+                    if let Some(reason) = rejection.lock().take() {
+                        tracing::warn!(host = %host.name, reason = %reason, "host key rejected");
+                        TermError::HostKeyRejected(reason)
+                    } else {
+                        map_connect_err(e, &host.name)
+                    }
+                })
+        },
+        || {
+            TermError::ConnectFailed(format!(
+                "ssh connect timed out after {}s (host={}, 疑似半开连接或网络不可达)",
+                CONNECT_TIMEOUT.as_secs(),
+                host.name
+            ))
+        },
+    )
+    .await?;
 
     Ok(ConnectResult {
         handle: session,
@@ -1037,6 +1115,31 @@ fn map_connect_err(e: russh::Error, host: &str) -> TermError {
     }
 }
 
+/// 给无界 await 加超时的统一助手：`fut` 在 `dur` 内未完成 → `on_timeout()`。
+///
+/// 背景（P1-12）：russh 的多个 await（connect / authenticate / channel_open /
+/// channel 窗口等待）在半开连接（对端失联但 TCP 未断）上可能永不返回。
+/// 其中 channel 窗口等待尤为致命：russh 在窗口耗尽时 park，session 死亡后
+/// 没有任何机制唤醒等待者。本助手统一加界；超时错误由调用方按所在阶段映射
+/// 到既有 TermError 变体（ConnectFailed / ChannelError / SftpError），消息
+/// 均显式注明超时。
+async fn with_timeout<F, T>(
+    dur: Duration,
+    fut: F,
+    on_timeout: impl FnOnce() -> TermError,
+) -> Result<T, TermError>
+where
+    F: std::future::Future<Output = Result<T, TermError>>,
+{
+    match tokio::time::timeout(dur, fut).await {
+        Ok(res) => res,
+        Err(_) => {
+            tracing::warn!(timeout_secs = dur.as_secs(), "ssh await 超时（半开连接？）");
+            Err(on_timeout())
+        }
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // SshTerminalHandle
 // ───────────────────────────────────────────────────────────────────────────
@@ -1114,6 +1217,12 @@ impl SshTerminalHandle {
     ///
     /// Phase 1 不做 channel 池：每次调用都开新 channel，调用方负责 drop（关闭）。
     /// 持锁期间不能并发 SFTP（同一 session 串行），但可并发 PTY 写（writer 无锁）。
+    ///
+    /// P1-12：整个 open（channel_open + subsystem + SFTP init）持锁执行且均为
+    /// 无界 await —— `Handle` 未实现 Clone（内含 `UnboundedReceiver`），无法克隆
+    /// handle 后先释放锁再 open，因此退而在 `SFTP_OPEN_TIMEOUT` 内加界：超时后
+    /// future 连同锁 guard 一起被 drop，最坏情况是 30s 有界阻塞而非半开连接时
+    /// 永久 wedge 整个 session（close/keepalive 都要拿同一把锁）。
     pub async fn open_sftp_provider(
         &self,
     ) -> Result<crate::infrastructure::sftp::SftpProvider, TermError> {
@@ -1122,7 +1231,17 @@ impl SshTerminalHandle {
             // session 已 take（close 过）→ SessionClosed
             TermError::SessionClosed("ssh session handle already taken".into())
         })?;
-        crate::infrastructure::sftp::SftpProvider::open(session).await
+        with_timeout(
+            SFTP_OPEN_TIMEOUT,
+            crate::infrastructure::sftp::SftpProvider::open(session),
+            || {
+                TermError::SftpError(format!(
+                    "open SFTP provider timed out after {}s (session 半开或无响应?)",
+                    SFTP_OPEN_TIMEOUT.as_secs()
+                ))
+            },
+        )
+        .await
     }
 
     /// 在已建立的 SSH session 上执行一条命令（Phase 5-B）。
@@ -1132,6 +1251,10 @@ impl SshTerminalHandle {
     ///
     /// 锁 `session` 仅在 `channel_open_session` 期间持有，exec 收数据阶段释放锁，
     /// 不阻塞 PTY 写与 SFTP 操作。
+    ///
+    /// P1-12：`channel_open_session` 持锁 await 且需等 server 确认，session 半开时
+    /// 可能永不返回 —— 永久 wedge close()/keepalive 共用的 `session` 锁。加
+    /// `CHANNEL_OPEN_TIMEOUT`（30s）加界，超时后 guard 随 future 一起释放。
     pub async fn exec(&self, command: &str) -> Result<String, TermError> {
         tracing::debug!(command, "ssh handle exec: starting");
 
@@ -1140,10 +1263,22 @@ impl SshTerminalHandle {
             let session = guard.as_ref().ok_or_else(|| {
                 TermError::SessionClosed("ssh session handle already taken".into())
             })?;
-            session
-                .channel_open_session()
-                .await
-                .map_err(|e| TermError::ChannelError(format!("channel_open_session: {e}")))?
+            with_timeout(
+                CHANNEL_OPEN_TIMEOUT,
+                async {
+                    session
+                        .channel_open_session()
+                        .await
+                        .map_err(|e| TermError::ChannelError(format!("channel_open_session: {e}")))
+                },
+                || {
+                    TermError::ChannelError(format!(
+                        "channel_open_session timed out after {}s (session 半开或无响应?)",
+                        CHANNEL_OPEN_TIMEOUT.as_secs()
+                    ))
+                },
+            )
+            .await?
         };
 
         channel
@@ -1206,22 +1341,44 @@ impl TerminalHandle for SshTerminalHandle {
     }
 
     async fn write(&self, data: &[u8]) -> Result<(), TermError> {
-        self.writer
-            .data_bytes(Bytes::copy_from_slice(data))
-            .await
-            .map_err(|e| TermError::ChannelError(format!("write: {e}")))
+        // P1-12：russh 在 channel 窗口耗尽时永久 park 等待窗口更新，而 session
+        // 死亡（半开连接）后没有任何机制唤醒窗口等待者 —— 不加界则 write 永久挂起。
+        with_timeout(PTY_WRITE_TIMEOUT, async {
+            self.writer
+                .data_bytes(Bytes::copy_from_slice(data))
+                .await
+                .map_err(|e| TermError::ChannelError(format!("write: {e}")))
+        }, || {
+            TermError::ChannelError(format!(
+                "pty write timed out after {}s (channel 窗口耗尽且 session 已死?)",
+                PTY_WRITE_TIMEOUT.as_secs()
+            ))
+        })
+        .await
     }
 
     async fn send_control(&self, c: ControlKey) -> Result<(), TermError> {
-        self.writer
-            .data_bytes(Bytes::copy_from_slice(c.as_bytes()))
-            .await
-            .map_err(|e| TermError::ChannelError(format!("send_control: {e}")))
+        // 与 write() 同款超时包装：控制键虽小，但 channel 窗口耗尽且 session 已死时
+        // russh 同样会永久 park，不给界则 Ctrl+C/Ctrl+D 永久挂起。
+        with_timeout(PTY_WRITE_TIMEOUT, async {
+            self.writer
+                .data_bytes(Bytes::copy_from_slice(c.as_bytes()))
+                .await
+                .map_err(|e| TermError::ChannelError(format!("send_control: {e}")))
+        }, || {
+            TermError::ChannelError(format!(
+                "send_control timed out after {}s (channel 窗口耗尽且 session 已死?)",
+                PTY_WRITE_TIMEOUT.as_secs()
+            ))
+        })
+        .await
     }
 
     async fn resize(&self, size: PtySize) -> Result<(), TermError> {
+        // russh 0.62 的 window_change 参数顺序为 (cols, rows)：col_width 在前，
+        // row_height 在后（与 request_pty 一致，勿传反）。
         self.writer
-            .window_change(size.rows as u32, size.cols as u32, 0, 0)
+            .window_change(size.cols as u32, size.rows as u32, 0, 0)
             .await
             .map_err(|e| TermError::ChannelError(format!("resize: {e}")))
     }
@@ -1585,6 +1742,22 @@ mod tests {
         // §7.4 Phase 1：10s 间隔 + 3 次上限（SSH 标准 keepalive 机制）
         assert_eq!(KEEPALIVE_INTERVAL_SECS, 10, "keepalive 间隔应为 10 秒");
         assert_eq!(KEEPALIVE_MAX_MISSES, 3, "keepalive 最大 miss 次数应为 3");
+    }
+
+    // ── P1-12：超时配置常量测试 ─────────────────────────────────────
+
+    #[test]
+    fn timeout_constants_have_expected_values() {
+        // connect+auth 与 channel_open 均 30s；PTY 写 60s（长于 channel_open，
+        // 不误伤正常输出洪峰下的窗口等待）；SFTP open 30s
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(CHANNEL_OPEN_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(PTY_WRITE_TIMEOUT, Duration::from_secs(60));
+        assert_eq!(SFTP_OPEN_TIMEOUT, Duration::from_secs(30));
+        assert!(
+            PTY_WRITE_TIMEOUT > CHANNEL_OPEN_TIMEOUT,
+            "PTY 写超时应长于 channel_open，避免误伤正常写阻塞"
+        );
     }
 
     // ── Phase 2：ProxyJump 配置常量测试 ──────────────────────────────
