@@ -10,7 +10,7 @@
 //!         └── SftpSession::new(channel.into_stream())
 //!               ↑
 //!               SftpProvider { sftp: SftpSession }
-//!                 ├── upload(local, remote)   读本地 → 写远端
+//!                 ├── upload(local, remote)   读本地 → 写远端（原子：远端 tmp + rename）
 //!                 ├── download(remote, local) 读远端 → 写本地（原子：tmp + fsync + rename）
 //!                 └── canonicalize(path)     realpath（路径策略检查用）
 //! ```
@@ -90,10 +90,23 @@ impl SftpProvider {
         })
     }
 
-    /// 上传本地文件到远端（覆盖写）。
+    /// 上传本地文件到远端（**原子写**，覆盖目标，修复 P2-3）。
     ///
-    /// 流式拷贝（`tokio::io::copy`），不一次性载入内存，适合大文件。
-    /// 远端用 `create()`（CREATE | TRUNCATE | WRITE）打开。
+    /// 流程：
+    /// 1. 写到远端临时文件 `<name>.termbridge-tmp-<pid>-<millis>`（与目标同目录，
+    ///    保证 rename 不跨文件系统）
+    /// 2. 流式拷贝（`tokio::io::copy`，不一次性载入内存）+ flush + shutdown
+    /// 3. stat 临时文件校验大小与本地一致（传输截断在 rename 前拦截）
+    /// 4. rename 临时文件 → 目标；目标已存在时 OpenSSH 对 `SSH_FXP_RENAME`
+    ///    返回 `SSH_FX_FAILURE`，此时先 remove 旧目标再 rename（见下）
+    /// 5. 任一步失败 → 清理临时文件（目标原内容不受影响）
+    ///
+    /// rename 语义（russh-sftp 2.4.0 调查结论）：`Features` 只协商 hardlink /
+    /// fsync / statvfs / expand-path / limits@openssh.com，**不支持
+    /// `posix-rename@openssh.com`**；高层 `SftpSession` 也未暴露 extended 请求，
+    /// 无法发原子覆盖。因此覆盖已有文件需要 remove→rename：新内容已完整落在
+    /// 临时文件后才删旧目标，remove 与 rename 之间存在极小的目标缺失窗口
+    /// （期间并发读会看到 ENOENT）。
     pub async fn upload(&self, local: &Path, remote: &str) -> Result<(), TermError> {
         tracing::info!(local = ?local, remote = remote, "sftp upload: starting");
 
@@ -102,36 +115,72 @@ impl SftpProvider {
             .map_err(TermError::Io)?
             .len();
 
+        // 远端临时文件：与目标同目录；pid + 毫秒时间戳避免并发上传互相覆盖
+        let tmp = remote_tmp_path(remote);
+
         let mut local_file = tokio::fs::File::open(local).await?;
-        // create() = CREATE | TRUNCATE | WRITE，覆盖已有远端文件
-        let mut remote_file = self
-            .sftp
-            .create(remote)
-            .await
-            .map_err(|e| TermError::SftpError(format!("sftp create '{remote}': {e}")))?;
 
-        let copied = tokio::io::copy(&mut local_file, &mut remote_file)
-            .await
-            .map_err(|e| TermError::SftpError(format!("sftp upload copy: {e}")))?;
+        let result: Result<u64, TermError> = async {
+            // 1. create() = CREATE | TRUNCATE | WRITE：只写临时文件，不碰目标
+            let mut remote_file = self
+                .sftp
+                .create(&tmp)
+                .await
+                .map_err(|e| TermError::SftpError(format!("sftp create '{tmp}': {e}")))?;
 
-        // flush 等 pending writes 完成；shutdown 关闭远端 handle
-        remote_file
-            .flush()
-            .await
-            .map_err(|e| TermError::SftpError(format!("sftp upload flush: {e}")))?;
-        remote_file
-            .shutdown()
-            .await
-            .map_err(|e| TermError::SftpError(format!("sftp upload shutdown: {e}")))?;
+            // 2. 流式拷贝
+            let copied = tokio::io::copy(&mut local_file, &mut remote_file)
+                .await
+                .map_err(|e| TermError::SftpError(format!("sftp upload copy: {e}")))?;
 
-        tracing::info!(
-            local = ?local,
-            remote = remote,
-            bytes = copied,
-            expected = local_size,
-            "sftp upload: complete"
-        );
-        Ok(())
+            // flush 等 pending writes 完成；shutdown 关闭远端 handle
+            remote_file
+                .flush()
+                .await
+                .map_err(|e| TermError::SftpError(format!("sftp upload flush: {e}")))?;
+            remote_file
+                .shutdown()
+                .await
+                .map_err(|e| TermError::SftpError(format!("sftp upload shutdown: {e}")))?;
+
+            // 3. 大小校验：远端写入截断在 rename 前拦截
+            let remote_meta = self
+                .sftp
+                .metadata(&tmp)
+                .await
+                .map_err(|e| map_sftp_error(e, &format!("sftp upload stat '{tmp}'")))?;
+            if remote_meta.len() != local_size {
+                return Err(TermError::SftpError(format!(
+                    "sftp upload size mismatch for '{remote}': \
+                     local {local_size} bytes, remote {} bytes",
+                    remote_meta.len()
+                )));
+            }
+
+            // 4. rename 临时文件 → 目标
+            replace_remote_file(&self.sftp, &tmp, remote).await?;
+            Ok(copied)
+        }
+        .await;
+
+        // 失败清理：删除残留临时文件（best-effort，目标不受影响）
+        if result.is_err() {
+            if let Err(e) = self.sftp.remove_file(&tmp).await {
+                tracing::warn!(tmp = %tmp, error = %e, "sftp upload: cleanup tmp failed");
+            }
+        }
+
+        match &result {
+            Ok(copied) => tracing::info!(
+                local = ?local,
+                remote = remote,
+                bytes = copied,
+                expected = local_size,
+                "sftp upload: complete"
+            ),
+            Err(e) => tracing::warn!(local = ?local, remote = remote, error = %e, "sftp upload: failed"),
+        }
+        result.map(|_| ())
     }
 
     /// 下载远端文件到本地（**原子写**）。
@@ -446,7 +495,8 @@ impl SftpProvider {
             };
 
             if file_type.is_symlink() {
-                tracing::debug!(local = ?local_child, "upload_dir: skipping symlink");
+                // 与 download_dir 的跳过告警一致：跳过条目对调用方可见
+                tracing::warn!(local = ?local_child, "upload_dir: skipping symlink (not followed)");
                 continue;
             } else if file_type.is_dir() {
                 count += Box::pin(self.upload_dir_inner(
@@ -468,8 +518,10 @@ impl SftpProvider {
     ///
     /// - 自动创建本地目录（`create_dir_all`）
     /// - 跳过符号链接等非普通文件/目录条目（RemoteEntry.is_dir/is_file 均为 false）
+    /// - 跳过对本地文件系统不安全的远端条目名（`\`、`/`、`:`、控制字符、
+    ///   Windows 保留设备名、尾部点/空格，修复 P2-3），跳过条目均记录 warn 日志
     /// - 单个文件失败时 fail-fast
-    /// - 返回传输的文件数（不含目录）
+    /// - 返回传输的文件数（不含目录；跳过的条目不计入）
     pub async fn download_dir(
         &self,
         remote_dir: &str,
@@ -498,7 +550,20 @@ impl SftpProvider {
 
         let entries = self.list_dir(remote_dir).await?;
         let mut count = 0usize;
+        let mut skipped: Vec<String> = Vec::new();
         for entry in entries {
+            // 远端 POSIX 文件名直拼 Windows 路径有注入风险（\ 变分隔符、: 变
+            // ADS、保留设备名异常），校验失败的条目跳过并告警（修复 P2-3）
+            if let Err(reason) = validate_local_entry_name(&entry.name) {
+                tracing::warn!(
+                    remote = remote_dir,
+                    name = %entry.name,
+                    reason = %reason,
+                    "download_dir: skipping entry with unsafe local name"
+                );
+                skipped.push(format!("{} ({reason})", entry.name));
+                continue;
+            }
             let remote_child = if remote_dir.ends_with('/') {
                 format!("{}{}", remote_dir, entry.name)
             } else {
@@ -517,10 +582,126 @@ impl SftpProvider {
             } else if entry.is_file {
                 self.download(&remote_child, &local_child).await?;
                 count += 1;
+            } else {
+                // 符号链接等非普通条目：与 upload_dir 的 symlink 跳过一致，告警可见
+                tracing::warn!(
+                    remote = remote_dir,
+                    name = %entry.name,
+                    "download_dir: skipping non-regular entry (symlink or special file)"
+                );
+                skipped.push(format!("{} (not a regular file or directory)", entry.name));
             }
+        }
+        if !skipped.is_empty() {
+            tracing::warn!(
+                remote = remote_dir,
+                skipped = ?skipped,
+                "download_dir: skipped entries are excluded from files_transferred"
+            );
         }
         Ok(count)
     }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// 辅助函数
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 远端临时文件路径（upload 原子写用）：与目标**同目录**（保证 rename 不跨
+/// 文件系统），命名 `<name>.termbridge-tmp-<pid>-<millis>`——pid + 毫秒时间戳
+/// 避免并发上传互相覆盖临时文件。
+fn remote_tmp_path(remote: &str) -> String {
+    let (parent, name) = match remote.rfind('/') {
+        // 含 '/'：parent 保留末尾 '/'（remote="/a/f.txt" → parent="/a/", name="f.txt"）
+        Some(pos) => (&remote[..pos + 1], &remote[pos + 1..]),
+        // 纯文件名（相对路径）：落在远端当前工作目录，仍与目标同目录
+        None => ("", remote),
+    };
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("{parent}{name}.termbridge-tmp-{}-{millis}", std::process::id())
+}
+
+/// 用临时文件替换远端目标（upload 原子写的最后一步）。
+///
+/// 优先直接 rename（目标不存在，或服务器允许覆盖 rename 时一步完成）；
+/// OpenSSH sftp-server 对目标已存在的 `SSH_FXP_RENAME` 返回 `SSH_FX_FAILURE`
+/// （russh-sftp 2.4 不支持 `posix-rename@openssh.com` 原子覆盖），此时删除旧
+/// 目标后再 rename。回退仅在明确收到 `Failure` 时触发——其他错误（NoSuchFile /
+/// PermissionDenied 等）直接上报，不动目标，避免误删。
+async fn replace_remote_file(
+    sftp: &SftpSession,
+    tmp: &str,
+    remote: &str,
+) -> Result<(), TermError> {
+    match sftp.rename(tmp, remote).await {
+        Ok(()) => Ok(()),
+        Err(SftpLibError::Status(s)) if s.status_code == StatusCode::Failure => {
+            tracing::debug!(
+                remote = remote,
+                "sftp upload: target exists (SSH_FX_FAILURE), falling back to remove-then-rename"
+            );
+            sftp.remove_file(remote)
+                .await
+                .map_err(|e| map_sftp_error(e, &format!("sftp upload remove old '{remote}'")))?;
+            sftp.rename(tmp, remote)
+                .await
+                .map_err(|e| map_sftp_error(e, &format!("sftp upload rename '{tmp}' -> '{remote}'")))?;
+            Ok(())
+        }
+        Err(e) => Err(map_sftp_error(
+            e,
+            &format!("sftp upload rename '{tmp}' -> '{remote}'"),
+        )),
+    }
+}
+
+/// 校验远端条目名对**本地**文件系统（Windows 语义优先）是否安全（修复 P2-3）。
+///
+/// 远端 POSIX 文件名会被直接 `local_dir.join(name)` 拼进 Windows 路径：
+/// - `\` 会变成路径分隔符（目录穿越）
+/// - `:` 会变成 NTFS 备用数据流（ADS）
+/// - 保留设备名（CON / NUL / COM1 …，不分大小写，含 `CON.txt` 形式）行为异常
+/// - 控制字符 / 尾部点与空格会被 Windows 静默丢弃或产生不可访问的路径
+///
+/// 返回 `Err(原因)` 表示该条目应跳过（下载方收集并告警）。
+fn validate_local_entry_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("empty name".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err(format!("relative path component '{name}'"));
+    }
+    // 路径分隔符 / NTFS ADS 分隔符
+    if name.contains('\\') {
+        return Err("contains backslash".to_string());
+    }
+    if name.contains('/') {
+        return Err("contains slash".to_string());
+    }
+    if name.contains(':') {
+        return Err("contains colon (NTFS alternate data stream)".to_string());
+    }
+    // 控制字符（含 DEL）
+    if name.chars().any(|c| c.is_control()) {
+        return Err("contains control characters".to_string());
+    }
+    // Windows 会静默丢弃尾部点 / 空格，产生与请求不一致的本地路径
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Err("ends with dot or space".to_string());
+    }
+    // 保留设备名：取第一个 '.' 之前的主名（CON.txt、NUL.tar.gz 同样命中）
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let stem = name.split('.').next().unwrap_or(name);
+    if RESERVED.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
+        return Err(format!("reserved device name '{stem}'"));
+    }
+    Ok(())
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -671,6 +852,84 @@ mod tests {
         let local = Path::new("/tmp/a.tar.gz");
         let tmp: PathBuf = format!("{}.termbridge.tmp", local.to_string_lossy()).into();
         assert_eq!(tmp, PathBuf::from("/tmp/a.tar.gz.termbridge.tmp"));
+    }
+
+    // ── 修复 P2-3：upload 远端临时文件路径 ────────────────────────
+
+    #[test]
+    fn remote_tmp_path_stays_in_same_directory() {
+        // 常规路径：与目标同目录，名字保留
+        let tmp = remote_tmp_path("/home/u/deploy/app.tar.gz");
+        assert!(tmp.starts_with("/home/u/deploy/app.tar.gz.termbridge-tmp-"));
+        // 含 pid 与毫秒两段后缀
+        let rest = tmp.strip_prefix("/home/u/deploy/app.tar.gz.termbridge-tmp-").unwrap();
+        assert_eq!(rest.split('-').count(), 2);
+
+        // 根目录下的文件
+        let tmp = remote_tmp_path("/foo");
+        assert!(tmp.starts_with("/foo.termbridge-tmp-"));
+
+        // 无 '/' 的相对路径：落在远端 cwd（仍与目标同目录）
+        let tmp = remote_tmp_path("file.txt");
+        assert!(tmp.starts_with("file.txt.termbridge-tmp-"));
+        assert!(!tmp.contains('/'));
+    }
+
+    #[test]
+    fn remote_tmp_path_is_unique_per_call() {
+        // pid + 毫秒：同进程连续两次调用生成不同临时名（避免并发覆盖）
+        let a = remote_tmp_path("/srv/data.bin");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = remote_tmp_path("/srv/data.bin");
+        assert_ne!(a, b);
+    }
+
+    // ── 修复 P2-3：download_dir 本地文件名校验 ────────────────────
+
+    #[test]
+    fn local_entry_name_accepts_safe_names() {
+        for name in ["file.txt", "data", ".hidden", "a.tar.gz", "池-Eglyph 宽字.txt", "a b.c"] {
+            assert!(validate_local_entry_name(name).is_ok(), "{name} should be accepted");
+        }
+    }
+
+    #[test]
+    fn local_entry_name_rejects_separators_and_streams() {
+        assert!(validate_local_entry_name("a\\b").is_err(), "backslash 变 Windows 分隔符");
+        assert!(validate_local_entry_name("a/b").is_err());
+        assert!(validate_local_entry_name("a:b").is_err(), "冒号变 NTFS ADS");
+        assert!(validate_local_entry_name("C:\\x").is_err());
+    }
+
+    #[test]
+    fn local_entry_name_rejects_control_chars_and_trailing_dot_space() {
+        assert!(validate_local_entry_name("a\u{0001}b").is_err());
+        assert!(validate_local_entry_name("a\u{007f}b").is_err());
+        assert!(validate_local_entry_name("name.").is_err(), "尾部点被 Windows 丢弃");
+        assert!(validate_local_entry_name("name ").is_err(), "尾部空格被 Windows 丢弃");
+    }
+
+    #[test]
+    fn local_entry_name_rejects_reserved_device_names() {
+        for name in [
+            "CON", "con", "Con", "NUL", "nul.txt", "COM1", "com9", "LPT1", "lpt4.tar.gz", "AUX",
+        ] {
+            assert!(
+                validate_local_entry_name(name).is_err(),
+                "{name} is a reserved device name"
+            );
+        }
+        // 非保留名不受影响（前缀撞名但整体不是设备名）
+        assert!(validate_local_entry_name("console").is_ok());
+        assert!(validate_local_entry_name("nullify").is_ok());
+        assert!(validate_local_entry_name("com10.txt").is_ok());
+    }
+
+    #[test]
+    fn local_entry_name_rejects_empty_and_relative_components() {
+        assert!(validate_local_entry_name("").is_err());
+        assert!(validate_local_entry_name(".").is_err());
+        assert!(validate_local_entry_name("..").is_err());
     }
 
     // ── Phase 2：RemoteEntry 序列化测试 ──────────────────────────

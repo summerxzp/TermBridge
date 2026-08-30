@@ -1,10 +1,12 @@
-//! 日志脱敏层（§5.5 三类正则）。
+//! 日志脱敏层（§5.5 正则规则）。
 //!
 //! 应用于 tracing 日志输出（stderr），防止 PTY 输出中的密码 / token / 私钥
-//! 泄露到日志。三类正则：
+//! 泄露到日志。规则：
 //!   1. key=value / key: value 凭证（行尾脱敏）
 //!   2. HTTP Authorization header
 //!   3. PEM 私钥块（跨行）
+//!   4. URL userinfo 密码（scheme://user:password@host，修复 P3-4）
+//!   5. mysql / mysqldump 命令行 -pPASSWORD
 
 use std::io::{self, Write};
 use std::sync::OnceLock;
@@ -12,10 +14,12 @@ use std::sync::OnceLock;
 use regex::Regex;
 use tracing_subscriber::fmt::MakeWriter;
 
-// 三类脱敏正则，进程级编译一次复用（OnceLock 避免每次调用重新编译）。
+// 脱敏正则，进程级编译一次复用（OnceLock 避免每次调用重新编译）。
 static RE_CREDENTIAL: OnceLock<Regex> = OnceLock::new();
 static RE_AUTHORIZATION: OnceLock<Regex> = OnceLock::new();
 static RE_PEM_KEY: OnceLock<Regex> = OnceLock::new();
+static RE_URL_USERINFO: OnceLock<Regex> = OnceLock::new();
+static RE_CLI_PASSWORD: OnceLock<Regex> = OnceLock::new();
 
 fn credential_re() -> &'static Regex {
     RE_CREDENTIAL.get_or_init(|| {
@@ -44,14 +48,39 @@ fn pem_key_re() -> &'static Regex {
     })
 }
 
-/// 对输入字符串应用三类脱敏正则，返回脱敏后的字符串。
+fn url_userinfo_re() -> &'static Regex {
+    RE_URL_USERINFO.get_or_init(|| {
+        // 4. URL userinfo 密码（修复 P3-4）：postgres://root:hunter2@db/x 等。
+        //    RFC 3986：authority 中的 userinfo 在最后一个 '@' 之前，约定 user:password
+        //    按第一个 ':' 切分（组 1 保留 scheme://user）。密码段贪婪匹配到 '@'
+        //    前的一切（可含 '@'，如 ssh://deploy:P@ss@host），但不越过 authority
+        //    边界 '/'、'?'、'#' 与空白——因此 host:port、路径、无密码 URL 不受影响。
+        Regex::new(r"(?i)([a-z][a-z0-9+.\-]*://[^/\s:@?#]+):([^/?#\s]+)@")
+            .expect("脱敏正则 RE_URL_USERINFO 编译失败")
+    })
+}
+
+fn cli_password_re() -> &'static Regex {
+    RE_CLI_PASSWORD.get_or_init(|| {
+        // 5. 命令行短选项密码：mysql / mysqldump 的 -pPASSWORD（-p 与密码间无空格；
+        //    有空格时 mysql 是交互式提示，行内无密码）。限定 mysql 家族命令行，
+        //    避免误伤 cp -p / tar -p 等无关短选项。
+        Regex::new(r"(?i)(\b(?:mysql|mysqldump)\b[^\n]*?\s-p)(\S+)")
+            .expect("脱敏正则 RE_CLI_PASSWORD 编译失败")
+    })
+}
+
+/// 对输入字符串应用全部脱敏规则，返回脱敏后的字符串。
 ///
-/// 顺序：先 PEM 私钥块（跨行，避免被行级正则切碎），
-/// 再凭证 key=value，最后 Authorization header。
+/// 顺序：先 PEM 私钥块（跨行，避免被行级正则切碎），再凭证 key=value，
+/// 再 Authorization header，最后 URL userinfo 与命令行密码（只脱敏行内
+/// 剩余的 URL/CLI 密码段，保留 user 与 host 便于排障）。
 pub fn redact(input: &str) -> String {
     let s = pem_key_re().replace_all(input, "[REDACTED PRIVATE KEY]");
     let s = credential_re().replace_all(&s, "${1}[REDACTED]");
     let s = authorization_re().replace_all(&s, "${1}[REDACTED]");
+    let s = url_userinfo_re().replace_all(&s, "${1}:[REDACTED]@");
+    let s = cli_password_re().replace_all(&s, "${1}[REDACTED]");
     s.into_owned()
 }
 
@@ -198,5 +227,74 @@ mod tests {
         assert_eq!(redact("access_key=abc"), "access_key=[REDACTED]");
         assert_eq!(redact("auth_token=abc"), "auth_token=[REDACTED]");
         assert_eq!(redact("secret: abc"), "secret: [REDACTED]");
+    }
+
+    // ── 修复 P3-4：URL userinfo 密码 ─────────────────────────────────
+
+    #[test]
+    fn redacts_postgres_url_userinfo() {
+        assert_eq!(
+            redact("postgres://root:hunter2@db/x"),
+            "postgres://root:[REDACTED]@db/x"
+        );
+    }
+
+    #[test]
+    fn redacts_https_url_userinfo() {
+        assert_eq!(
+            redact("https://user:token@host"),
+            "https://user:[REDACTED]@host"
+        );
+    }
+
+    #[test]
+    fn redacts_ssh_url_with_at_in_password() {
+        // RFC 3986：userinfo 终止于最后一个 '@'——密码 "P@ss" 整体被脱敏
+        assert_eq!(
+            redact("ssh://deploy:P@ss@host"),
+            "ssh://deploy:[REDACTED]@host"
+        );
+    }
+
+    #[test]
+    fn redacts_url_userinfo_keeps_user_and_path() {
+        // 只脱敏密码段：scheme / user / host / 端口 / 路径保留，便于排障
+        assert_eq!(
+            redact("connecting to mysql://app:s3cret@db.internal:3306/appdb?ssl=true"),
+            "connecting to mysql://app:[REDACTED]@db.internal:3306/appdb?ssl=true"
+        );
+    }
+
+    #[test]
+    fn urls_without_password_stay_intact() {
+        assert_eq!(redact("https://example.com/path"), "https://example.com/path");
+        // 只有 user 无密码
+        assert_eq!(
+            redact("ssh://git@github.com/user/repo.git"),
+            "ssh://git@github.com/user/repo.git"
+        );
+        // host:port 不是 userinfo
+        assert_eq!(redact("http://host:8080/x"), "http://host:8080/x");
+        // file:// 无 authority 主体
+        assert_eq!(redact("file:///var/log/x"), "file:///var/log/x");
+    }
+
+    #[test]
+    fn redacts_mysql_cli_password() {
+        assert_eq!(
+            redact("mysql -u root -phunter2"),
+            "mysql -u root -p[REDACTED]"
+        );
+        assert_eq!(
+            redact("mysqldump -h db --single-transaction -ps3cret db > dump.sql"),
+            "mysqldump -h db --single-transaction -p[REDACTED] db > dump.sql"
+        );
+        // -p 后带空格 = 交互式提示，行内无密码，不应误改
+        assert_eq!(
+            redact("mysql -u root -p -h db"),
+            "mysql -u root -p -h db"
+        );
+        // 非密码类短选项不受影响
+        assert_eq!(redact("cp -p a b"), "cp -p a b");
     }
 }
