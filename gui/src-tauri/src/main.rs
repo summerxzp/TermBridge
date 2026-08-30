@@ -8,6 +8,7 @@
 //! - 后端 → 前端：Tauri event（pty_data / pty_eof），data 用 base64 编码
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine;
 use dashmap::DashMap;
@@ -28,7 +29,11 @@ use termbridge::infrastructure::persistent::PersistentProvider;
 /// GUI 全局状态：SessionManager + PTY read task 句柄
 struct AppState {
     mgr: Arc<SessionManager>,
-    read_tasks: DashMap<String, JoinHandle<()>>,
+    /// PTY read loop 任务表：value 为 (task, generation)。generation 用于任务结束时
+    /// 判断表中条目是否仍是自己（防止旧任务自清理时误删后继任务）；Arc 供任务
+    /// 结束时自清理（spawn_read_loop 的 async move 拿不到 &self）
+    read_tasks: Arc<DashMap<String, (JoinHandle<()>, u64)>>,
+    next_read_task_gen: AtomicU64,
 }
 
 impl AppState {
@@ -36,14 +41,25 @@ impl AppState {
         let provider = Arc::new(PersistentProvider::default()) as Arc<dyn TerminalProvider>;
         Self {
             mgr: Arc::new(SessionManager::new(provider)),
-            read_tasks: DashMap::new(),
+            read_tasks: Arc::new(DashMap::new()),
+            next_read_task_gen: AtomicU64::new(0),
         }
     }
 
     /// 启动 PTY read 循环：持续 read_raw → emit pty_data 事件
     fn spawn_read_loop(&self, app: AppHandle, session_id: String) {
+        // React 18 StrictMode 双挂载 / 前端重复调用 start_read_loop 防护：
+        // 同 session 已有 read loop 时必须先中止旧任务再重建，否则两个 tokio task
+        // 并发 read_raw() 会把 PTY 字节流拆成两半（旧 task 对应的前端 listener 已
+        // 注销，那一半输出丢失）
+        if let Some((_, (old, _))) = self.read_tasks.remove(&session_id) {
+            old.abort();
+        }
+
         let mgr = self.mgr.clone();
         let sid = session_id.clone();
+        let read_tasks = self.read_tasks.clone();
+        let gen = self.next_read_task_gen.fetch_add(1, Ordering::Relaxed);
 
         let task = tokio::spawn(async move {
             loop {
@@ -75,14 +91,19 @@ impl AppState {
                     }
                 }
             }
+            // 循环自然结束（EOF / 错误 / app 关闭）：把本任务条目从 map 移除，防止
+            // map 泄漏。仅当条目仍是自己（generation 匹配）才移除；detach/close 走
+            // abort_read_task 的 remove（被 abort 的任务不会执行到这里），StrictMode
+            // 快速重建出的后继任务 generation 更大，也不会被误删
+            read_tasks.remove_if(&sid, |_, (_, g)| *g == gen);
         });
 
-        self.read_tasks.insert(session_id, task);
+        self.read_tasks.insert(session_id, (task, gen));
     }
 
     /// 停止 PTY read 循环
     fn abort_read_task(&self, session_id: &str) {
-        if let Some((_, task)) = self.read_tasks.remove(session_id) {
+        if let Some((_, (task, _))) = self.read_tasks.remove(session_id) {
             task.abort();
         }
     }

@@ -76,8 +76,12 @@ export function TerminalView({ sessionId, host, onDisconnect }: Props) {
     ]).then(([un1, un2]) => {
       unlistenData = un1;
       unlistenEof = un2;
-      // 7. listener 就绪后启动 read loop
-      api.startReadLoop(sessionId).catch(console.error);
+      // 7. listener 就绪后启动 read loop。必须带 disposed 检查：StrictMode 双挂载时
+      // 首个挂载可能在卸载后才走到这里，不检查会给已卸载的挂载再起一条读循环
+      //（与后端双重 read loop → PTY 字节流被拆分）
+      if (!disposed) {
+        api.startReadLoop(sessionId).catch(console.error);
+      }
     });
 
     // 8. 清理
