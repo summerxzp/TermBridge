@@ -1,12 +1,12 @@
-# termbridge-mcp（平台包方案，长期主渠道）
+# @summerxzp/termbridge-mcp（平台包方案，长期主渠道）
 
 Rust 二进制通过 npm **平台包**分发（借鉴 esbuild / Biome / SWC 的主包 + 平台包模式）：
 
-- 主包 `termbridge-mcp`：薄启动器，仅解析本机平台包并启动二进制（零网络/零下载）。
-- 平台包 `termbridge-win32-x64|linux-x64|darwin-arm64`：每个包内含**完整 release
+- 主包 `@summerxzp/termbridge-mcp`：薄启动器，仅解析本机平台包并启动二进制（零网络/零下载）。
+- 平台包 `@summerxzp/termbridge-win32-x64|linux-x64|darwin-arm64`：每个包内含**完整 release
   目录**（trio 二进制同目录 + `resources/agentd` + `SKILL.md` + 配置），
   保证 `current_exe()`（helper 同目录）与 agentd/LOCALAPPDATA 布局语义不受影响。
-- 安装/更新全走 npm registry（可配 npmmirror/内网源）；`npx -y termbridge-mcp@latest`
+- 安装/更新全走 npm registry（可配 npmmirror/内网源）；`npx -y @summerxzp/termbridge-mcp@latest`
   每次启动解析最新版。
 
 ## 使用
@@ -16,7 +16,7 @@ Rust 二进制通过 npm **平台包**分发（借鉴 esbuild / Biome / SWC 的�
   "mcpServers": {
     "termbridge": {
       "command": "npx",
-      "args": ["-y", "termbridge-mcp@latest"]
+      "args": ["-y", "@summerxzp/termbridge-mcp@latest"]
     }
   }
 }
@@ -25,7 +25,7 @@ Rust 二进制通过 npm **平台包**分发（借鉴 esbuild / Biome / SWC 的�
 ## 发版（CI 中执行，勿手动提交 package.json 版本）
 
 ```bash
-# 1. 从 release stgging 目录生成 3 个平台包 + 同步主包版本
+# 1. 从 release staging 目录生成 3 个平台包 + 同步主包版本
 node scripts/build-platform-packages.mjs \
   --version 0.3.0 \
   --os-arch win32-x64 --staging <dir>/termbridge-windows-x86_64 \

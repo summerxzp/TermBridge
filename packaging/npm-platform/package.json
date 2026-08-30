@@ -1,7 +1,7 @@
 {
-  "name": "termbridge-mcp",
+  "name": "@summerxzp/termbridge-mcp",
   "version": "0.3.0",
-  "description": "TermBridge — Remote Terminal Runtime for AI Agents (MCP)。薄主包：解析当前平台的 termbridge-<os>-<arch> 平台包并启动二进制，更新/安装全走 npm registry。",
+  "description": "TermBridge — Remote Terminal Runtime for AI Agents (MCP)。薄主包：解析当前平台的 @summerxzp/termbridge-<os>-<arch> 平台包并启动二进制，更新/安装全走 npm registry。",
   "license": "Apache-2.0",
   "keywords": [
     "termbridge",
@@ -22,9 +22,12 @@
   "engines": {
     "node": ">=18"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "optionalDependencies": {
-    "termbridge-win32-x64": "0.2.1",
-    "termbridge-linux-x64": "0.2.1",
-    "termbridge-darwin-arm64": "0.2.1"
+    "@summerxzp/termbridge-win32-x64": "0.3.0",
+    "@summerxzp/termbridge-linux-x64": "0.3.0",
+    "@summerxzp/termbridge-darwin-arm64": "0.3.0"
   }
 }

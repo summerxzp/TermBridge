@@ -161,21 +161,45 @@ jobs:
           generate_release_notes: true
 
   # npm 平台包（长期主渠道，参考 packaging/npm-platform/）：
-  # - 从同一 staging 生成 3 个平台包（@termbridge/<os>-<arch>，完整 release 目录）
-  #   与薄主包 termbridge-mcp，版本取 tag（与 Cargo 一致）
-  # - 默认只生成 + npm pack 校验；配置 NPM_TOKEN secret 后才真正 publish
+  # - 从同一 staging 生成 3 个平台包（@summerxzp/termbridge-<os>-<arch>，完整 release 目录）
+  #   与薄主包 @summerxzp/termbridge-mcp，版本取 tag（与 Cargo 一致）
+  # - 发布走 npm Trusted Publishing（OIDC）：npmjs.com 上各包已配置
+  #   summerxzp/TermBridge release.yml 为受信发布者（账号级，无需 NPM_TOKEN secret）
   npm-packages:
-    name: npm platform packages (publish needs NPM_TOKEN)
+    name: npm platform packages (OIDC trusted publishing)
     runs-on: ubuntu-latest
     needs: build
-    if: ${{ !cancelled() }}
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 20
+          # OIDC trusted publishing 要求 Node >= 22.14 / npm >= 11.5.1（npmjs docs），
+          # 用 Node 24 与 ci.yml 对齐，同时规避 Node 20 deprecation 警告
+          node-version: 24
           registry-url: https://registry.npmjs.org
+
+      - name: Verify version consistency (tag vs Cargo.toml)
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          # 版本一致性门禁：npm 包版本（取自 tag）必须与二进制自报版本
+          # （Cargo.toml [workspace.package].version）一致，防止 tag 与 Cargo 版本
+          # 分叉后把错位版本发布到 npm（更新检查 / 日志自报版本都会错位）
+          CARGO_VERSION=$(awk '/^\[workspace\.package\]/{in_pkg=1; next} /^\[/{in_pkg=0} in_pkg && $1 == "version" {gsub(/[",]/, "", $3); print $3; exit}' Cargo.toml)
+          if [ -z "$CARGO_VERSION" ]; then
+            echo "::error::未能从 Cargo.toml [workspace.package] 解析 version"
+            exit 1
+          fi
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::版本不一致：tag ${GITHUB_REF_NAME} → npm 版本 ${VERSION}，但 Cargo.toml [workspace.package].version = ${CARGO_VERSION}。请对齐版本后重新打 tag。"
+            exit 1
+          fi
+          echo "版本一致：${VERSION}"
 
       - uses: actions/download-artifact@v5
         with:
@@ -185,8 +209,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # tag 与 Cargo.toml 版本一致（release.yml 由 v* tag 触发）
-          VERSION="${GITHUB_REF_NAME#v}"
           # win32-x64  linux-x64  darwin-arm64 → asset 名
           declare -A ASSETS=( [win32-x64]=windows-x86_64 [linux-x64]=linux-x86_64 [darwin-arm64]=macos-arm64 )
           mkdir -p staging
@@ -199,11 +221,8 @@ jobs:
               *.zip)    unzip -q "$archive" -d "$d" ;;
               *.tar.gz) tar xzf "$archive" -C "$d" ;;
             esac
-            # 兼容旧版「带顶层目录」归档：把二进制挪到 staging 根
-            if ! ls "$d"/termbridge* >/dev/null 2>&1; then
-              sub=$(find "$d" -mindepth 1 -maxdepth 1 -type d | head -1)
-              [ -n "$sub" ] && { mv "$sub"/* "$d"/ 2>/dev/null || true; }
-            fi
+            # 归档为扁平结构（Windows zip: Compress-Archive -Path "$dir/*"；
+            # Unix: tar -C "$dir" .），解压即得全部文件，无顶层目录，无需整理
           done
 
       - name: Generate platform packages + sync main package version
@@ -227,22 +246,16 @@ jobs:
           done
           ( cd packaging/npm-platform && npm pack --dry-run )
 
-      - name: Publish to npm (only when NPM_TOKEN is configured)
-        env:
-          # secrets 不能在 if 条件中引用（GitHub Actions 解析限制），
-          # 改为注入 env 后在脚本内判断
-          NPM_TOKEN_VAL: ${{ secrets.NPM_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish to npm (OIDC trusted publishing)
         shell: bash
         run: |
           set -euo pipefail
-          if [ -z "${NPM_TOKEN_VAL:-}" ]; then
-            echo "NPM_TOKEN 未配置，跳过 npm publish（pack 校验已通过）"
-            exit 0
-          fi
+          # OIDC：npm CLI 检测到 GitHub Actions OIDC 环境后自动换取短时身份，
+          # 无需 NODE_AUTH_TOKEN（npm trust publisher 已在 npmjs.com 配置）。
+          # --access public：scope 包（@summerxzp/*）默认 restricted，必须显式公开
           for p in packaging/npm-platform/generated/termbridge-win32-x64 \
                    packaging/npm-platform/generated/termbridge-linux-x64 \
                    packaging/npm-platform/generated/termbridge-darwin-arm64; do
-            npm publish "$p"
+            npm publish "$p" --access public
           done
-          ( cd packaging/npm-platform && npm publish )
+          ( cd packaging/npm-platform && npm publish --access public )

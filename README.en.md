@@ -32,7 +32,28 @@ TermBridge is an MCP (Model Context Protocol) server that communicates with AI c
 
 ## Installation
 
-### Option 1: Download Pre-built Binaries (Recommended)
+### Option 1: npm (Primary Channel, Recommended)
+
+Configure your MCP client directly — no manual binary download needed:
+
+```json
+{
+  "mcpServers": {
+    "termbridge": {
+      "command": "npx",
+      "args": ["-y", "@summerxzp/termbridge-mcp@latest"]
+    }
+  }
+}
+```
+
+> The thin launcher package `@summerxzp/termbridge-mcp` forwards to the native binary
+> for the current platform; platform packages `@summerxzp/termbridge-<os>-<arch>`
+> (win32-x64 / linux-x64 / darwin-arm64, each containing the full release directory)
+> are installed automatically as optionalDependencies — zero download, zero cache.
+> To update: `npx -y @summerxzp/termbridge-mcp@latest`.
+
+### Option 2: Download Pre-built Binaries
 
 Download the archive for your platform from [GitHub Release](https://github.com/summerxzp/TermBridge/releases/latest):
 
@@ -44,10 +65,9 @@ Download the archive for your platform from [GitHub Release](https://github.com/
 
 > macOS Intel users: no pre-built package yet. Please build from source, or wait for a future x86_64 macOS release.
 
-Archive contents:
+Archive contents (flat archive — files are extracted directly to the extraction root):
 
 ```
-termbridge-v<version>-<platform>-<arch>/
 ├── termbridge-mcp            MCP server main entry
 ├── termbridge                CLI (human admin tool, optional)
 ├── termbridge-auth-helper    Credential helper (must be in same directory as mcp)
@@ -58,7 +78,7 @@ termbridge-v<version>-<platform>-<arch>/
     └── linux-x86_64/         Remote daemon (auto-deployed by bootstrap_host, no manual action needed)
 ```
 
-### Option 2: Build from Source
+### Option 3: Build from Source
 
 **Prerequisites**:
 - Rust toolchain (stable, 1.75+ recommended)

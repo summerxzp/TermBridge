@@ -10,9 +10,9 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const PLATFORMS = {
-  'win32-x64': { pkg: 'termbridge-win32-x64', exe: true },
-  'linux-x64': { pkg: 'termbridge-linux-x64', exe: false },
-  'darwin-arm64': { pkg: 'termbridge-darwin-arm64', exe: false },
+  'win32-x64': { pkg: '@summerxzp/termbridge-win32-x64', exe: true },
+  'linux-x64': { pkg: '@summerxzp/termbridge-linux-x64', exe: false },
+  'darwin-arm64': { pkg: '@summerxzp/termbridge-darwin-arm64', exe: false },
 };
 const BIN_NAMES = {
   termbridge: 'termbridge',
@@ -39,7 +39,7 @@ function main(name) {
     console.error(
       `\nTermBridge 启动失败：${e.message}\n` +
         `（npx 场景若用了 --no-optional 会缺失平台包 ${meta ? meta.pkg : ''}；` +
-        `安装方式：npx -y termbridge-mcp，更新：npx -y termbridge-mcp@latest）`,
+        `安装方式：npx -y @summerxzp/termbridge-mcp，更新：npx -y @summerxzp/termbridge-mcp@latest）`,
     );
     process.exitCode = 1;
   }

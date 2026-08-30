@@ -32,7 +32,27 @@ TermBridge 是一个 MCP（Model Context Protocol）server，通过 stdio 与 AI
 
 ## 安装
 
-### 方式一：下载预构建二进制（推荐）
+### 方式一：npm（长期主渠道，推荐）
+
+MCP 客户端直接配置，无需手动下载二进制：
+
+```json
+{
+  "mcpServers": {
+    "termbridge": {
+      "command": "npx",
+      "args": ["-y", "@summerxzp/termbridge-mcp@latest"]
+    }
+  }
+}
+```
+
+> 薄主包 `@summerxzp/termbridge-mcp` 启动时转发到当前平台的原生二进制；平台包
+> `@summerxzp/termbridge-<os>-<arch>`（win32-x64 / linux-x64 / darwin-arm64，内含
+> 完整 release 目录）经 optionalDependencies 自动安装，零下载、零缓存。
+> 更新：`npx -y @summerxzp/termbridge-mcp@latest`。
+
+### 方式二：下载预构建二进制
 
 从 [GitHub Release](https://github.com/summerxzp/TermBridge/releases/latest) 下载对应平台的压缩包：
 
@@ -44,10 +64,9 @@ TermBridge 是一个 MCP（Model Context Protocol）server，通过 stdio 与 AI
 
 > macOS Intel 用户：当前暂无预构建包，请自行从源码构建，或等待后续 x86_64 macOS release。
 
-解压后包含：
+解压后包含（归档为扁平结构，文件直接位于解压根目录）：
 
 ```
-termbridge-v<version>-<platform>-<arch>/
 ├── termbridge-mcp            MCP server 主入口
 ├── termbridge                CLI（人类管理员工具，可选）
 ├── termbridge-auth-helper    凭据 helper（必须与 mcp 同目录）
@@ -58,7 +77,7 @@ termbridge-v<version>-<platform>-<arch>/
     └── linux-x86_64/         远端 daemon（bootstrap_host 自动部署，无需手动操作）
 ```
 
-### 方式二：从源码构建
+### 方式三：从源码构建
 
 **前置要求**：
 - Rust toolchain（stable，建议 1.75+）
