@@ -117,6 +117,14 @@ pub const PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 /// drop，最坏情况是 30s 有界阻塞而非永久 wedge 整个 session。映射为 `SftpError`。
 pub const SFTP_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// SSH exec 收集循环总超时（120s）。
+///
+/// `SshProvider::exec` 是短连接路径（探测 / bootstrap / 远端校验等短操作），
+/// 与 PTY 路径不同，没有 keepalive 任务；半开连接上 `channel.wait()` 永不
+/// 返回。对整段收集循环加界 120s：足够覆盖慢主机上的 `agentd bootstrap`
+/// 启动，同时把挂起变成有界失败。映射为 `ChannelError`。
+pub const EXEC_TIMEOUT: Duration = Duration::from_secs(120);
+
 // ───────────────────────────────────────────────────────────────────────────
 // SshProvider
 // ───────────────────────────────────────────────────────────────────────────
@@ -493,40 +501,68 @@ impl SshProvider {
 
         // 开 session channel + exec（不开 PTY）
         // want_reply=true：要求 server 回 success/failure，便于及早发现 exec 被拒
-        let mut channel = session
-            .channel_open_session()
-            .await
-            .map_err(|e| TermError::ChannelError(format!("channel_open_session: {e}")))?;
+        // P1-12：半开连接上 channel_open 永久等待，加界
+        let mut channel = with_timeout(
+            CHANNEL_OPEN_TIMEOUT,
+            async {
+                session
+                    .channel_open_session()
+                    .await
+                    .map_err(|e| TermError::ChannelError(format!("channel_open_session: {e}")))
+            },
+            || {
+                TermError::ChannelError(format!(
+                    "ssh exec channel_open timed out after {}s",
+                    CHANNEL_OPEN_TIMEOUT.as_secs()
+                ))
+            },
+        )
+        .await?;
         channel
             .exec(true, command)
             .await
             .map_err(|e| TermError::ChannelError(format!("channel.exec: {e}")))?;
 
-        // 循环收消息：Data → stdout；ExtendedData → stderr 丢弃；ExitStatus → 退出码
-        let mut stdout = Vec::new();
-        let mut exit_code: Option<u32> = None;
-        loop {
-            match channel.wait().await {
-                Some(ChannelMsg::Data { data }) => {
-                    stdout.extend_from_slice(&data);
+        // 循环收消息：Data → stdout；ExtendedData → stderr 丢弃；ExitStatus → 退出码。
+        // P1-12：exec 无 keepalive（短连接路径），半开连接上 wait() 永不返回，
+        // 整段收集循环加界（命令均为短操作：探测 / bootstrap / 校验）。
+        let (stdout, exit_code) = with_timeout(
+            EXEC_TIMEOUT,
+            async {
+                let mut stdout = Vec::new();
+                let mut exit_code: Option<u32> = None;
+                loop {
+                    match channel.wait().await {
+                        Some(ChannelMsg::Data { data }) => {
+                            stdout.extend_from_slice(&data);
+                        }
+                        Some(ChannelMsg::ExtendedData { data, ext }) => {
+                            // stderr 不阻塞 stdout 收集，仅 debug 记录后丢弃
+                            tracing::debug!(
+                                host = %host.name,
+                                ext,
+                                len = data.len(),
+                                "ssh exec stderr (discarded)"
+                            );
+                        }
+                        Some(ChannelMsg::ExitStatus { exit_status }) => {
+                            exit_code = Some(exit_status);
+                            // 不 break：等 Eof/Close 确保所有 stdout 数据已收到
+                        }
+                        Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                        Some(_) => continue,
+                    }
                 }
-                Some(ChannelMsg::ExtendedData { data, ext }) => {
-                    // stderr 不阻塞 stdout 收集，仅 debug 记录后丢弃
-                    tracing::debug!(
-                        host = %host.name,
-                        ext,
-                        len = data.len(),
-                        "ssh exec stderr (discarded)"
-                    );
-                }
-                Some(ChannelMsg::ExitStatus { exit_status }) => {
-                    exit_code = Some(exit_status);
-                    // 不 break：等 Eof/Close 确保所有 stdout 数据已收到
-                }
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
-                Some(_) => continue,
-            }
-        }
+                Ok((stdout, exit_code))
+            },
+            || {
+                TermError::ChannelError(format!(
+                    "ssh exec timed out after {}s (半开连接或远端命令未退出?)",
+                    EXEC_TIMEOUT.as_secs()
+                ))
+            },
+        )
+        .await?;
 
         // 清理：channel eof + session/bastions disconnect（exec 是短连接）
         let _ = channel.eof().await;
@@ -623,10 +659,24 @@ impl SshProvider {
 
         // 开 session channel + exec（不开 PTY）
         // want_reply=true：要求 server 回 success/failure，便于及早发现 exec 被拒
-        let channel = session
-            .channel_open_session()
-            .await
-            .map_err(|e| TermError::ChannelError(format!("channel_open_session: {e}")))?;
+        // P1-12：channel_open 加界；返回的读/写半是 proxy 长生命通道（空闲属
+        // 正常），数据循环**有意不加界**——连接活性由传输层/keepalive 负责
+        let channel = with_timeout(
+            CHANNEL_OPEN_TIMEOUT,
+            async {
+                session
+                    .channel_open_session()
+                    .await
+                    .map_err(|e| TermError::ChannelError(format!("channel_open_session: {e}")))
+            },
+            || {
+                TermError::ChannelError(format!(
+                    "ssh exec_stream channel_open timed out after {}s",
+                    CHANNEL_OPEN_TIMEOUT.as_secs()
+                ))
+            },
+        )
+        .await?;
         channel
             .exec(true, command)
             .await
