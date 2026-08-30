@@ -60,7 +60,10 @@ enum Mode {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 日志输出到 stderr：proxy 模式下 stdout 是 framed 协议流、bootstrap 模式下 stdout
+    // 是 client 解析的 JSON 握手，任何 warn/error 日志打到 stdout 都会使流失步
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 

@@ -1,7 +1,8 @@
 //! Session 状态机 + SessionManager（ADR-0004 §5 / §8）
 //!
-//! Session 持有 Pty + RingBuffer + 状态。PTY read task 在独立 std::thread 中
-//! 阻塞读 master_fd → 写入 RingBuffer → 更新 last_activity。EOF → state = Lost。
+//! Session 持有 Pty + PtyWriter + RingBuffer + 状态。PTY read task 在独立 std::thread 中
+//! 阻塞读 master_fd → 写入 RingBuffer → 更新 last_activity → 唤醒 event pump（Notify）。
+//! EOF/EIO → 有界回收子进程 → 填写终态（TerminalInfo）→ state = Lost。
 
 use std::io;
 use std::os::fd::RawFd;
@@ -14,10 +15,11 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use thiserror::Error;
+use tokio::sync::Notify;
 
 use crate::buffer::{ReadSinceResult, RingBuffer};
 use crate::protocol::{ControlKey, PtySize, SessionInfo};
-use crate::pty::Pty;
+use crate::pty::{Pty, PtyWriter};
 
 // ───────────────────────────────────────────────────────────────────────────
 // 错误类型
@@ -67,6 +69,23 @@ impl SessionState {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// TerminalInfo
+// ───────────────────────────────────────────────────────────────────────────
+
+/// 会话终态信息：PTY read task 在 EOF/错误时填写，event pump 读取后构造终态事件
+/// （pty_exit / session_lost，与 daemon_proto 的字段约定一致）。
+#[derive(Debug, Clone)]
+pub enum TerminalInfo {
+    /// 子进程已退出，退出码已知（waitpid 回收成功；信号死亡为 128+信号号）
+    Exited(i32),
+    /// PTY EOF 但退出状态未知（有界窗口内未回收子进程，可能仅关闭了 slave fd），
+    /// 协议侧 pty_exit 的 exit_code 字段缺省（Option = None，daemon_proto 的 unknown 约定）
+    ExitedUnknown,
+    /// 异常丢失（PTY 读错误等），附原因
+    Lost(String),
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Session
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -76,10 +95,19 @@ pub struct Session {
     name: Option<String>,
     state: Arc<Mutex<SessionState>>,
     pty: Arc<Mutex<Pty>>,
+    /// 输入写入器（有界队列 + 专属写线程；dispatch 线程不直接写 master fd）
+    writer: PtyWriter,
     buffer: Arc<RingBuffer>,
     created_at: DateTime<Utc>,
     last_activity_at: Arc<Mutex<DateTime<Utc>>>,
     pty_size: Mutex<PtySize>,
+    /// event pump 唤醒（read task 新数据 / 状态变化 / close 时 notify_one）
+    pump_notify: Arc<Notify>,
+    /// 终态信息（EOF/错误路径由 read task 填写，event pump 读取）
+    terminal: Arc<Mutex<Option<TerminalInfo>>>,
+    /// pump 代际：每次 attach 递增，旧代际 pump 自动作废（防止 detach 后重连时
+    /// 新旧 pump 并存 → 重复数据 / 重复终态事件）
+    pump_epoch: AtomicU64,
 }
 
 impl Session {
@@ -93,6 +121,31 @@ impl Session {
         self.buffer.written()
     }
 
+    /// 读取 buffer 增量（event pump 冲刷尾部数据用）
+    pub fn read_since(&self, cursor: u64) -> ReadSinceResult {
+        self.buffer.read_since(cursor)
+    }
+
+    /// 终态信息快照（state = Lost 后由 read task 填写）
+    pub fn terminal(&self) -> Option<TerminalInfo> {
+        self.terminal.lock().clone()
+    }
+
+    /// 唤醒 event pump（新数据 / 状态变化 / close）
+    pub fn notify_pump(&self) {
+        self.pump_notify.notify_one();
+    }
+
+    /// pump 等待用的 Notify 引用（rpc 层 event pump 用）
+    pub fn pump_notify(&self) -> Arc<Notify> {
+        Arc::clone(&self.pump_notify)
+    }
+
+    /// pump 代际快照
+    pub fn pump_epoch(&self) -> u64 {
+        self.pump_epoch.load(Ordering::SeqCst)
+    }
+
     /// 转为协议 SessionInfo
     pub fn to_info(&self) -> SessionInfo {
         SessionInfo {
@@ -104,6 +157,15 @@ impl Session {
             pty_size: *self.pty_size.lock(),
             written: self.written(),
         }
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Session 销毁前先杀子进程：Pty 被 read task 的 Arc 共享，真正的 Pty::drop 可能延后；
+        // 必须保证 writer 字段 Drop（join 写线程）之前子进程已死 —— 否则写线程可能阻塞在
+        // master write 上（tty 缓冲满且前台进程不读 stdin），join 无法返回。
+        self.pty.lock().kill_child();
     }
 }
 
@@ -123,7 +185,7 @@ impl SessionManager {
         }
     }
 
-    /// 创建新 session：spawn PTY + 启动 read task，返回 session_id
+    /// 创建新 session：spawn PTY + 启动 read task + 写线程，返回 session_id
     pub fn create(
         &self,
         shell: &str,
@@ -135,6 +197,9 @@ impl SessionManager {
             .map_err(|e| SessionError::Pty(format!("spawn 失败: {}", e)))?;
         // 在包进 Mutex 前取出 master_fd（RawFd 是 Copy，可安全传给 read task）
         let master_fd = pty.master_fd();
+        // 专属写线程：dispatch 的 send_input 只入队，不直接 write master fd
+        let writer = PtyWriter::new(master_fd)
+            .map_err(|e| SessionError::Pty(format!("writer 创建失败: {}", e)))?;
         let pty_arc = Arc::new(Mutex::new(pty));
         let buffer = Arc::new(RingBuffer::with_default_size());
         let now = Utc::now();
@@ -145,18 +210,32 @@ impl SessionManager {
             name: name.clone(),
             state: Arc::new(Mutex::new(SessionState::Created)),
             pty: pty_arc.clone(),
+            writer,
             buffer: buffer.clone(),
             created_at: now,
             last_activity_at: Arc::new(Mutex::new(now)),
             pty_size: Mutex::new(pty_size),
+            pump_notify: Arc::new(Notify::new()),
+            terminal: Arc::new(Mutex::new(None)),
+            pump_epoch: AtomicU64::new(0),
         });
 
-        // 启动 PTY read task（独立线程，阻塞读 master_fd → 写 buffer → 更新 activity）
-        // read task 持有 pty_arc 保持 Pty 存活（防止 master_fd 被 close）
+        // 启动 PTY read task（独立线程，阻塞读 master_fd → 写 buffer → 更新 activity → 唤醒 pump）
+        // read task 持有 pty_arc 保持 Pty 存活（防止 master_fd 被 close）+ EOF 后回收子进程
         let read_state = session.state.clone();
         let read_activity = session.last_activity_at.clone();
+        let read_notify = session.pump_notify.clone();
+        let read_terminal = session.terminal.clone();
         thread::spawn(move || {
-            pty_read_loop(master_fd, pty_arc, buffer, read_state, read_activity);
+            pty_read_loop(
+                master_fd,
+                pty_arc,
+                buffer,
+                read_state,
+                read_activity,
+                read_notify,
+                read_terminal,
+            );
         });
 
         self.sessions.insert(session_id.clone(), session);
@@ -186,6 +265,9 @@ impl SessionManager {
             }
         }
         drop(state);
+        // 递增 pump 代际：使该 session 上旧连接遗留的 event pump 自动作废
+        // （detach 后立即重连时，防止新旧 pump 并存 → 重复数据 / 重复终态事件）
+        session.pump_epoch.fetch_add(1, Ordering::SeqCst);
         Ok(session.buffer.read_since(since_cursor))
     }
 
@@ -196,6 +278,9 @@ impl SessionManager {
         match *state {
             SessionState::Attached => {
                 *state = SessionState::Detached;
+                drop(state);
+                // 唤醒 pump：观察 Detached 立即退出（不发终态事件）
+                session.notify_pump();
                 Ok(())
             }
             SessionState::Lost => Err(SessionError::Lost(session_id.to_string())),
@@ -206,12 +291,16 @@ impl SessionManager {
         }
     }
 
-    /// 发送输入到 PTY（不等待 shell 处理）
+    /// 发送输入到 PTY（不等待 shell 处理）。
+    ///
+    /// 输入经有界队列交给专属写线程写 master fd：RPC dispatch 线程绝不阻塞在 tty 上。
+    /// 队列满（tty 背压，如前台进程不读 stdin）时最多等待 5s，仍满则报错而非无限阻塞。
     pub fn send_input(&self, session_id: &str, data: &[u8]) -> Result<(), SessionError> {
         let session = self.get(session_id)?;
         self.ensure_alive(&session)?;
-        let pty = session.pty.lock();
-        pty.write(data)
+        session
+            .writer
+            .send(data)
             .map_err(|e| SessionError::Pty(format!("write 失败: {}", e)))?;
         // 更新 last_activity
         *session.last_activity_at.lock() = Utc::now();
@@ -256,10 +345,15 @@ impl SessionManager {
         let (_, session) = self.sessions.remove(session_id).ok_or_else(|| {
             SessionError::NotFound(session_id.to_string())
         })?;
-        // kill 子进程（Pty drop 会自动 kill + wait，这里显式 kill 加速退出）
-        let pty = session.pty.lock();
-        pty.kill_child();
-        drop(pty);
+        // kill 子进程（Pty drop 会自动 kill + wait，这里显式 kill 加速退出；
+        // Session::drop 兜底再 kill 一次，保证写线程 join 前子进程必死）
+        {
+            let pty = session.pty.lock();
+            pty.kill_child();
+        }
+        // 唤醒 event pump：session 已移除，pump 立即冲刷尾部数据并发 session_lost 终态事件
+        // （终态保证：close 也必须给 attach 中的 client 一个终态事件）
+        session.notify_pump();
         Ok(())
     }
 
@@ -271,11 +365,6 @@ impl SessionManager {
             .collect()
     }
 
-    /// 查询 session 状态（不存在返回 None），供 event pump 判断是否继续推送
-    pub fn session_state(&self, session_id: &str) -> Option<SessionState> {
-        self.sessions.get(session_id).map(|e| e.state())
-    }
-
     /// 关闭所有 session（daemon shutdown 时调用）
     pub fn shutdown(&self) {
         let ids: Vec<String> = self.sessions.iter().map(|e| e.id.clone()).collect();
@@ -284,11 +373,21 @@ impl SessionManager {
         }
     }
 
-    /// 获取 session（不存在报错）
-    fn get(&self, session_id: &str) -> Result<Arc<Session>, SessionError> {
+    /// 获取 session Arc（不存在返回 None；rpc 层 / event pump 用）
+    pub fn get_session(&self, session_id: &str) -> Option<Arc<Session>> {
         self.sessions
             .get(session_id)
             .map(|e| Arc::clone(e.value()))
+    }
+
+    /// session 是否仍存在于管理器（未被 close 移除；event pump 判断终态用）
+    pub fn contains(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id)
+    }
+
+    /// 获取 session（不存在报错；manager 内部用）
+    fn get(&self, session_id: &str) -> Result<Arc<Session>, SessionError> {
+        self.get_session(session_id)
             .ok_or_else(|| SessionError::NotFound(session_id.to_string()))
     }
 
@@ -311,44 +410,100 @@ impl Default for SessionManager {
 // PTY read task
 // ───────────────────────────────────────────────────────────────────────────
 
-/// PTY read 循环：阻塞读 master_fd → 写 buffer → 更新 last_activity。
-/// EOF 或错误 → state = Lost，线程退出。
+/// EOF 后回收子进程的有界窗口：100 次 × 20ms = 2s
+const REAP_ATTEMPTS: usize = 100;
+/// 每次 waitpid(WNOHANG) 轮询间隔
+const REAP_INTERVAL: Duration = Duration::from_millis(20);
+
+/// PTY read 循环：阻塞读 master_fd → 写 buffer → 更新 last_activity → 唤醒 event pump。
 ///
-/// read task 直接用 master_fd（libc::read），不锁 Pty 对象，避免与 send_input 的 write
-/// 互斥。pty_arc 仅用于保持 Pty 存活（防止 master_fd 被 close）。
+/// EOF / EIO（Linux 上 slave 端全部关闭后 master read 返回 EIO）→ 有界回收子进程（≤2s）
+/// 填写终态 → state = Lost → 唤醒 pump。pump 负责先冲刷尾部 pty_data，再发送
+/// pty_exit / session_lost 终态事件（每个 attach 恰好一个终态事件）。
+///
+/// read task 直接用 master_fd（libc::read），不锁 Pty 对象，避免与写路径互斥；
+/// pty_arc 仅用于保持 Pty 存活 + EOF 后回收子进程（短锁单次 try_reap）。
 fn pty_read_loop(
     master_fd: RawFd,
     pty_arc: Arc<Mutex<Pty>>,
     buffer: Arc<RingBuffer>,
     state: Arc<Mutex<SessionState>>,
     last_activity: Arc<Mutex<DateTime<Utc>>>,
+    pump_notify: Arc<Notify>,
+    terminal: Arc<Mutex<Option<TerminalInfo>>>,
 ) {
     let mut buf = [0u8; 8192];
     loop {
-        // 阻塞读：master_fd 默认阻塞模式，read 会等到有数据或 EOF
+        // 阻塞读：master_fd 默认阻塞模式，read 会等到有数据或 EOF/EIO
         let n = unsafe { libc::read(master_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
         if n < 0 {
             let err = io::Error::last_os_error();
-            // 非阻塞模式（若设置）的 EAGAIN/WOULDLOCK：短暂 sleep 后重试
+            // 非阻塞模式（若设置）的 EAGAIN：短暂 sleep 后重试
             if err.kind() == io::ErrorKind::WouldBlock {
                 thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            // 其他错误（EBADF 等）→ Lost
+            if err.raw_os_error() == Some(libc::EIO) {
+                // Linux：slave 端全部关闭（子进程退出）后 master read 返回 EIO —— 视同 EOF
+                finish_lost(&pty_arc, &terminal, &state, &pump_notify);
+                break;
+            }
+            // 其他错误（EBADF 等）→ 异常丢失（session_lost）
+            *terminal.lock() = Some(TerminalInfo::Lost(format!("pty read 错误: {}", err)));
             *state.lock() = SessionState::Lost;
+            pump_notify.notify_one();
             break;
         }
         if n == 0 {
-            // EOF：子进程关闭 slave 端
-            *state.lock() = SessionState::Lost;
+            // EOF：子进程关闭 slave 端 → 与 EIO 同一退出路径
+            finish_lost(&pty_arc, &terminal, &state, &pump_notify);
             break;
         }
         let n = n as usize;
         buffer.write(&buf[..n]);
         *last_activity.lock() = Utc::now();
+        pump_notify.notify_one();
     }
-    // pty_arc drop 时若引用计数归零，Pty drop 会 kill_child + close master_fd
+    // pty_arc drop 时若引用计数归零，Pty drop 会 kill_child + reap + close master_fd
     drop(pty_arc);
+}
+
+/// EOF/EIO 退出路径：有界回收子进程 → 填写终态 → 翻转 Lost → 唤醒 pump。
+///
+/// 顺序约束：先填终态再翻状态 —— pump 看到 Lost 时终态必已就绪，可直接发终态事件。
+/// EOF/EIO 不保证子进程已退出（可能仅关闭了 slave fd），故回收是有界的；
+/// 窗口内未回收则以"未知退出码"上报（协议侧 pty_exit 的 exit_code 缺省）。
+fn finish_lost(
+    pty_arc: &Arc<Mutex<Pty>>,
+    terminal: &Arc<Mutex<Option<TerminalInfo>>>,
+    state: &Arc<Mutex<SessionState>>,
+    pump_notify: &Arc<Notify>,
+) {
+    let exit_code = reap_exit_code_bounded(pty_arc);
+    *terminal.lock() = Some(match exit_code {
+        Some(code) => TerminalInfo::Exited(code),
+        None => TerminalInfo::ExitedUnknown,
+    });
+    *state.lock() = SessionState::Lost;
+    pump_notify.notify_one();
+}
+
+/// 有界回收子进程（≤2s，WNOHANG 轮询）。
+///
+/// 返回 Some(code)：已退出（正常退出码，或 128+信号号）；None：窗口内未退出
+/// （可能仅关闭 slave fd）或已被其他处回收 —— 调用方以"未知退出码"上报。
+fn reap_exit_code_bounded(pty_arc: &Arc<Mutex<Pty>>) -> Option<i32> {
+    for attempt in 0..REAP_ATTEMPTS {
+        if attempt > 0 {
+            thread::sleep(REAP_INTERVAL);
+        }
+        // 短锁：每次尝试单独加锁，不阻塞 resize / close 的 kill_child
+        let code = pty_arc.lock().try_reap();
+        if let Some(code) = code {
+            return Some(code);
+        }
+    }
+    None
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -563,5 +718,77 @@ mod tests {
         let info = &mgr.list()[0];
         assert_eq!(info.name.as_deref(), Some("test-session"));
         mgr.close(&id).expect("close");
+    }
+
+    /// Fix 1：EOF 后 read task 应回收子进程并填写终态（退出码），状态转 Lost
+    #[test]
+    fn eof_records_terminal_exit_code() {
+        let mgr = SessionManager::new();
+        // /bin/true 立即退出 → PTY EOF/EIO → 有界回收 → 终态 Exited(0)
+        let id = mgr
+            .create("/bin/true", None, PtySize { rows: 24, cols: 80 }, None)
+            .expect("create true");
+        // 等 true 退出 + read task EOF 路径（回收是有界的，但 true 退出极快）
+        thread::sleep(Duration::from_millis(500));
+        let session = mgr.get_session(&id).expect("session 应仍存在");
+        assert_eq!(session.state(), SessionState::Lost);
+        match session.terminal() {
+            Some(TerminalInfo::Exited(0)) => {}
+            other => panic!("应记录 Exited(0) 终态，实际: {:?}", other),
+        }
+        mgr.close(&id).expect("close");
+    }
+
+    /// Fix 3：输入积压（前台进程不读 stdin）时，resize / close 不被阻塞，
+    /// send_input 以错误返回而非无限阻塞
+    #[test]
+    fn resize_and_close_work_during_input_backlog() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Arc as StdArc;
+        // sh 执行脚本时从脚本文件读命令，不读 tty stdin → 输入积压可复现
+        let dir = std::env::temp_dir();
+        let script = dir.join(format!("tb_test_backlog_{}.sh", std::process::id()));
+        std::fs::write(&script, "#!/bin/sh\nsleep 300\n").expect("写脚本失败");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let mgr = StdArc::new(SessionManager::new());
+        let id = mgr
+            .create(script.to_string_lossy().as_ref(), None, PtySize { rows: 24, cols: 80 }, None)
+            .expect("create");
+        mgr.attach(&id, 0).expect("attach");
+        // 等脚本跑起来
+        thread::sleep(Duration::from_millis(200));
+
+        // 后台线程发送 1MB（远超 256KB 队列容量）→ 等待至背压超时
+        let big = vec![0x41u8; 1024 * 1024];
+        let mgr_t = mgr.clone();
+        let id_t = id.clone();
+        let sender = thread::spawn(move || mgr_t.send_input(&id_t, &big));
+        // 等队列填满、写线程阻塞
+        thread::sleep(Duration::from_millis(300));
+
+        // resize 必须立即返回（不与写线程争锁）
+        let t0 = std::time::Instant::now();
+        mgr.resize(&id, 40, 120).expect("resize");
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "resize 不应被积压输入阻塞，实际耗时 {:?}",
+            t0.elapsed()
+        );
+
+        // close 必须立即返回（kill → 写线程 EIO 退出 → join）
+        let t1 = std::time::Instant::now();
+        mgr.close(&id).expect("close");
+        assert!(
+            t1.elapsed() < Duration::from_secs(2),
+            "close 不应被积压输入阻塞，实际耗时 {:?}",
+            t1.elapsed()
+        );
+
+        // 发送线程最终以错误返回（Backlogged 背压超时，或 close 后 Closed）
+        let r = sender.join().expect("join sender");
+        assert!(matches!(r, Err(SessionError::Pty(_))), "应报错而非无限阻塞，实际: {:?}", r);
+
+        let _ = std::fs::remove_file(&script);
     }
 }

@@ -130,6 +130,22 @@ impl Event {
         }
     }
 
+    /// 构造退出码未知的 pty_exit 事件（EOF 后有界窗口内未回收子进程）。
+    ///
+    /// 与 daemon_proto 的 unknown 约定一致：exit_code 为 Option，未知时缺省（省略字段）。
+    pub fn pty_exit_unknown(session_id: &str) -> Self {
+        Self {
+            event: "pty_exit".to_string(),
+            session_id: session_id.to_string(),
+            cursor_start: None,
+            cursor_end: None,
+            is_truncated: None,
+            data: None,
+            exit_code: None,
+            reason: None,
+        }
+    }
+
     /// 构造 session_lost 事件
     pub fn session_lost(session_id: &str, reason: impl Into<String>) -> Self {
         Self {
