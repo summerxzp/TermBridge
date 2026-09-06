@@ -81,15 +81,23 @@ for (const { key, staging } of args.platforms) {
   // bin 字段（P0，esbuild 同款做法）：npm pack 会把「未列入 bin 的文件」mode 归一化为
   // 0644，只有 bin 条目保留/强制 0755。缺 bin 会导致 Linux/macOS 平台包发布出去的二进制
   // 无执行位，launcher spawnSync 直接 EACCES（Windows 不受影响，故 CI 上难察觉）。
-  // bin key 用无扩展名命令名（npm 据此建 node_modules/.bin shim），value 按包内实际
-  // 存在的文件：Windows staging 是 .exe 后缀，Unix staging 无扩展名。
+  // bin key 用无扩展名命令名（npm 据此建 node_modules/.bin shim）。
+  // 注意：npm 不允许 bin value 带 .exe 后缀（"script name *.exe was invalid and
+  // removed"，v0.3.1 实测），Windows 包必须生成无扩展名的 Node shim 脚本转发到
+  // 同目录 .exe —— shim 本身在 bin 列表中即可保住 .exe 的执行语义（Windows
+  // 不看执行位，spawnSync 直接跑 .exe）。
   const BIN_CMDS = ['termbridge', 'termbridge-mcp', 'termbridge-auth-helper']; // 与 launcher.js BIN_NAMES 对齐
   const binEntries = {};
   for (const cmd of BIN_CMDS) {
     if (existsSync(path.join(destDir, cmd))) {
+      // Unix staging：无扩展名二进制，直接作为 bin target
       binEntries[cmd] = `./${cmd}`;
     } else if (existsSync(path.join(destDir, `${cmd}.exe`))) {
-      binEntries[cmd] = `./${cmd}.exe`;
+      // Windows staging：生成无扩展名 shim（CJS，spawnSync 同目录 .exe，
+      // 透传 stdio / 退出码 / 信号语义），bin 指向 shim
+      const shim = `#!/usr/bin/env node\n// npm bin 不允许 .exe 值：shim 转发到同目录 ${cmd}.exe\nconst { spawnSync } = require('child_process');\nconst path = require('path');\nconst exe = path.join(__dirname, '${cmd}.exe');\nconst r = spawnSync(exe, process.argv.slice(2), { stdio: 'inherit' });\nif (r.error) { console.error('${cmd}.exe 启动失败:', r.error.message); process.exit(1); }\nprocess.exit(r.status === null ? 1 : r.status);\n`;
+      writeFileSync(path.join(destDir, cmd), shim);
+      binEntries[cmd] = `./${cmd}`;
     }
   }
   if (Object.keys(binEntries).length === 0) {
@@ -102,6 +110,10 @@ for (const { key, staging } of args.platforms) {
     version: args.version,
     description: `TermBridge runtime for ${key} (完整 release 目录，含 trio 二进制 / resources/agentd / SKILL.md)`,
     license: 'Apache-2.0',
+    // OIDC trusted publishing 的 provenance 校验硬性要求 repository.url
+    // 与 GitHub 仓库完全一致（v0.3.1 实测 E422：expected to match
+    // "https://github.com/summerxzp/TermBridge" from provenance）
+    repository: { type: 'git', url: 'https://github.com/summerxzp/TermBridge' },
     os: meta.os,
     cpu: meta.cpu,
     bin: binEntries,

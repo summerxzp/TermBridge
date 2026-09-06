@@ -2,7 +2,7 @@
 name: "termbridge"
 description: "Operate remote Linux hosts via TermBridge terminal runtime. Invoke when user asks to run commands on, manage, debug, or deploy to a remote SSH host."
 metadata:
-  version: "0.3.0"
+  version: "0.3.2"
   mcp-server: termbridge
 ---
 
@@ -13,6 +13,22 @@ TermBridge is a persistent, recoverable terminal runtime for AI agents. It expos
 > **Version check**: `metadata.version` in this file is the TermBridge release this SKILL.md was packaged with. The MCP server reports its own version in the `serverInfo.version` field of the initialize handshake. If the two differ (e.g. the user updated termbridge but this skill was not re-synced from the release package), tell the user: "SKILL.md 版本落后，请从 release 包重新复制 SKILL.md 到 agent 的 skill 目录" and do not assume behaviors from newer releases.
 
 Use it when the user wants to operate on a remote Linux host: run commands, debug services, edit files, deploy code, inspect logs.
+
+## Architecture At A Glance (read this first)
+
+```
+Agent ──MCP/stdio──▶ termbridge-mcp (local) ──SSH──▶ remote host
+                                              │
+                    ┌─────────────────────────┴──────────────────────┐
+                    │ standard session: direct SSH PTY (no daemon)   │
+                    │ persistent session: agentd daemon on the host  │
+                    │   (auto-deployed from the local agentd binary; │
+                    │    survives disconnects, supports detach/attach)│
+                    └────────────────────────────────────────────────┘
+```
+
+- **agentd** is TermBridge's remote runtime daemon (Linux x86_64). It ships inside every release archive / npm platform package at `resources/agentd/linux-x86_64/termbridge-agentd` and is auto-copied to a local cache, then auto-deployed to the host on first `open_session(persistent=true)`. You normally never manage it manually; if `RUNTIME_MISSING` occurs, see Key Constraints below.
+- `restart_remote_daemon(host)` redeploys + restarts the remote daemon (e.g. after a TermBridge upgrade); attached sessions on it will be lost (state → Lost).
 
 ## Core Workflow
 

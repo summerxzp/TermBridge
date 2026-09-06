@@ -3,6 +3,10 @@
   "version": "0.3.0",
   "description": "TermBridge — Remote Terminal Runtime for AI Agents (MCP)。薄主包：解析当前平台的 @summerxzp/termbridge-<os>-<arch> 平台包并启动二进制，更新/安装全走 npm registry。",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/summerxzp/TermBridge"
+  },
   "keywords": [
     "termbridge",
     "mcp",
