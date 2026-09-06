@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use crate::domain::provider::Host;
 use crate::domain::provider::TermError;
+use crate::infrastructure::username_store;
 
 /// `ssh -G` 子进程超时（15s）。
 ///
@@ -54,6 +55,15 @@ fn validate_alias(alias: &str) -> Result<&str, TermError> {
 /// 调用 `ssh -G <alias>` 并解析为 Host。
 ///
 /// `alias` 是 ssh config 里的 Host 别名（或直接 IP/hostname）。
+///
+/// 用户名优先级（高 → 低）：
+/// 1. **记忆的用户名**（`username_store`）：用户在凭据对话框中填写过一次后
+///    记住（最新优先），下次连接作为该 host 的默认用户名
+/// 2. ssh config 的 `User`（`ssh -G` 输出；缺省时为空串，由后续认证路径处理）
+///
+/// 另：`identityfile` / `userknownhostsfile` 路径经 `normalize_msys_path`
+/// 归一化——Git Bash (MSYS) 环境下 spawn 的 `ssh -G` 输出 POSIX 风格盘符路径
+/// （`/c/Users/...`），Windows 侧 russh/std::fs 无法打开。
 pub async fn resolve(alias: &str) -> Result<Host, TermError> {
     // 入口校验（P1-4）：拒绝空串 / '-' 开头 / `--`，防 ssh 选项注入
     let alias = validate_alias(alias)?;
@@ -89,7 +99,21 @@ pub async fn resolve(alias: &str) -> Result<Host, TermError> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_ssh_g(alias, &stdout)
+    let mut host = parse_ssh_g(alias, &stdout)?;
+
+    // 记忆的用户名优先于 ssh config User（用户在凭据对话框填写过一次即成为
+    // 该 host 的默认，最新优先；见 username_store 文档）
+    if let Some(remembered) = username_store::lookup(&host.hostname) {
+        tracing::debug!(
+            host = %host.hostname,
+            config_user = %host.user,
+            remembered_user = %remembered,
+            "sshconfig: 记忆的用户名覆盖 ssh config User"
+        );
+        host.user = remembered;
+    }
+
+    Ok(host)
 }
 
 /// 解析 `ssh -G` 输出文本为 Host（纯函数，便于单测）。
@@ -140,7 +164,7 @@ fn parse_ssh_g(alias: &str, stdout: &str) -> Result<Host, TermError> {
         .map(|files| {
             files
                 .iter()
-                .map(|s| expand_tilde(s))
+                .map(|s| expand_tilde(&normalize_msys_path(s, cfg!(windows))))
                 .filter(|p| p.is_file())
                 .collect()
         })
@@ -158,7 +182,7 @@ fn parse_ssh_g(alias: &str, stdout: &str) -> Result<Host, TermError> {
         .map(|v| {
             split_quoted_tokens(v)
                 .iter()
-                .map(|s| expand_tilde(s))
+                .map(|s| expand_tilde(&normalize_msys_path(s, cfg!(windows))))
                 .collect()
         })
         .unwrap_or_default();
@@ -195,6 +219,41 @@ fn expand_tilde(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+/// 归一化 MSYS (Git Bash) 风格的 POSIX 路径为 Windows 可用形式。
+///
+/// 背景：MCP server 若从 Git Bash (MSYS) 环境被 spawn，PATH 上的 `ssh` 是
+/// MSYS OpenSSH，`ssh -G` 输出 POSIX 风格盘符路径——
+/// `userknownhostsfile /c/Users/.../.ssh/known_hosts`、
+/// `identityfile /c/Users/.../.ssh/id_ed25519`。Windows 侧 russh / std::fs
+/// 打不开 `/c/...` 路径 → host key 永远"未知"（HOST_KEY_REJECTED）、
+/// identity file 静默失败。Windows 原生 OpenSSH 输出 `C:\Users\...` 无此问题。
+///
+/// 规则（`windows=true` 时）：路径匹配 `/<盘符>/`（如 `/c/`）→ 转为
+/// `<盘符>:/...`（`/c/Users/foo` → `C:/Users/foo`；正斜杠对 Windows API 合法，
+/// 不必转反斜杠）。其余（`/home/...`、`C:\...`、`~` 开头等）原样返回。
+///
+/// `windows=false`：恒原样返回（POSIX 上 `/c/...` 是合法字面路径）。
+fn normalize_msys_path(path: &str, windows: bool) -> String {
+    if !windows {
+        return path.to_string();
+    }
+    // 仅处理 `/<单字母>/` 盘符形式；`/home/...`、`/tmp/...` 等不动
+    let bytes = path.as_bytes();
+    if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b'/'
+    {
+        let mut out = String::with_capacity(path.len());
+        // 保留原大小写（MSYS 通常输出小写盘符，Windows 不区分大小写均可打开）
+        out.push(bytes[1] as char);
+        out.push(':');
+        out.push_str(&path[2..]); // 保留剩余 `/...`（正斜杠对 Windows API 合法）
+        return out;
+    }
+    path.to_string()
 }
 
 /// 按 OpenSSH token 语法切分空格分隔的多 token 值（P3-6）。
@@ -785,5 +844,86 @@ port 22
         assert_eq!(host.user_known_hosts_files.len(), 2);
         assert_eq!(host.user_known_hosts_files[0], PathBuf::from("/tmp/kh1"));
         assert_eq!(host.user_known_hosts_files[1], PathBuf::from("/tmp/kh2"));
+    }
+
+    // ── MSYS (Git Bash) 路径归一化 ─────────────────────────────────────
+    // 背景：Git Bash 环境 spawn 的 `ssh -G` 输出 POSIX 风格盘符路径
+    // （`/c/Users/...`），Windows 侧 russh/std::fs 打不开。
+
+    #[test]
+    fn normalize_msys_path_converts_drive_letter_form_on_windows() {
+        // `/c/Users/SUMMER/.ssh/known_hosts` → `c:/Users/SUMMER/.ssh/known_hosts`
+        // （保留原盘符大小写；MSYS 输出小写，Windows 文件系统不区分大小写）
+        assert_eq!(
+            normalize_msys_path("/c/Users/SUMMER/.ssh/known_hosts", true),
+            "c:/Users/SUMMER/.ssh/known_hosts"
+        );
+        // 大写盘符同样处理
+        assert_eq!(
+            normalize_msys_path("/D/data/id_ed25519", true),
+            "D:/data/id_ed25519"
+        );
+        // 恰为 `/<盘符>/` 前缀的最短形式（`/c/`）也应转换
+        assert_eq!(normalize_msys_path("/c/", true), "c:/");
+    }
+
+    #[test]
+    fn normalize_msys_path_leaves_posix_paths_unchanged_on_windows() {
+        // 非 `/<单字母>/` 形式的 POSIX 路径不动（可能是合法远端/字面路径）
+        assert_eq!(
+            normalize_msys_path("/home/user/x", true),
+            "/home/user/x"
+        );
+        assert_eq!(normalize_msys_path("/tmp/kh", true), "/tmp/kh");
+        // `/<双字符>/` 不是盘符形式
+        assert_eq!(normalize_msys_path("/ab/cd", true), "/ab/cd");
+    }
+
+    #[test]
+    fn normalize_msys_path_leaves_windows_paths_unchanged() {
+        // 已是 Windows 形式（反斜杠 / 盘符冒号）原样返回
+        assert_eq!(
+            normalize_msys_path(r"C:\already\fine", true),
+            r"C:\already\fine"
+        );
+        assert_eq!(normalize_msys_path("C:/Users/x", true), "C:/Users/x");
+        // 相对路径不动
+        assert_eq!(normalize_msys_path("relative/path", true), "relative/path");
+    }
+
+    #[test]
+    fn normalize_msys_path_noop_on_non_windows() {
+        // POSIX 上 `/c/...` 是合法字面路径，恒原样返回
+        assert_eq!(
+            normalize_msys_path("/c/Users/SUMMER/.ssh/known_hosts", false),
+            "/c/Users/SUMMER/.ssh/known_hosts"
+        );
+        assert_eq!(normalize_msys_path("/home/user/x", false), "/home/user/x");
+    }
+
+    /// 记忆用户名覆盖辅助：从解析结果 Host 应用记忆（resolve 内联逻辑提取，
+    /// 纯函数便于单测——resolve 本身依赖 `ssh -G` 子进程无法单测，
+    /// `username_store::lookup` 读全局文件也不适合在单测中预置）。
+    fn apply_remembered_user(host: &mut Host, remembered: Option<String>) {
+        if let Some(user) = remembered {
+            host.user = user;
+        }
+    }
+
+    #[test]
+    fn remembered_user_overrides_config_user() {
+        // 有记忆 → 覆盖 ssh config User（"填写过一次后作为默认"）
+        let mut host = parse_ssh_g("testhost", SAMPLE_G).unwrap();
+        assert_eq!(host.user, "testuser");
+        apply_remembered_user(&mut host, Some("alice".into()));
+        assert_eq!(host.user, "alice");
+    }
+
+    #[test]
+    fn no_remembered_user_keeps_config_user() {
+        // 无记忆 → 保持 ssh config User（首次使用，用户名默认空/取 config）
+        let mut host = parse_ssh_g("testhost", SAMPLE_G).unwrap();
+        apply_remembered_user(&mut host, None);
+        assert_eq!(host.user, "testuser");
     }
 }

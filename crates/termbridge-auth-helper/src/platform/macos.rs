@@ -2,6 +2,7 @@
 // 关闭 ECHO 隐藏输入，Ctrl+C 返回 Cancelled（关闭 ISIG，不触发 SIGINT 退出）。
 // GUI 集成（Security framework / Keychain）留待后续阶段。
 
+use super::PromptedCredential;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::unix::io::AsRawFd;
@@ -11,7 +12,11 @@ pub enum PromptError {
     Unsupported,
 }
 
-pub fn prompt_password(host: &str, user: &str, reason: &str) -> Result<String, PromptError> {
+pub fn prompt_password(
+    host: &str,
+    user: &str,
+    reason: &str,
+) -> Result<PromptedCredential, PromptError> {
     // 1. 打开 /dev/tty（MCP 进程的 stdin/stdout 被 JSON-RPC 占用，必须直连终端）
     let mut tty = OpenOptions::new()
         .read(true)
@@ -72,6 +77,10 @@ pub fn prompt_password(host: &str, user: &str, reason: &str) -> Result<String, P
     if bytes.is_empty() {
         Err(PromptError::Cancelled)
     } else {
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        // tty prompt 不提供用户名编辑：原样返回请求的预填用户名
+        Ok(PromptedCredential {
+            user: user.to_string(),
+            password: String::from_utf8_lossy(&bytes).into_owned(),
+        })
     }
 }

@@ -23,7 +23,10 @@ struct PasswordRequest {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Response {
-    Password { value: String },
+    /// value = 密码；user = 对话框中实际确认/编辑的用户名（Windows CredUI 的
+    /// 用户名缓冲是 in/out 的，用户可修改预填值）。旧版 TermBridge 读到未知
+    /// 字段会忽略（未开 deny_unknown_fields），向前兼容安全。
+    Password { value: String, user: String },
     Cancelled,
 }
 
@@ -38,7 +41,11 @@ fn main() {
             return None;
         }
         match platform::prompt_password(&req.host, &req.user, &req.reason) {
-            Ok(password) => Some(Response::Password { value: password }),
+            // 读回对话框确认/编辑后的用户名（可能被用户修改），随密码一起回传
+            Ok(cred) => Some(Response::Password {
+                value: cred.password,
+                user: cred.user,
+            }),
             Err(_) => None,
         }
     })()

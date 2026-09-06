@@ -21,7 +21,8 @@ use tokio::task::JoinHandle;
 use bytes::Bytes;
 
 use crate::domain::credential::{
-    CredentialError, CredentialProvider, NoopCredentialProvider, PasswordRequest, Secret,
+    CredentialError, CredentialProvider, NoopCredentialProvider, PasswordCredential,
+    PasswordRequest,
 };
 use crate::domain::output::{ReadOutputParams, ReadOutputResult};
 use crate::domain::policy::{Action, ApprovalMode, Decision};
@@ -38,6 +39,7 @@ use crate::infrastructure::persistent::{
 use crate::infrastructure::sftp::DirTransferReport;
 use crate::infrastructure::ssh::SshTerminalHandle;
 use crate::infrastructure::sshconfig;
+use crate::infrastructure::username_store;
 use crate::application::host_policy::{AuthMode, HostPolicyResolver, SessionMode};
 use crate::application::path_policy::{PathPolicy, RemoteOperation};
 use crate::application::policy::PolicyManager;
@@ -245,7 +247,9 @@ impl SessionManager {
     ///
     /// auth 只来自 host policy（MCP schema 无 auth 参数——ADR-0009 禁止密码进
     /// tool arguments）。`auth=password` 时经 CredentialProvider 请求密码（可能
-    /// 触发用户 prompt，ADR-0017 §2.7），密码不持久化、不部署 key。
+    /// 触发用户 prompt，ADR-0017 §2.7），密码不持久化、不部署 key。对话框中
+    /// 用户可编辑用户名：确认值优先于 config User，认证成功后记入
+    /// username_store 作为该 host 默认（下次连接免填，最新优先）。
     pub async fn open_session(
         &self,
         host_alias: &HostName,
@@ -263,15 +267,35 @@ impl SessionManager {
         //    必须在 credential prompt 之前拒绝——用户不应为注定失败的请求输入密码。
         Self::validate_auth_session_combo(auth_mode, session_mode)?;
 
-        // 3. ssh -G 解析（ADR-0006：复用 OpenSSH 完整 config 解析）
-        let host = sshconfig::resolve(host_alias).await?;
+        // 3. ssh -G 解析（ADR-0006：复用 OpenSSH 完整 config 解析；
+        //    内部应用记忆用户名优先于 config User，见 sshconfig::resolve 文档）
+        let mut host = sshconfig::resolve(host_alias).await?;
 
         // 4. password 路径：经 CredentialProvider 请求密码（ADR-0017 §2.3）。
         //    Secret 仅在 SSH 认证瞬间 reveal()；provider.open 返回后 request drop → Zeroize。
+        //    对话框中用户可能编辑用户名（Windows CredUI in/out 缓冲）——
+        //    有效用户名 = 对话框确认值（None 回退 config User），并在认证成功后
+        //    记入 username_store（下次连接作为该 host 默认，最新优先）。
+        //    Key / Auto 路径不弹密码，无新信息，不记忆。
         let password = match auth_mode {
             AuthMode::Password => Some(self.request_password(&host).await?),
             AuthMode::Key | AuthMode::Auto => None,
         };
+
+        // 有效用户名写回 host.user：OpenTerminalRequest 携带 host.user 进入
+        // SSH 认证——这是自定义用户名真正对 session 生效的地方
+        if let Some(cred) = password.as_ref() {
+            let effective = cred.user.clone().unwrap_or_else(|| host.user.clone());
+            if effective != host.user {
+                tracing::info!(
+                    host = %host.hostname,
+                    config_user = %host.user,
+                    effective_user = %effective,
+                    "用户在凭据对话框中修改了用户名"
+                );
+                host.user = effective;
+            }
+        }
 
         // 5. Provider 创建 Terminal Backend
         //    persistent=false → SshProvider 路径（SSH connect + auth + PTY + shell）
@@ -287,6 +311,8 @@ impl SessionManager {
             "open_session: resolved, connecting"
         );
         let pty_size = pty_size.unwrap_or_default();
+        // password 路径：只把 Secret 传给 provider（用户名已写回 host.user）
+        let password_secret = password.map(|cred| cred.secret);
         let handle = self
             .provider
             .open(OpenTerminalRequest {
@@ -294,9 +320,16 @@ impl SessionManager {
                 pty_size,
                 persistent,
                 name,
-                password,
+                password: password_secret,
             })
             .await?;
+
+        // password 路径认证成功：记住该 host 的用户名（host.user 已是有效用户名
+        // ——对话框确认值或 config User；最新优先，下次连接作为默认）。
+        // Key / Auto 路径不经过这里（无新信息）。记忆失败仅 warn，不影响开session。
+        if auth_mode == AuthMode::Password {
+            username_store::remember(&host.hostname, &host.user);
+        }
 
         // 6. 创建 Session（内部 spawn PTY read task）
         let id = self.next_session_id();
@@ -344,10 +377,13 @@ impl SessionManager {
 
     /// 经 CredentialProvider 请求密码（ADR-0017 §2.3 auth=password）。
     ///
+    /// 返回 [`PasswordCredential`]：密码 + 对话框中实际确认/编辑的用户名
+    /// （None = helper 未提供，调用方回退 host.user）。
+    ///
     /// 错误映射（与 bootstrap_host 一致，ADR-0009）：
     /// - 用户取消 → `AuthFailed`（认证未发生）
     /// - helper 失败 / 平台不支持 → `InvalidArgument`
-    async fn request_password(&self, host: &Host) -> Result<Secret, TermError> {
+    async fn request_password(&self, host: &Host) -> Result<PasswordCredential, TermError> {
         self.credential_provider
             .request_password(PasswordRequest {
                 host: host.hostname.clone(),
@@ -1630,9 +1666,10 @@ mod tests {
 
     /// 假 CredentialProvider：按编程结果响应。
     /// Secret 不可 Clone（ADR-0005），每次调用构造新值。
+    /// `Ok` 变体可携带对话框编辑后的用户名（None = 模拟旧 helper 未回传）。
     #[derive(Clone)]
     enum FakeResponse {
-        Ok,
+        Ok(Option<String>),
         Cancelled,
         HelperFailed(String),
         Unsupported(String),
@@ -1647,9 +1684,12 @@ mod tests {
         async fn request_password(
             &self,
             _request: PasswordRequest,
-        ) -> Result<Secret, CredentialError> {
+        ) -> Result<PasswordCredential, CredentialError> {
             match self.response.lock().clone() {
-                FakeResponse::Ok => Ok(Secret::new("fake-password".into())),
+                FakeResponse::Ok(user) => Ok(PasswordCredential {
+                    user,
+                    secret: Secret::new("fake-password".into()),
+                }),
                 FakeResponse::Cancelled => Err(CredentialError::Cancelled),
                 FakeResponse::HelperFailed(msg) => Err(CredentialError::HelperFailed(msg)),
                 FakeResponse::Unsupported(msg) => Err(CredentialError::Unsupported(msg)),
@@ -1814,10 +1854,21 @@ mod tests {
     // ── ADR-0017 §2.3：request_password 错误映射 ──────────────────────
 
     #[tokio::test]
-    async fn request_password_returns_secret_on_ok() {
-        let mgr = mgr_with_credentials(FakeResponse::Ok);
-        let password = mgr.request_password(&test_host()).await.unwrap();
-        assert_eq!(password.reveal(), "fake-password");
+    async fn request_password_returns_credential_on_ok() {
+        // 对话框回传编辑后的用户名 → PasswordCredential 携带
+        let mgr = mgr_with_credentials(FakeResponse::Ok(Some("alice".into())));
+        let cred = mgr.request_password(&test_host()).await.unwrap();
+        assert_eq!(cred.secret.reveal(), "fake-password");
+        assert_eq!(cred.user.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn request_password_old_helper_no_user() {
+        // 旧 helper 未回传 user → None（调用方回退 host.user）
+        let mgr = mgr_with_credentials(FakeResponse::Ok(None));
+        let cred = mgr.request_password(&test_host()).await.unwrap();
+        assert_eq!(cred.secret.reveal(), "fake-password");
+        assert_eq!(cred.user, None);
     }
 
     #[tokio::test]

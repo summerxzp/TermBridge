@@ -370,16 +370,19 @@ fn warn_on_nested_dotted_host_keys(content: &str) {
 // 平台路径（ADR-0017 §2.9）
 // ───────────────────────────────────────────────────────────────────────────
 
-/// 默认 hosts.toml 平台路径（ADR-0017 §2.9）。
+/// 默认配置目录（ADR-0017 §2.9，`default_config_path` 的基础）。
 ///
-/// - Linux / macOS：`~/.config/termbridge/hosts.toml`（XDG）
-/// - Windows：`%APPDATA%\TermBridge\hosts.toml`
+/// - Linux / macOS：`~/.config/termbridge`（XDG）
+/// - Windows：`%APPDATA%\TermBridge`
 ///
 /// macOS 特殊处理：`dirs::config_dir()` 在 macOS 返回 `~/Library/Application Support`
 /// （Apple 原生惯例，适合 GUI 应用用 plist 管理配置）。但 TermBridge 是 CLI/开发者
 /// 工具，hosts.toml 是用户手写的 toml，应遵循 XDG 惯例（`~/.config`），与 git/vim/
 /// tmux 等所有 CLI 工具一致。参考：https://becca.ooo/blog/macos-dotfiles/
-pub fn default_config_path() -> PathBuf {
+///
+/// 除 hosts.toml 外，同目录下的其他 TermBridge 状态文件（如 username-memory.json，
+/// 见 `infrastructure/username_store.rs`）也复用此目录。
+pub fn default_config_dir() -> PathBuf {
     let base = if cfg!(target_os = "macos") {
         // macOS: 强制 XDG 风格（~/.config），尊重 XDG_CONFIG_HOME 环境变量
         std::env::var_os("XDG_CONFIG_HOME")
@@ -400,7 +403,12 @@ pub fn default_config_path() -> PathBuf {
     // Windows 用 TermBridge 目录（与 agentd 本地路径、ADR-0017 §2.9 一致，
     // %APPDATA%\TermBridge\hosts.toml）；Unix 用 XDG 惯例小写 termbridge。
     let app_dir = if cfg!(windows) { "TermBridge" } else { "termbridge" };
-    base.join(app_dir).join("hosts.toml")
+    base.join(app_dir)
+}
+
+/// 默认 hosts.toml 平台路径（ADR-0017 §2.9）：配置目录 + `hosts.toml`。
+pub fn default_config_path() -> PathBuf {
+    default_config_dir().join("hosts.toml")
 }
 
 // ───────────────────────────────────────────────────────────────────────────

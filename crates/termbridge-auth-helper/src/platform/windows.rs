@@ -4,6 +4,7 @@
 // 安全：密码缓冲读取后立即用 write_volatile 清零（模拟 SecureZeroMemory），
 // 避免依赖额外 windows feature。
 
+use super::PromptedCredential;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{FALSE, ERROR_SUCCESS};
 use windows::Win32::Graphics::Gdi::HBITMAP;
@@ -19,7 +20,11 @@ pub enum PromptError {
     Unsupported,
 }
 
-pub fn prompt_password(host: &str, user: &str, reason: &str) -> Result<String, PromptError> {
+pub fn prompt_password(
+    host: &str,
+    user: &str,
+    reason: &str,
+) -> Result<PromptedCredential, PromptError> {
     unsafe {
         // CREDUI 用户名/密码缓冲（WCHAR 计数）。CredUI wrapper 用切片 len 作 max chars。
         const USER_BUF_LEN: usize = 256;
@@ -71,10 +76,16 @@ pub fn prompt_password(host: &str, user: &str, reason: &str) -> Result<String, P
 
         match result {
             ERROR_SUCCESS => {
+                // user_buf 是 in/out 缓冲：对话框允许用户编辑用户名，
+                // 必须在清零前读回（可能是用户改过的自定义登录名）
+                let user_out = from_wide_buf(&user_buf);
                 let password = from_wide_buf(&password_buf);
                 secure_zero(&mut user_buf);
                 secure_zero(&mut password_buf);
-                Ok(password)
+                Ok(PromptedCredential {
+                    user: user_out,
+                    password,
+                })
             }
             // ERROR_CANCELLED 或任何其它失败：保守当取消，不暴露内部错误
             _ => {

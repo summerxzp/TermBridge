@@ -17,7 +17,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use crate::domain::credential::{
-    CredentialError, CredentialProvider, PassphraseRequest, PasswordRequest, Secret,
+    CredentialError, CredentialProvider, PassphraseRequest, PasswordCredential, PasswordRequest,
+    Secret,
 };
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -37,12 +38,22 @@ struct PasswordRequestMsg {
 /// helper → TermBridge 响应（stdout，单行 JSON）。
 ///
 /// 镜像 B1 helper 的 `Response` enum（`#[serde(tag = "type")]`）：
-/// - `{"type":"password","value":"..."}` → `Password`
+/// - `{"type":"password","value":"...","user":"..."}` → `Password`
+/// - `{"type":"password","value":"..."}` → `Password`（旧版 helper 无 user，
+///   `#[serde(default)]` 兼容 → user=None，调用方回退 request.user）
 /// - `{"type":"cancelled"}` → `Cancelled`
-#[derive(Deserialize)]
+///
+/// serde 兼容性：本 enum 未开 `deny_unknown_fields`——反向兼容（旧 TermBridge
+/// 读新 helper 的多出的 `user` 字段）同样安全，未知字段被忽略。
+#[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum HelperResponse {
-    Password { value: String },
+    Password {
+        value: String,
+        /// 对话框中实际确认/编辑的用户名（旧 helper 省略此字段 → None）
+        #[serde(default)]
+        user: Option<String>,
+    },
     Cancelled,
 }
 
@@ -78,7 +89,7 @@ impl CredentialProvider for HelperCredentialProvider {
     async fn request_password(
         &self,
         request: PasswordRequest,
-    ) -> Result<Secret, CredentialError> {
+    ) -> Result<PasswordCredential, CredentialError> {
         // 1. 构造 IPC 请求 JSON
         let msg = PasswordRequestMsg {
             msg_type: "password_request",
@@ -134,9 +145,12 @@ impl CredentialProvider for HelperCredentialProvider {
             .map_err(|e| CredentialError::HelperFailed(format!("parse helper response: {e}")))?;
 
         match response {
-            HelperResponse::Password { value } => {
+            HelperResponse::Password { value, user } => {
                 tracing::debug!("credential helper: password received");
-                Ok(Secret::new(value))
+                Ok(PasswordCredential {
+                    user,
+                    secret: Secret::new(value),
+                })
             }
             HelperResponse::Cancelled => {
                 tracing::debug!("credential helper: cancelled by user");
@@ -193,4 +207,45 @@ fn resolve_helper_path() -> Result<PathBuf, CredentialError> {
         "credential helper not found: {}",
         helper_path.display()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── helper 响应协议：user 字段向后/向前兼容 ────────────────────────
+
+    #[test]
+    fn parse_response_with_user() {
+        // 新 helper：回传对话框中确认/编辑后的用户名
+        let resp: HelperResponse =
+            serde_json::from_str(r#"{"type":"password","value":"pw","user":"alice"}"#).unwrap();
+        match resp {
+            HelperResponse::Password { value, user } => {
+                assert_eq!(value, "pw");
+                assert_eq!(user.as_deref(), Some("alice"));
+            }
+            other => panic!("期望 Password，实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_response_without_user() {
+        // 旧 helper 二进制：只回密码，无 user 字段 → None（调用方回退 request.user）
+        let resp: HelperResponse =
+            serde_json::from_str(r#"{"type":"password","value":"pw"}"#).unwrap();
+        match resp {
+            HelperResponse::Password { value, user } => {
+                assert_eq!(value, "pw");
+                assert_eq!(user, None, "旧 helper 无 user 字段应为 None");
+            }
+            other => panic!("期望 Password，实际: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_response_cancelled() {
+        let resp: HelperResponse = serde_json::from_str(r#"{"type":"cancelled"}"#).unwrap();
+        assert!(matches!(resp, HelperResponse::Cancelled));
+    }
 }

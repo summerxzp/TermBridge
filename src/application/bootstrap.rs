@@ -38,6 +38,7 @@ use crate::domain::credential::{CredentialError, CredentialProvider, PasswordReq
 use crate::domain::provider::{Host, TermError};
 use crate::infrastructure::ssh::{self, SshClientHandler};
 use crate::infrastructure::sshconfig;
+use crate::infrastructure::username_store;
 
 /// bootstrap_host 结果（ADR-0009 §3 / ADR-0017 §2.8）。
 #[derive(Debug, Clone, Serialize)]
@@ -125,7 +126,7 @@ impl BootstrapHost {
         let key_path = ensure_identity_file(&host).await?;
 
         // 步骤 5：请求密码
-        let password = match self
+        let cred = match self
             .credential_provider
             .request_password(PasswordRequest {
                 host: host.hostname.clone(),
@@ -148,12 +149,25 @@ impl BootstrapHost {
             }
         };
 
-        // 步骤 6：重连 + 密码认证
+        // 有效用户名：对话框中实际确认/编辑的（None = helper 未提供，回退
+        // ssh config 解析的 host.user）。用户可能把预填的 config User 改成
+        // 自定义登录名（如 root → 普通用户），必须用改后的值认证
+        let effective_user = cred.user.clone().unwrap_or_else(|| host.user.clone());
+        if effective_user != host.user {
+            tracing::info!(
+                host = %host.hostname,
+                config_user = %host.user,
+                effective_user = %effective_user,
+                "用户在凭据对话框中修改了用户名"
+            );
+        }
+
+        // 步骤 6：重连 + 密码认证（用有效用户名）
         let connected = ssh::connect_unauthenticated(&host).await?;
         let mut session = connected.handle;
-        let ok =
-            ssh::authenticate_with_password(&mut session, &host.user, password.reveal()).await?;
-        drop(password); // 立即 Zeroize
+        let ok = ssh::authenticate_with_password(&mut session, &effective_user, cred.secret.reveal())
+            .await?;
+        drop(cred); // 立即 Zeroize
 
         if !ok {
             return Ok(BootstrapResult::AuthenticationFailed {
@@ -161,29 +175,35 @@ impl BootstrapHost {
             });
         }
 
+        // 密码认证成功：记住该 host 的用户名（最新优先，下次连接作为默认；
+        // 记忆失败仅 warn，不影响 bootstrap 结果）
+        username_store::remember(&host.hostname, &effective_user);
+
         // 步骤 7：部署公钥到远端 authorized_keys（幂等）
+        // 部署命令以已认证用户身份在远端执行（~ 展开是远端侧的），无需改动
         let public_key = read_public_key(&key_path).await?;
         deploy_public_key(&mut session, &public_key).await?;
 
         // 步骤 8：关闭密码连接
         drop(session);
 
-        // 步骤 9：重连 + key 认证验证
+        // 步骤 9：重连 + key 认证验证（key 部署到了 effective_user 的 authorized_keys）
         let connected = ssh::connect_unauthenticated(&host).await?;
         let mut session = connected.handle;
         // host.identity_files 可能为空（刚生成的 key），用实际 key_path
         let identity_files = vec![key_path];
-        let via =
-            match ssh::authenticate_session(&mut session, &host.user, &identity_files).await {
-                Ok(v) => v,
-                Err(TermError::AuthFailed) => {
-                    return Ok(BootstrapResult::BootstrapFailed {
-                        host: host_alias.into(),
-                        reason: "key auth verification failed after install".into(),
-                    });
-                }
-                Err(e) => return Err(e),
-            };
+        let via = match ssh::authenticate_session(&mut session, &effective_user, &identity_files)
+            .await
+        {
+            Ok(v) => v,
+            Err(TermError::AuthFailed) => {
+                return Ok(BootstrapResult::BootstrapFailed {
+                    host: host_alias.into(),
+                    reason: "key auth verification failed after install".into(),
+                });
+            }
+            Err(e) => return Err(e),
+        };
 
         // 步骤 10：Bootstrapped
         Ok(BootstrapResult::Bootstrapped {

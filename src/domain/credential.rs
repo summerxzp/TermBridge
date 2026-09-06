@@ -94,6 +94,28 @@ pub struct PassphraseRequest {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Response 类型
+// ───────────────────────────────────────────────────────────────────────────
+
+/// `request_password` 的返回：密码 + 对话框中实际确认/编辑的用户名。
+///
+/// - `user`：用户在凭据对话框中**确认或修改后**的用户名。Windows CredUI 的
+///   用户名缓冲是 in/out 的，用户可以编辑预填值（如把 ssh config 的 root 改成
+///   普通用户）。`None` = helper 未提供（旧版 helper 二进制只回密码）→ 调用方
+///   回退 `request.user`（ssh config 解析出的预填值）。
+/// - `secret`：一次性密码（drop 自动清零，见 [`Secret`]）。
+///
+/// derive(Debug) 是安全的：`Secret` 的 Debug 为手动实现的脱敏占位符（P2-9），
+/// 不会泄漏密码明文。
+#[derive(Debug)]
+pub struct PasswordCredential {
+    /// 对话框中实际确认/编辑的用户名（None = helper 未提供，回退 request.user）
+    pub user: Option<String>,
+    /// 密码（一次性，调用方负责尽快 drop → Zeroize）
+    pub secret: Secret,
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // CredentialError
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -130,7 +152,14 @@ pub enum CredentialError {
 #[async_trait]
 pub trait CredentialProvider: Send + Sync {
     /// 请求密码（一次性使用，调用方负责 drop 后 Zeroize）。
-    async fn request_password(&self, request: PasswordRequest) -> Result<Secret, CredentialError>;
+    ///
+    /// 返回 [`PasswordCredential`]：密码 + 对话框中实际确认/编辑的用户名。
+    /// 用户名可被用户在对话框中修改（Windows CredUI 用户名缓冲是 in/out 的），
+    /// 调用方应优先使用返回的 `user`（None 时回退 `request.user`）。
+    async fn request_password(
+        &self,
+        request: PasswordRequest,
+    ) -> Result<PasswordCredential, CredentialError>;
 
     /// 请求 private key passphrase（MVP 可返回 `Unsupported`，优先走 SSH Agent）。
     async fn request_passphrase(
@@ -154,7 +183,7 @@ impl CredentialProvider for NoopCredentialProvider {
     async fn request_password(
         &self,
         _request: PasswordRequest,
-    ) -> Result<Secret, CredentialError> {
+    ) -> Result<PasswordCredential, CredentialError> {
         Err(CredentialError::Unsupported(
             "NoopCredentialProvider: no credential provider configured".into(),
         ))
@@ -194,5 +223,18 @@ mod tests {
         let dbg = format!("{secrets:?}");
         assert!(!dbg.contains("alpha-pass"));
         assert!(!dbg.contains("beta-pass"));
+    }
+
+    #[test]
+    fn debug_of_password_credential_does_not_leak() {
+        // PasswordCredential 派生 Debug：Secret 的 Debug 已脱敏（P2-9），
+        // 用户名非机密可正常显示
+        let cred = PasswordCredential {
+            user: Some("alice".to_string()),
+            secret: Secret::new("hunter2-super-secret".to_string()),
+        };
+        let dbg = format!("{cred:?}");
+        assert!(!dbg.contains("hunter2-super-secret"), "Debug 泄漏明文: {dbg}");
+        assert!(dbg.contains("alice"), "用户名非机密，应正常显示: {dbg}");
     }
 }
