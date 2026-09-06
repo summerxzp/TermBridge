@@ -35,6 +35,7 @@ use crate::infrastructure::daemon_proto::SessionInfo;
 use crate::infrastructure::persistent::{
     PersistentProvider, PersistentTerminalHandle, RemoteDaemonRestartReport,
 };
+use crate::infrastructure::sftp::DirTransferReport;
 use crate::infrastructure::ssh::SshTerminalHandle;
 use crate::infrastructure::sshconfig;
 use crate::application::host_policy::{AuthMode, HostPolicyResolver, SessionMode};
@@ -755,14 +756,15 @@ impl SessionManager {
     ///
     /// 复用 `sftp_transfer` 的 session 获取 + path policy 校验模式，
     /// 调用 `SftpProvider::upload_dir` 或 `download_dir`。
-    /// 返回传输的文件数（不含目录）。
+    /// 返回 [`DirTransferReport`]：传输文件数 + 被跳过的条目（symlink /
+    /// 非普通条目 / 本地文件名不安全，含原因），供 MCP 工具上报给 Agent。
     pub async fn sftp_transfer_dir(
         &self,
         session_id: &str,
         direction: TransferDirection,
         local_path: PathBuf,
         remote_path: String,
-    ) -> Result<usize, TermError> {
+    ) -> Result<DirTransferReport, TermError> {
         self.check_policy(&Action::SftpTransfer {
             direction,
             local: local_path.to_string_lossy().into_owned(),

@@ -412,6 +412,16 @@ struct GetSessionTimelineResult {
     events: Vec<TimelineEvent>,
 }
 
+/// sftp_transfer_dir 单条被跳过的条目（Phase 5-A）
+#[derive(Serialize)]
+struct SkippedEntryDto {
+    /// 条目名（仅文件名，不含父路径）
+    name: String,
+    /// 简短跳过原因（如 "invalid local filename: contains ':'" / "symlink" /
+    /// "not a regular file or directory"）
+    reason: String,
+}
+
 /// sftp_transfer_dir 成功返回（Phase 5-A）
 #[derive(Serialize)]
 struct SftpTransferDirResult {
@@ -419,6 +429,8 @@ struct SftpTransferDirResult {
     local_path: String,
     remote_path: String,
     files_transferred: usize,
+    /// 被跳过的条目（symlink / 非普通条目 / 本地文件名不安全），空列表 = 无跳过
+    skipped: Vec<SkippedEntryDto>,
 }
 
 /// detect_remote_env 成功返回（Phase 5-B）
@@ -837,7 +849,7 @@ async fn sftp_chmod(
     }
 
     /// Transfer a directory recursively via SFTP (Phase 5-A).
-    #[tool(description = "Transfer a directory recursively between local and remote via SFTP. Supports upload (local->remote) and download (remote->local). Creates target directories automatically. Symlinks are skipped. Returns files_transferred count. Path policy enforced.")]
+    #[tool(description = "Transfer a directory recursively between local and remote via SFTP. Supports upload (local->remote) and download (remote->local). Creates target directories automatically. Entries that cannot be transferred are SKIPPED (not an error) and reported in the `skipped` list with a reason each: symlinks (never followed), non-regular entries (special files), and download-side names unsafe for the local filesystem (e.g. containing ':', reserved device names like CON/NUL). Check `skipped` after every call - files_transferred does not include them, and those entries are silently absent from the destination. Returns files_transferred count. Path policy enforced. A transfer error (as opposed to a skip) still aborts the whole operation.")]
     async fn sftp_transfer_dir(
         &self,
         Parameters(params): Parameters<SftpTransferDirParams>,
@@ -866,11 +878,16 @@ async fn sftp_chmod(
             )
             .await
         {
-            Ok(count) => ok_result(SftpTransferDirResult {
+            Ok(report) => ok_result(SftpTransferDirResult {
                 direction: params.direction,
                 local_path: params.local_path,
                 remote_path: params.remote_path,
-                files_transferred: count,
+                files_transferred: report.files_transferred,
+                skipped: report
+                    .skipped
+                    .into_iter()
+                    .map(|s| SkippedEntryDto { name: s.name, reason: s.reason })
+                    .collect(),
             }),
             Err(e) => err_result(&e),
         }

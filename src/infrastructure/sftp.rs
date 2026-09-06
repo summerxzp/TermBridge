@@ -50,6 +50,35 @@ pub struct RemoteEntry {
     pub permissions: Option<u32>,
 }
 
+/// 目录递归传输中被跳过的条目（Phase 5-A，`DirTransferReport.skipped` 元素）。
+///
+/// 序列化为 JSON 供 MCP 工具返回给 Agent——跳过信息此前只在 tracing::warn
+/// 日志里可见，Agent 无从得知目录传输静默缺失了哪些条目。
+#[derive(Debug, Clone, Serialize)]
+pub struct SkippedEntry {
+    /// 条目名称（仅文件名，不含父路径）
+    pub name: String,
+    /// 简短跳过原因（如 "invalid local filename: contains ':'" / "symlink" /
+    /// "not a regular file or directory"）
+    pub reason: String,
+}
+
+/// 目录递归传输结果报告（Phase 5-A，upload_dir / download_dir 返回类型）。
+///
+/// - `files_transferred`：成功传输的文件数（不含目录；跳过条目不计入）
+/// - `skipped`：被跳过的条目及原因（symlink / 非普通条目 / 本地文件名不安全），
+///   空列表表示无跳过
+///
+/// 注意：单个文件传输**失败**仍是 fail-fast（返回 Err 中止），`skipped` 只
+/// 收集主动跳过的条目。
+#[derive(Debug, Clone, Serialize)]
+pub struct DirTransferReport {
+    /// 成功传输的文件数（不含目录；跳过条目不计入）
+    pub files_transferred: usize,
+    /// 被跳过的条目（空列表 = 无跳过，序列化为 `[]`）
+    pub skipped: Vec<SkippedEntry>,
+}
+
 /// SFTP 操作封装。每次构造会新建一个 SFTP channel（独立于 PTY channel）。
 ///
 /// 生命周期短：构造 → 一次 upload/download/canonicalize → drop。
@@ -444,14 +473,15 @@ impl SftpProvider {
     /// 递归上传本地目录到远端（Phase 5-A）。
     ///
     /// - 自动创建远端目录（`mkdir_p` 语义）
-    /// - 跳过符号链接（不跟随，防止循环）
+    /// - 跳过符号链接（不跟随，防止循环），跳过条目记入 `report.skipped`
     /// - 单个文件失败时 fail-fast（返回错误，不继续）
-    /// - 返回传输的文件数（不含目录）
+    /// - 返回 [`DirTransferReport`]：传输文件数 + 跳过条目列表（含原因），
+    ///   供 MCP 工具把静默缺失的条目上报给 Agent
     pub async fn upload_dir(
         &self,
         local_dir: &Path,
         remote_dir: &str,
-    ) -> Result<usize, TermError> {
+    ) -> Result<DirTransferReport, TermError> {
         const MAX_DEPTH: usize = 20;
         self.upload_dir_inner(local_dir, remote_dir, 0, MAX_DEPTH).await
     }
@@ -462,7 +492,7 @@ impl SftpProvider {
         remote_dir: &str,
         depth: usize,
         max_depth: usize,
-    ) -> Result<usize, TermError> {
+    ) -> Result<DirTransferReport, TermError> {
         if depth > max_depth {
             return Err(TermError::InvalidArgument(format!(
                 "sftp upload_dir exceeded max depth {max_depth} at '{remote_dir}' \
@@ -483,6 +513,7 @@ impl SftpProvider {
         self.mkdir_p(remote_dir, 0).await?;
 
         let mut count = 0usize;
+        let mut skipped: Vec<SkippedEntry> = Vec::new();
         let mut entries = tokio::fs::read_dir(local_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let file_type = entry.file_type().await?;
@@ -498,21 +529,27 @@ impl SftpProvider {
             if file_type.is_symlink() {
                 // 与 download_dir 的跳过告警一致：跳过条目对调用方可见
                 tracing::warn!(local = ?local_child, "upload_dir: skipping symlink (not followed)");
+                skipped.push(SkippedEntry {
+                    name: name_str.into_owned(),
+                    reason: "symlink".to_string(),
+                });
                 continue;
             } else if file_type.is_dir() {
-                count += Box::pin(self.upload_dir_inner(
+                let sub = Box::pin(self.upload_dir_inner(
                     &local_child,
                     &remote_child,
                     depth + 1,
                     max_depth,
                 ))
                 .await?;
+                count += sub.files_transferred;
+                skipped.extend(sub.skipped);
             } else if file_type.is_file() {
                 self.upload(&local_child, &remote_child).await?;
                 count += 1;
             }
         }
-        Ok(count)
+        Ok(DirTransferReport { files_transferred: count, skipped })
     }
 
     /// 递归下载远端目录到本地（Phase 5-A）。
@@ -520,14 +557,16 @@ impl SftpProvider {
     /// - 自动创建本地目录（`create_dir_all`）
     /// - 跳过符号链接等非普通文件/目录条目（RemoteEntry.is_dir/is_file 均为 false）
     /// - 跳过对本地文件系统不安全的远端条目名（`\`、`/`、`:`、控制字符、
-    ///   Windows 保留设备名、尾部点/空格，修复 P2-3），跳过条目均记录 warn 日志
+    ///   Windows 保留设备名、尾部点/空格，修复 P2-3）
+    /// - 跳过的条目记入 `report.skipped`（含具体原因）并记录 warn 日志
     /// - 单个文件失败时 fail-fast
-    /// - 返回传输的文件数（不含目录；跳过的条目不计入）
+    /// - 返回 [`DirTransferReport`]：传输文件数 + 跳过条目列表（不含目录；
+    ///   跳过的条目不计入 files_transferred），供 MCP 工具上报给 Agent
     pub async fn download_dir(
         &self,
         remote_dir: &str,
         local_dir: &Path,
-    ) -> Result<usize, TermError> {
+    ) -> Result<DirTransferReport, TermError> {
         const MAX_DEPTH: usize = 20;
         self.download_dir_inner(remote_dir, local_dir, 0, MAX_DEPTH)
             .await
@@ -539,7 +578,7 @@ impl SftpProvider {
         local_dir: &Path,
         depth: usize,
         max_depth: usize,
-    ) -> Result<usize, TermError> {
+    ) -> Result<DirTransferReport, TermError> {
         if depth > max_depth {
             return Err(TermError::InvalidArgument(format!(
                 "sftp download_dir exceeded max depth {max_depth} at '{remote_dir}' \
@@ -551,7 +590,7 @@ impl SftpProvider {
 
         let entries = self.list_dir(remote_dir).await?;
         let mut count = 0usize;
-        let mut skipped: Vec<String> = Vec::new();
+        let mut skipped: Vec<SkippedEntry> = Vec::new();
         for entry in entries {
             // 远端 POSIX 文件名直拼 Windows 路径有注入风险（\ 变分隔符、: 变
             // ADS、保留设备名异常），校验失败的条目跳过并告警（修复 P2-3）
@@ -562,7 +601,10 @@ impl SftpProvider {
                     reason = %reason,
                     "download_dir: skipping entry with unsafe local name"
                 );
-                skipped.push(format!("{} ({reason})", entry.name));
+                skipped.push(SkippedEntry {
+                    name: entry.name,
+                    reason: format!("invalid local filename: {reason}"),
+                });
                 continue;
             }
             let remote_child = if remote_dir.ends_with('/') {
@@ -573,13 +615,15 @@ impl SftpProvider {
             let local_child = local_dir.join(&entry.name);
 
             if entry.is_dir {
-                count += Box::pin(self.download_dir_inner(
+                let sub = Box::pin(self.download_dir_inner(
                     &remote_child,
                     &local_child,
                     depth + 1,
                     max_depth,
                 ))
                 .await?;
+                count += sub.files_transferred;
+                skipped.extend(sub.skipped);
             } else if entry.is_file {
                 self.download(&remote_child, &local_child).await?;
                 count += 1;
@@ -590,17 +634,24 @@ impl SftpProvider {
                     name = %entry.name,
                     "download_dir: skipping non-regular entry (symlink or special file)"
                 );
-                skipped.push(format!("{} (not a regular file or directory)", entry.name));
+                skipped.push(SkippedEntry {
+                    name: entry.name,
+                    reason: "not a regular file or directory".to_string(),
+                });
             }
         }
         if !skipped.is_empty() {
+            let summary: Vec<String> = skipped
+                .iter()
+                .map(|s| format!("{} ({})", s.name, s.reason))
+                .collect();
             tracing::warn!(
                 remote = remote_dir,
-                skipped = ?skipped,
+                skipped = ?summary,
                 "download_dir: skipped entries are excluded from files_transferred"
             );
         }
-        Ok(count)
+        Ok(DirTransferReport { files_transferred: count, skipped })
     }
 }
 
@@ -994,6 +1045,45 @@ mod tests {
         let json = serde_json::to_string(&entry).unwrap();
         // permissions 为 None 时应被 skip
         assert!(!json.contains("permissions"));
+    }
+
+    // ── Phase 5-A：DirTransferReport 序列化测试 ──────────────────
+
+    #[test]
+    fn dir_transfer_report_serializes_with_skipped_entries() {
+        let report = DirTransferReport {
+            files_transferred: 3,
+            skipped: vec![
+                SkippedEntry {
+                    name: "a:b.txt".into(),
+                    reason: "invalid local filename: contains colon (NTFS alternate data stream)".into(),
+                },
+                SkippedEntry {
+                    name: "link".into(),
+                    reason: "not a regular file or directory".into(),
+                },
+            ],
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"files_transferred\":3"));
+        assert!(json.contains("\"skipped\":["));
+        assert!(json.contains("\"name\":\"a:b.txt\""));
+        assert!(json.contains("\"reason\":\"invalid local filename: contains colon"));
+        assert!(json.contains("\"name\":\"link\""));
+        assert!(json.contains("\"reason\":\"not a regular file or directory\""));
+    }
+
+    #[test]
+    fn dir_transfer_report_serializes_empty_skipped_as_array() {
+        // 无跳过时 skipped 序列化为 []（而非 null），旧消费方不破坏
+        let report = DirTransferReport {
+            files_transferred: 2,
+            skipped: Vec::new(),
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"files_transferred\":2"));
+        assert!(json.contains("\"skipped\":[]"));
+        assert!(!json.contains("null"));
     }
 
     // ── Phase 2：map_sftp_error 测试 ──────────────────────────────
