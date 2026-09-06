@@ -253,9 +253,24 @@ jobs:
           # OIDC：npm CLI 检测到 GitHub Actions OIDC 环境后自动换取短时身份，
           # 无需 NODE_AUTH_TOKEN（npm trust publisher 已在 npmjs.com 配置）。
           # --access public：scope 包（@summerxzp/*）默认 restricted，必须显式公开
+          #
+          # 版本已存在 → 跳过该包继续（v0.3.1 实测教训：新包名首发必须手动
+          # publish 一次才能配 trusted publisher，手动版与 CI 版同版本号冲突；
+          # unpublish 最后一个版本会触发 24h 禁止重发，比跳过更糟。手动版与
+          # CI 产物同源同内容，仅缺 provenance，功能无差异）。
+          publish_one() {
+            local pkg_dir="$1"
+            if ! npm publish "$pkg_dir" --access public 2>&1 | tee /tmp/npm-publish.log; then
+              if grep -qE "cannot publish over the previously published versions|EPUBLISHCONFLICT" /tmp/npm-publish.log; then
+                echo "::warning::$(basename "$pkg_dir") 该版本已存在（手动首发过），跳过"
+                return 0
+              fi
+              return 1
+            fi
+          }
           for p in packaging/npm-platform/generated/termbridge-win32-x64 \
                    packaging/npm-platform/generated/termbridge-linux-x64 \
                    packaging/npm-platform/generated/termbridge-darwin-arm64; do
-            npm publish "$p" --access public
+            publish_one "$p"
           done
-          ( cd packaging/npm-platform && npm publish --access public )
+          publish_one packaging/npm-platform
