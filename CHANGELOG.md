@@ -2,8 +2,46 @@
 
 All notable changes to TermBridge are documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+The format is based on [Keep a Changelog](https://keepachangelog.com/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [0.3.1] - 2026-09-07
+
+全量 code review（`docs/code-review-2026-08-30.md`）修复批次 + 真实 Linux 环境实测验证。
+
+### Fixed
+
+**SSH / PTY**
+- PTY rows/cols 与 russh 参数顺序对齐（russh 为 col-first），修正初始窗口尺寸颠倒（远端 `stty size` 实测 24×80 正确，resize 后 30×100 正确）
+- SSH connect / channel_open / PTY write / send_control / `SshProvider::exec` 收集循环（120s）/ `ssh -G` 全部补齐超时，半开连接不再永久挂起
+- `open_session` host 别名拒绝 `-` 前缀，堵 `ssh -G` 参数注入；`userknownhostsfile` 支持带引号含空格路径；Git Bash（MSYS）下 `ssh -G` POSIX 路径（`/c/Users/...`）归一化，Windows 侧 host key 不再永远未知
+
+**agentd（远端 daemon；Linux 实测 46/46 三轮全绿）**
+- 子进程退出：冲刷尾部输出 + 发送 `pty_exit`/`session_lost` 终态事件（此前 attached 客户端永远挂等，实测 exit 后立即转 lost）
+- 客户端断连自动 detach，重连直接 attach（实测 detach→attach 游标续读正常）
+- `send_input` 改专属写线程（短写补全 + 256KB 背压 5s 超时），RPC dispatch 不再被阻塞写楔死；PtyWriter Drop 有界 join（panic 路径不再挂死 unwind）
+- FD_CLOEXEC 全覆盖（shell 子进程不再继承 listener/连接/其他 session 的 pty master）；fork 前完成全部内存分配；kill 打进程组 + EOF 路径 reap；日志改 stderr 不污染协议流
+
+**策略 / 安全**
+- 封堵 `authorized_keys`/`authorized_keys2` 经 SFTP create 的绕过（新建文件此前不检查目标路径）；策略层敏感路径词法归一化（`//`、`..` 变体不再绕过 Confirm）；hosts.toml 损坏 fail-closed；bootstrap 公钥部署注入安全（base64 append）；`sftp_chmod` 拒绝 mode=0（防 chmod 0000）
+- 控制面：IPC token 改 CSPRNG（原时间戳^pid 零熵）、discovery 文件 0600、HELLO 失败限流、endpoint 唯一化；**Windows 控制面切换 Named Pipe + 当前用户 SID DACL**（protected DACL 无 Everyone/Anonymous ACE，跨用户连接在传输层被拒；`FILE_FLAG_FIRST_PIPE_INSTANCE` 防管道名抢注）
+
+**输出 / SFTP**
+- `extract_context`（wait_for context_lines≥1）补回匹配文本本身；ANSI strip 支持带 intermediate byte 序列（`ESC ( B` 等）+ 跨页状态机（分页不再截断序列）；wait_for 唤醒改 watch（并发 waiter 不丢唤醒）
+- SFTP 上传原子化（tmp + 尺寸校验 + rename）；download 临时文件 pid+毫秒命名；`sftp_transfer_dir` 返回 `skipped` 列表（symlink/非常规/本地不安全文件名带原因，Agent 可感知静默跳过）；`download_dir` 校验远端文件名防 Windows 路径意外
+- Secret 手写 Debug 输出 `[REDACTED]`；日志脱敏补 URL userinfo
+
+**其他**
+- agentd 升级路径：版本比对触发重部署 + 原子部署（tmp+chmod+mv）+ 部署后同流程自动重启远端 daemon；新增 MCP 工具 `restart_remote_daemon`
+- 凭据弹窗（CredUI）用户名可编辑且真正生效（此前回读被丢弃），按主机记忆用户名（最新优先），ssh config User 可为空
+- GUI 修复 React StrictMode 双挂载读循环瓜分 PTY 输出
+- `RUNTIME_MISSING` 错误信息改为 agent 可自助排查的完整指引（agentd 是什么/为何缺失/三条修复路径）
+- CI 补 agentd 测试步骤（46 个 Linux-only 测试此前从未在 CI 运行）
+
+### Known Issues
+
+- npm 平台包 `bin` 字段修复（Linux/macOS 二进制 0644 → EACCES）包含在本版本，`npx @summerxzp/termbridge-mcp@0.3.1` 为首个 Linux/macOS 可用的 npm 版本
+- russh-sftp 无 posix-rename 扩展，SFTP 覆盖上传存在极短的 remove→rename 空窗
 
 ## [0.3.0] - 2026-08-28
 
@@ -31,35 +69,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `/etc` 等系统目录的正常读/写仍放行（改 nginx.conf、部署应用等运维场景不受影响）
   - `hosts.toml` 新增 per-host `allowed_remote_paths`（ADR-0017 Host Policy 扩展）：按主机声明可触及范围，未配置回退全局 `TERMBRIDGE_ALLOWED_REMOTE_PATHS`（默认 `["/"]`，不缩小 SSH 账号已具备权限）
   - `~` / `~/...` 远端路径经 `realpath("~")`（通道级缓存）正确展开；`Create` 目标不存在时校验父目录；null 字节路径一律拒绝
-
-### Fixed
-
-**SSH / PTY（termbridge core）**
-- PTY rows/cols 与 russh 参数顺序对齐（russh 为 col-first），修正初始窗口尺寸颠倒
-- SSH connect / exec / SFTP open / PTY write / `ssh -G` 全部补齐超时，无响应主机不再永久挂起；新增 host 别名注入防护与 known_hosts 引号路径解析
-- `SshProvider::exec` 收集循环加 120s 总超时（channel_open 同步加界）；`exec_stream`（proxy 长生命通道）仅 channel_open 加界，数据循环有意保持无界
-- SFTP 下载本地临时文件改 pid+毫秒命名（原固定 `.termbridge.tmp` 并发下载同一目标互覆）
-- 输出链路：`extract_context` 返回匹配文本；`strip_ansi` 修复 CSI 中间字节剥离与跨页状态；RingBuffer 改 watch 唤醒，避免读取空转
-- `sftp_chmod` 拒绝 mode=0（防止把文件权限清零）；SFTP 上传改原子写（temp + fsync + rename）；`sftp_transfer_dir` 下载校验目标目录名
-- `sftp_transfer_dir` 返回新增 `skipped` 列表：symlink / 非常规文件 / 本地不安全文件名逐项带原因上报（此前仅日志），Agent 可感知静默跳过
-- Timeline 缓冲改用 `VecDeque`，避免大 session 下的频繁内存搬移
-- Unix 缓存路径统一走 `dirs` crate（遵循 XDG）；CLI 读消息增加长度边界校验；日志脱敏补全（Secret Debug redaction + URL userinfo redact）
-
-**agentd（远端 daemon；新增单元测试需 Linux CI 跑通）**
-- 新增 MCP 工具 `restart_remote_daemon`：pid 文件校验（/proc comm 防误杀）→ SIGTERM/5s 宽限/-9 兜底 → 清理 socket → bootstrap 新 daemon；升级部署（NeedsUpgrade）后同一流程内自动重启生效
-- 补齐 pty_exit / session_lost 事件 + 通知驱动泵 + tail flush；修复 disconnect→detach 后 reconnect 的输出丢失
-- `send_input` 改独立 writer 线程 + 背压，大输入不再阻塞 read loop
-- 进程安全：FD_CLOEXEC、fork 前完成内存分配（fork-before-exec）、进程组 kill + reap；日志改走 stderr，不污染 PTY
-- daemon 升级路径 + 原子部署（升级不再中断既有 session）
-
-**策略 / 控制面安全**
-- 封堵 authorized_keys / authorized_keys2 经 SFTP create 的绕过；敏感路径词法归一化（`..` / 重复分隔符）；hosts.toml 解析失败 fail-closed；bootstrap 公钥部署注入安全 + 非 UTF-8 home 兼容
-- 控制面加固：IPC token 改用 CSPRNG、discovery 文件 0600、HELLO 限流、endpoint 唯一化
-- Windows 控制面传输从 TCP loopback 切换为 **Named Pipe**（兑现 ADR-0018「未来再切 Named Pipe」）：protected DACL `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<当前用户 SID>)` 拒绝跨用户连接；`FILE_FLAG_FIRST_PIPE_INSTANCE` 防管道名抢注；客户端 `ERROR_PIPE_BUSY` 有界重试；instance 发现文件 transport/endpoint 如实标记
-
-**GUI / npm 分发**
-- 修复 React StrictMode 双挂载产生两条 PTY read loop（字节流被拆分、一半丢失）：后端重建前先 abort 同 session 旧任务 + 循环结束自清理（防 map 泄漏），前端 `startReadLoop` 补 disposed 检查
-- npm 平台包 package.json 补 `bin` 字段：修复 Linux/macOS 发布的二进制被 `npm pack` 归一为 0644（运行 EACCES）的发布阻断问题；launcher 失败提示改为 scoped 包名；release.yml 移除 `!cancelled()` 误用、新增 tag/Cargo.toml 版本一致性门禁、删除死代码兼容块；README 与内部文档同步（npm 主渠道、扁平归档结构、legacy 下载器说明）
 
 ## [0.2.1] - 2026-08-14
 

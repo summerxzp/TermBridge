@@ -58,8 +58,12 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo check -p termbridge-agentd
 
+      - name: Test agentd (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo test -p termbridge-agentd
+
       - name: Check GUI (Tauri)
         run: cargo check -p termbridge-gui
 
       - name: Run unit tests
-        run: cargo test --lib
+        run: cargo test --lib -p termbridge

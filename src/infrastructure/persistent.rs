@@ -1101,10 +1101,30 @@ impl PersistentProvider {
     /// 6. 任一步失败 → `RuntimeDeployFailed`（尽力清理 tmp 残留）
     async fn deploy_runtime(&self, host: &Host) -> Result<(), TermError> {
         // 首次使用自动从发布包内置 resources/agentd 自举到本地缓存（wrapper/平台包
-        // 均保持 exe 同目录布局，故可稳定解析）；都不可用才报 RuntimeMissing
+        // 均保持 exe 同目录布局，故可稳定解析）；都不可用才报 RuntimeMissing。
+        // 错误信息必须自包含（What/Why/Fix）：消费方是无 agentd 记忆的 agent 会话，
+        // 不能假设它知道 agentd 是什么、装在哪、怎么补（用户反馈：新会话无法部署持久会话）
         let Some(local_path) = Self::ensure_local_agentd() else {
+            // current_exe() 失败的极端情况下回退到相对描述，保证信息仍可读
+            let bundled = Self::bundled_agentd_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| {
+                    "<exe dir>/resources/agentd/linux-x86_64/termbridge-agentd".to_string()
+                });
             return Err(TermError::RuntimeMissing(format!(
-                "local agentd binary not found: {}（发布包应包含 resources/agentd/linux-x86_64/termbridge-agentd）",
+                "persistent sessions (open_session with persistent=true) require the TermBridge \
+                 agentd daemon binary (Linux x86_64) to be available locally so it can be \
+                 auto-deployed to the remote host, but it was not found. Checked locations: \
+                 bundled copy at {bundled} and local cache at {}. This usually means termbridge \
+                 was installed by a method that does not bundle agentd (npm package without \
+                 resources/, cargo install, or a dev build). Fix (pick one): (1) download a \
+                 release archive from https://github.com/summerxzp/TermBridge/releases, which \
+                 bundles agentd under resources/; (2) if installed via npm \
+                 @summerxzp/termbridge-mcp, reinstall it and verify the platform package \
+                 contains resources/agentd; (3) for dev builds, build on/for Linux with \
+                 `cargo build --release -p termbridge-agentd` and copy the binary to the \
+                 local cache path above. Standard sessions (persistent=false) work without \
+                 agentd.",
                 Self::local_agentd_path().display()
             )));
         };
