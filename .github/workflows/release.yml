@@ -260,13 +260,17 @@ jobs:
           # CI 产物同源同内容，仅缺 provenance，功能无差异）。
           publish_one() {
             local pkg_dir="$1"
-            if ! npm publish "$pkg_dir" --access public 2>&1 | tee /tmp/npm-publish.log; then
+            # 输出落文件（tee 的退出码恒 0，管道会吞掉 npm 的失败状态）
+            if ! npm publish "$pkg_dir" --access public > /tmp/npm-publish.log 2>&1; then
               if grep -qE "cannot publish over the previously published versions|EPUBLISHCONFLICT" /tmp/npm-publish.log; then
                 echo "::warning::$(basename "$pkg_dir") 该版本已存在（手动首发过），跳过"
+                cat /tmp/npm-publish.log
                 return 0
               fi
+              cat /tmp/npm-publish.log
               return 1
             fi
+            cat /tmp/npm-publish.log
           }
           for p in packaging/npm-platform/generated/termbridge-win32-x64 \
                    packaging/npm-platform/generated/termbridge-linux-x64 \
