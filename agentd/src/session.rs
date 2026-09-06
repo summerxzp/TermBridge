@@ -555,8 +555,11 @@ mod tests {
     #[test]
     fn state_transitions() {
         let mgr = SessionManager::new();
+        // cat 挂在 stdin 读上不退出，状态稳定可断言。
+        // （"/bin/sleep" 无参会立即 usage-error 退出 → state 变 Lost，
+        // 全量并行时序下必挂——Linux 实测教训）
         let id = mgr
-            .create("/bin/sleep", None, PtySize { rows: 24, cols: 80 }, None)
+            .create("/bin/cat", None, PtySize { rows: 24, cols: 80 }, None)
             .expect("create");
 
         // Created → Attached
@@ -759,8 +762,14 @@ mod tests {
         // 等脚本跑起来
         thread::sleep(Duration::from_millis(200));
 
-        // 后台线程发送 1MB（远超 256KB 队列容量）→ 等待至背压超时
-        let big = vec![0x41u8; 1024 * 1024];
+        // 后台线程发送 1MB（远超 256KB 队列容量）→ 等待至背压超时。
+        // 数据含换行：无换行的超长行会被 PTY 行缓冲直接丢弃（不缓冲），
+        // 队列填不满，背压不发生（Linux 实测教训）
+        let mut big = Vec::with_capacity(1024 * 1024);
+        for _ in 0..(1024 * 1024 / 64) {
+            big.extend_from_slice(&[0x41u8; 63]);
+            big.push(b'\n');
+        }
         let mgr_t = mgr.clone();
         let id_t = id.clone();
         let sender = thread::spawn(move || mgr_t.send_input(&id_t, &big));

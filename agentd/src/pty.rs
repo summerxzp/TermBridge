@@ -250,6 +250,11 @@ const WRITER_QUEUE_BYTES: usize = 256 * 1024;
 const WRITER_CHUNK: usize = 64 * 1024;
 /// 队列满时 send_input 的最长等待（超时报错，绝不无限阻塞 RPC dispatch 线程）
 const SEND_WAIT: Duration = Duration::from_secs(5);
+/// Drop 时 join 写线程的上限。正常路径 Session 销毁前已 kill 子进程，slave
+/// 挂断使阻塞的 write 以 EIO 失败、写线程立即退出；但 panic/独立使用路径下
+/// 无人 kill 子进程，join 会永久挂死调用方（测试实测复现）。超时后放弃 join、
+/// 泄漏写线程——fd 关闭后其 write 最终以 EBADF 失败退出，不会永久驻留。
+const DROP_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// send_input 入队失败原因
 #[derive(Debug, PartialEq, Eq)]
@@ -366,15 +371,29 @@ impl PtyWriter {
 impl Drop for PtyWriter {
     fn drop(&mut self) {
         // 关闭队列 + 唤醒写线程并 join。
-        // 前置条件：Session 销毁时已先 kill 子进程 —— 写线程若阻塞在 master write 上，
-        // slave 端挂断（SIGKILL → slave fd 全关）会使其以 EIO 失败退出，join 不会无限等待。
+        // 正常路径前置：Session 销毁时已先 kill 子进程 —— 写线程若阻塞在 master
+        // write 上，slave 挂断（SIGKILL → slave fd 全关）会使其以 EIO 失败退出。
+        // 但 panic / 独立使用路径无人保证该前置，join 必须有界：超时放弃 join、
+        // 泄漏写线程（其 fd 关闭后 write 以 EBADF 失败自然退出），绝不挂死
+        // 正在 unwind 的线程。
         {
             let mut q = self.inner.queue.lock();
             q.closed = true;
         }
         self.inner.cv.notify_all();
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            let timeout = DROP_JOIN_TIMEOUT;
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let _ = thread::spawn(move || {
+                let _ = handle.join();
+                let _ = tx.send(());
+            });
+            if rx.recv_timeout(timeout).is_err() {
+                tracing::warn!(
+                    "pty-writer 线程在 {}s 内未退出（子进程未被 kill?），放弃 join",
+                    timeout.as_secs()
+                );
+            }
         }
     }
 }
@@ -540,8 +559,24 @@ mod tests {
             PtySize { rows: 24, cols: 80 },
         )
         .expect("spawn cat");
-        thread::sleep(Duration::from_millis(200));
-        let fd_dir = format!("/proc/{}/fd", pty.child_pid().as_raw());
+        // 等 exec 完成再检查：fork→exec 之间子进程短暂持有 master/slave 原始
+        // fd 是预期（随后显式关闭，exec 时 CLOEXEC 原子兜底）。并行负载下
+        // 子进程可能迟迟未被调度，固定 sleep 会误报（Linux 实测 flaky）。
+        // comm 变为 "cat" 即 exec 已完成，此后 fd > 2 才是真泄漏。
+        let pid = pty.child_pid().as_raw();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            if comm.trim() == "cat" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "子进程 5s 内未完成 exec（comm: {comm:?}）"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let fd_dir = format!("/proc/{pid}/fd");
         let entries = std::fs::read_dir(&fd_dir).expect("读 /proc/<pid>/fd 失败");
         for entry in entries {
             let name = entry.expect("entry").file_name();
@@ -624,12 +659,45 @@ mod tests {
         .expect("spawn cat");
         let writer = PtyWriter::new(pty.master_fd()).expect("create writer");
 
-        // 分批发送 512KB，cat 应全量回显
-        let total = 512 * 1024;
-        let input: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
-        for chunk in input.chunks(WRITER_CHUNK) {
-            writer.send(chunk).expect("send chunk");
+        // 关 ECHO（回显由 cat 输出提供，避免 tty 双重回显）与 ONLCR
+        // （输出 \n → \r\n 改写，否则回显内容 ≠ 输入，无法精确比对）
+        let fd = pty.master_fd();
+        unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(fd, &mut t), 0, "tcgetattr");
+            t.c_lflag &= !libc::ECHO;
+            t.c_oflag &= !libc::ONLCR;
+            assert_eq!(libc::tcsetattr(fd, libc::TCSANOW, &t), 0, "tcsetattr");
         }
+
+        // 后台线程分批发送 512KB；主线程**并发读取**回显——先发后读会撑满
+        // tty 输出缓冲 → cat 停止读取 → 输入队列背压死锁（Linux 实测教训）。
+        // 数据只用字母+换行：canonical 模式下控制字符有特殊语义
+        // （0x03=SIGINT 杀前台进程、0x7f=删除符…），会破坏回显一致性
+        let total = 512 * 1024;
+        let input: Vec<u8> = (0..total)
+            .map(|i| if i % 64 == 63 { b'\n' } else { b'a' + (i % 26) as u8 })
+            .collect();
+        let writer_t = std::sync::Arc::new(writer);
+        let sender = {
+            let writer_t = writer_t.clone();
+            let input = input.clone();
+            thread::spawn(move || {
+                for chunk in input.chunks(WRITER_CHUNK) {
+                    // 背压容忍：cat 读取慢时 send 可能 Backlogged，重试到成功
+                    let mut off = 0;
+                    while off < chunk.len() {
+                        match writer_t.send(&chunk[off..]) {
+                            Ok(()) => off = chunk.len(),
+                            Err(PtyWriteError::Backlogged) => {
+                                thread::sleep(Duration::from_millis(50));
+                            }
+                            Err(e) => panic!("send chunk 失败: {e}"),
+                        }
+                    }
+                }
+            })
+        };
 
         // 轮询读回显直到收满（最多 10s）
         let mut received: Vec<u8> = Vec::with_capacity(total);
@@ -645,12 +713,13 @@ mod tests {
                 Err(_) => break,
             }
         }
+        sender.join().expect("join sender");
         assert_eq!(received.len(), total, "cat 应回显全部输入（短写不得丢字节）");
         assert_eq!(received, input, "回显内容应一致");
 
         // 先杀子进程再 drop writer（避免 join 等待阻塞 write）
         pty.kill_child();
-        drop(writer);
+        drop(writer_t);
     }
 
     /// Fix 3：前台进程不读 stdin 时，队列背压应超时报错而非无限阻塞
@@ -664,8 +733,14 @@ mod tests {
         .expect("spawn sleep");
         let writer = PtyWriter::new(pty.master_fd()).expect("create writer");
 
-        // sleep 永不读 stdin：写入远超队列容量（256KB）的数据 → 5s 后 Backlogged
-        let big = vec![0x42u8; 1024 * 1024];
+        // sleep 永不读 stdin：写入远超队列容量（256KB）的数据 → 5s 后 Backlogged。
+        // 数据必须含换行：PTY 行缓冲（canonical 模式）对无换行的超长行直接
+        // 丢弃（不缓冲），队列永远填不满，背压不会发生（Linux 实测教训）。
+        let mut big = Vec::with_capacity(1024 * 1024);
+        for _ in 0..(1024 * 1024 / 64) {
+            big.extend_from_slice(&[0x42u8; 63]);
+            big.push(b'\n');
+        }
         let start = Instant::now();
         let err = writer.send(&big).expect_err("应背压超时");
         assert_eq!(err, PtyWriteError::Backlogged);
