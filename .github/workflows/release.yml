@@ -260,10 +260,13 @@ jobs:
           # CI 产物同源同内容，仅缺 provenance，功能无差异）。
           publish_one() {
             local pkg_dir="$1"
-            # 输出落文件（tee 的退出码恒 0，管道会吞掉 npm 的失败状态）
-            if ! npm publish "$pkg_dir" --access public > /tmp/npm-publish.log 2>&1; then
+            # 输出落文件（tee 的退出码恒 0，管道会吞掉 npm 的失败状态）。
+            # 必须 cd 进包目录发布：在仓库根 `npm publish <dir>` 会把目录
+            # 路径当 git spec 解析（v0.3.1 第四次实测：git ls-remote
+            # ssh://git@github.com/packaging/npm-platform.git → publickey 拒绝）
+            if ! ( cd "$pkg_dir" && npm publish --access public ) > /tmp/npm-publish.log 2>&1; then
               if grep -qE "cannot publish over the previously published versions|EPUBLISHCONFLICT" /tmp/npm-publish.log; then
-                echo "::warning::$(basename "$pkg_dir") 该版本已存在（手动首发过），跳过"
+                echo "::warning::$pkg_dir 该版本已存在（手动首发过），跳过"
                 cat /tmp/npm-publish.log
                 return 0
               fi
