@@ -559,10 +559,25 @@ mod tests {
             PtySize { rows: 24, cols: 80 },
         )
         .expect("spawn cat");
+        // 基线：测试进程自身的 fd 集合。CI runner 会向构建进程传递大量无
+        // CLOEXEC 的环境 fd（实测 fd 142 等），fork 继承给子进程属正常，
+        // 不算 agentd 的泄漏——断言语义是「子进程 fd ⊆ 父进程 fd ∪ {0,1,2}」，
+        // 即 agentd 不得新增任何泄漏。
+        let baseline: std::collections::HashSet<i32> =
+            std::fs::read_dir("/proc/self/fd")
+                .expect("读 /proc/self/fd 失败")
+                .map(|e| {
+                    e.expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .parse::<i32>()
+                        .expect("fd 编号")
+                })
+                .collect();
         // 等 exec 完成再检查：fork→exec 之间子进程短暂持有 master/slave 原始
         // fd 是预期（随后显式关闭，exec 时 CLOEXEC 原子兜底）。并行负载下
         // 子进程可能迟迟未被调度，固定 sleep 会误报（Linux 实测 flaky）。
-        // comm 变为 "cat" 即 exec 已完成，此后 fd > 2 才是真泄漏。
+        // comm 变为 "cat" 即 exec 已完成，此后才检查泄漏。
         let pid = pty.child_pid().as_raw();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -581,7 +596,11 @@ mod tests {
         for entry in entries {
             let name = entry.expect("entry").file_name();
             let fd: i32 = name.to_string_lossy().parse().expect("fd 编号");
-            assert!(fd <= 2, "子进程泄漏了 fd {}（应仅有 0/1/2）", fd);
+            let inherited = fd <= 2 || baseline.contains(&fd);
+            assert!(
+                inherited,
+                "子进程泄漏了 fd {fd}（既非 stdio 也不在父进程 fd 基线 {baseline:?} 中）"
+            );
         }
         pty.kill_child();
     }

@@ -5,13 +5,6 @@ All notable changes to TermBridge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.2] - 2026-09-07
-
-### Fixed
-
-- npm OIDC 发布失败（v0.3.1 实测 E422）：平台包/主包 package.json 补 `repository.url`（provenance 校验硬性要求）；Windows 平台包 bin 值不允许 `.exe` 后缀（npm 会直接删除条目），改为生成无扩展名 Node shim 转发到同目录 `.exe`
-- SKILL.md 新增「Architecture At A Glance」章节：agentd（远端 daemon）的存在、分发方式与 `restart_remote_daemon` 用途前置到文件开头，避免新会话/无记忆 agent 不知道 agentd 而无法部署持久会话（用户 dogfooding 反馈）
-
 ## [0.3.1] - 2026-09-07
 
 全量 code review（`docs/code-review-2026-08-30.md`）修复批次 + 真实 Linux 环境实测验证。
@@ -42,8 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - agentd 升级路径：版本比对触发重部署 + 原子部署（tmp+chmod+mv）+ 部署后同流程自动重启远端 daemon；新增 MCP 工具 `restart_remote_daemon`
 - 凭据弹窗（CredUI）用户名可编辑且真正生效（此前回读被丢弃），按主机记忆用户名（最新优先），ssh config User 可为空
 - GUI 修复 React StrictMode 双挂载读循环瓜分 PTY 输出
-- `RUNTIME_MISSING` 错误信息改为 agent 可自助排查的完整指引（agentd 是什么/为何缺失/三条修复路径）
-- CI 补 agentd 测试步骤（46 个 Linux-only 测试此前从未在 CI 运行）
+- `RUNTIME_MISSING` 错误信息改为 agent 可自助排查的完整指引（agentd 是什么/为何缺失/三条修复路径）；SKILL.md 新增「Architecture At A Glance」章节（agentd 知识前置，用户 dogfooding 反馈）
+- CI 补 agentd 测试步骤（46 个 Linux-only 测试此前从未在 CI 运行）；agentd fd 泄漏测试改「不新增泄漏」语义（CI runner 环境继承 fd 不算泄漏）
+- npm 平台包/主包 package.json 补 `repository.url`（OIDC provenance 校验硬性要求）；Windows 平台包 bin 值不允许 `.exe` 后缀（npm 静默删除条目），改为无扩展名 Node shim 转发
 
 ### Known Issues
 
