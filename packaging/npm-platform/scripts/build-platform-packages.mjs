@@ -111,9 +111,10 @@ for (const { key, staging } of args.platforms) {
     description: `TermBridge runtime for ${key} (完整 release 目录，含 trio 二进制 / resources/agentd / SKILL.md)`,
     license: 'Apache-2.0',
     // OIDC trusted publishing 的 provenance 校验硬性要求 repository.url
-    // 与 GitHub 仓库完全一致（v0.3.1 实测 E422：expected to match
-    // "https://github.com/summerxzp/TermBridge" from provenance）
-    repository: { type: 'git', url: 'https://github.com/summerxzp/TermBridge' },
+    // 与 GitHub 仓库一致；且必须用 git+https://...git 完整格式——纯 https
+    // 会被 npm 当 shorthand 解析成相对路径（v0.3.1 第三次实测：
+    // git ls-remote ssh://git@github.com/packaging/npm-platform.git）
+    repository: { type: 'git', url: 'git+https://github.com/summerxzp/TermBridge.git' },
     os: meta.os,
     cpu: meta.cpu,
     bin: binEntries,
