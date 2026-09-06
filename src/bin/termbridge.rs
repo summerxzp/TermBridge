@@ -581,14 +581,55 @@ async fn control_ipc_call(
 
 /// 连接到 endpoint，返回分离的 reader/writer（平台抽象）。
 ///
-/// - Linux/macOS：endpoint 以 `/` 开头时走 Unix socket，否则按 TCP 处理
-/// - Windows：恒走 TCP loopback（endpoint 形如 "tcp://127.0.0.1:<port>"）
+/// - Linux/macOS：endpoint 以 `/` 开头时走 Unix socket
+/// - Windows：endpoint 形如 `\\.\pipe\...`，走 Named Pipe 客户端（ADR-0018
+///   修订后 Windows 传输层为带 DACL 的 Named Pipe）
 async fn connect_endpoint_split(
     endpoint: &str,
 ) -> Result<(
     Box<dyn tokio::io::AsyncRead + Unpin + Send>,
     Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
 )> {
+    // Windows：Named Pipe 客户端
+    #[cfg(target_os = "windows")]
+    {
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        // ERROR_PIPE_BUSY：所有 pipe 实例都被占用（server accept loop 正在
+        // 补建下一实例）。标准做法：短暂等待后重试，有界防止死循环。
+        const PIPE_BUSY_RETRY_MS: u64 = 50;
+        const PIPE_BUSY_MAX_WAIT_MS: u64 = 2000;
+
+        let mut waited = 0u64;
+        loop {
+            match ClientOptions::new().open(endpoint) {
+                Ok(stream) => {
+                    let (r, w) = tokio::io::split(stream);
+                    return Ok((Box::new(r), Box::new(w)));
+                }
+                Err(e) if e.raw_os_error() == Some(231) => {
+                    // ERROR_PIPE_BUSY
+                    if waited >= PIPE_BUSY_MAX_WAIT_MS {
+                        anyhow::bail!(
+                            "connect to pipe {} failed: busy after {}ms: {}",
+                            endpoint,
+                            waited,
+                            e
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(PIPE_BUSY_RETRY_MS))
+                        .await;
+                    waited += PIPE_BUSY_RETRY_MS;
+                }
+                Err(e) => {
+                    anyhow::bail!("connect to {} failed: {}", endpoint, e);
+                }
+            }
+        }
+    }
+
+    // Unix：Unix socket（各 cfg 块为函数尾表达式：Windows 上 loop 永不退出，
+    // Unix/其他平台以 Ok(...) 收尾，保证所有平台类型正确）
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         if endpoint.starts_with('/') {
@@ -596,17 +637,28 @@ async fn connect_endpoint_split(
                 .await
                 .map_err(|e| anyhow::anyhow!("connect Unix socket {} failed: {}", endpoint, e))?;
             let (r, w) = tokio::io::split(stream);
-            return Ok((Box::new(r), Box::new(w)));
+            Ok((Box::new(r), Box::new(w)))
+        } else {
+            // 兼容旧 instance 文件记录的 tcp:// 端点（ADR-0018 修订前的残留）
+            let addr = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
+            let stream = tokio::net::TcpStream::connect(addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("connect to {} failed: {}", endpoint, e))?;
+            let (r, w) = tokio::io::split(stream);
+            Ok((Box::new(r), Box::new(w)))
         }
     }
 
-    // TCP loopback
-    let addr = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
-    let stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect to {} failed: {}", endpoint, e))?;
-    let (r, w) = tokio::io::split(stream);
-    Ok((Box::new(r), Box::new(w)))
+    // 其他平台（无 Named Pipe 也无 Unix socket 支持）
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        let addr = endpoint.strip_prefix("tcp://").unwrap_or(endpoint);
+        let stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("connect to {} failed: {}", endpoint, e))?;
+        let (r, w) = tokio::io::split(stream);
+        Ok((Box::new(r), Box::new(w)))
+    }
 }
 
 /// termbridge mcp list —— 列出运行中的 MCP server instance

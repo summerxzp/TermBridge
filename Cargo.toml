@@ -89,5 +89,19 @@ ureq = "2"
 # 直接复用同一版本，不引入新的 major）
 rand = "0.10"
 
+# ADR-0018 修订（2026-09）：Windows Control IPC 从 TCP loopback 切换 Named Pipe。
+# tokio 的 ServerOptions 不暴露 SECURITY_ATTRIBUTES，需直接调用 CreateNamedPipeW
+# 构建限制当前用户 SID 的 DACL。版本复用依赖树已有的 0.61（Cargo.lock），
+# 避免多版本 windows-sys 共存。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

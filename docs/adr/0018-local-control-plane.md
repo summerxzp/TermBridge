@@ -87,6 +87,7 @@ Agent Data Plane            Human Control Plane
 3. **MCP server exposes a local-only control IPC**。MCP server 启动时同时监听本地 IPC（Unix socket / Named Pipe），作为 Human Control Plane。
 4. **CLI and GUI use the control IPC**。CLI（`termbridge session approve`）和未来 GUI 通过 Control IPC 操作 MCP server 内的 session，而不是各自维护独立 SessionManager。
 5. **Control IPC uses Unix socket / Named Pipe**。Linux/macOS 用 Unix Domain Socket（`0600`）；Windows 第一版用 TCP loopback（`127.0.0.1:随机端口`），未来切 Named Pipe。
+   > **修订（2026-09，v0.3.x）**：Windows 传输已按计划从 TCP loopback 切换为 Named Pipe（`\\.\pipe\termbridge-mcp-<pid>-<rand>`），带 DACL（SDDL `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<当前用户SID>)`，protected DACL，无 Everyone/AN ACE）+ `FILE_FLAG_FIRST_PIPE_INSTANCE` 防抢占。完成 §2.6 "Named Pipe 限制当前用户 SID" 的既定目标，关闭 TCP loopback 任意本地用户可连接的跨用户暴露面；威胁模型不变——仍不防御 root 级攻击者，但现亦抵御同机其他用户的 loopback 连接。详见 Alternative H 修订注。
 6. **Session approval is ephemeral and session-scoped**。`approval_mode` 绑定 Session，不持久化，Session 关闭即重置。
 7. **Approval state is never persisted into host policy**。`hosts.toml` 仍只有 `auth` / `session`（ADR-0017），不包含 `approval_mode`。
 
@@ -403,6 +404,8 @@ approve / reject
 ### H. Windows 第一版就上 Named Pipe
 
 **否决（第一版）**：Named Pipe 的 ACL / SID 配置在 Rust 生态中实现复杂度高于 TCP loopback。第一版用 TCP loopback（127.0.0.1:随机端口）快速落地，未来再切 Named Pipe。功能行为一致，仅传输层差异。
+
+> **修订（2026-09，v0.3.x）**：本 ADR §2.2 决策 5 预留的"未来切 Named Pipe"已落地。Windows 传输层现为 `CreateNamedPipeW` + 显式 DACL（当前用户 SID / SYSTEM / Administrators，protected DACL，无 Everyone），`FILE_FLAG_FIRST_PIPE_INSTANCE` 防同名 pipe 抢占；HELLO token 认证与限速逻辑不变。原"否决"仅适用于第一版时间盒，其安全理由（TCP loopback 任意本地用户可连）正是本次切换消除的风险。
 
 ## 6. Relationships
 

@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SFTP 下载本地临时文件改 pid+毫秒命名（原固定 `.termbridge.tmp` 并发下载同一目标互覆）
 - 输出链路：`extract_context` 返回匹配文本；`strip_ansi` 修复 CSI 中间字节剥离与跨页状态；RingBuffer 改 watch 唤醒，避免读取空转
 - `sftp_chmod` 拒绝 mode=0（防止把文件权限清零）；SFTP 上传改原子写（temp + fsync + rename）；`sftp_transfer_dir` 下载校验目标目录名
+- `sftp_transfer_dir` 返回新增 `skipped` 列表：symlink / 非常规文件 / 本地不安全文件名逐项带原因上报（此前仅日志），Agent 可感知静默跳过
 - Timeline 缓冲改用 `VecDeque`，避免大 session 下的频繁内存搬移
 - Unix 缓存路径统一走 `dirs` crate（遵循 XDG）；CLI 读消息增加长度边界校验；日志脱敏补全（Secret Debug redaction + URL userinfo redact）
 
@@ -54,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 **策略 / 控制面安全**
 - 封堵 authorized_keys / authorized_keys2 经 SFTP create 的绕过；敏感路径词法归一化（`..` / 重复分隔符）；hosts.toml 解析失败 fail-closed；bootstrap 公钥部署注入安全 + 非 UTF-8 home 兼容
 - 控制面加固：IPC token 改用 CSPRNG、discovery 文件 0600、HELLO 限流、endpoint 唯一化
+- Windows 控制面传输从 TCP loopback 切换为 **Named Pipe**（兑现 ADR-0018「未来再切 Named Pipe」）：protected DACL `D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<当前用户 SID>)` 拒绝跨用户连接；`FILE_FLAG_FIRST_PIPE_INSTANCE` 防管道名抢注；客户端 `ERROR_PIPE_BUSY` 有界重试；instance 发现文件 transport/endpoint 如实标记
 
 **GUI / npm 分发**
 - 修复 React StrictMode 双挂载产生两条 PTY read loop（字节流被拆分、一半丢失）：后端重建前先 abort 同 session 旧任务 + 循环结束自清理（防 map 泄漏），前端 `startReadLoop` 补 disposed 检查
