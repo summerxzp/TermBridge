@@ -5,14 +5,35 @@ All notable changes to TermBridge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-09-11
+
+0.3.2 的重发行：内容与 0.3.2 完全一致（ADR-0019 + 发版修复），仅版本号顺延。
+
+> 0.3.2 在 npm 上为残缺状态（mcp/linux/darwin 三包已上，win32-x64 缺失）：
+> win32-x64@0.3.2 曾在 v0.3.1 发版事故中发布过，unpublish 后按 npm 政策
+> 「package@version 一旦用过永不能复用」无法重发，导致主包 0.3.2 的
+> Windows 用户 npx 安装时平台二进制被 optional 静默跳过。latest 已被
+> 0.3.3 覆盖，`npx @summerxzp/termbridge-mcp@latest` 不受影响；请勿
+> 显式安装 @0.3.2。
+
+### Added
+
+- **Linux/macOS 凭据输入多级 fallback（ADR-0019）**：`bootstrap_host` / `auth=password` 的密码输入从「仅 `/dev/tty`」升级为 `TERMBRIDGE_ASKPASS`（显式配置，askpass 兼容）→ GUI 对话框（zenity / kdialog / yad / osascript，PATH 软依赖，不打包）→ TTY 兜底。GUI 客户端（VSCode / Trae / Cursor 等）首次连接现在能真实弹出密码框；设计原则是「优先选择不干扰宿主 Agent 终端的输入通道」，TTY 排最后（宿主 TUI 占用终端的风险见 ADR-0019 §2.6）
+- **凭据输入超时**：默认 5 分钟（`TERMBRIDGE_PROMPT_TIMEOUT` 秒可配，0 = 禁用），TermBridge 父进程侧执行（SIGTERM → 2s 宽限 → SIGKILL），`bootstrap_host` 不再可能永久挂起。helper 侧安装 SIGTERM 守卫：超时被杀时恢复 termios（防终端停在无回显模式）+ 清理子对话框进程（防孤儿窗口）
+- `bootstrap_host` 新增 `timed_out` 返回状态（正常终态非错误，含超时秒数）；Agent 应提示用户在场时重试
+
+### Fixed
+
+- **凭据错误语义折叠（协议 v2）**：helper 响应区分 `cancelled`（用户取消）/ `unsupported`（环境无输入通道，含尝试轨迹与三条出路）/ `failed`（显式配置的 askpass 程序损坏）。此前 Linux/macOS 所有平台错误统一折叠成 `cancelled`，GUI 客户端用户会被告知「你取消了」而实际从未见过输入框
+- **级联信号防误判**：GUI provider 仅在「对话框从未展示」（ENOENT / stderr 环境失败特征 / <2s 快速退出）时级联到下一 provider；对话框展示后的任何非零退出（含用户取消、yad Esc 关窗码 252、osascript "User canceled" stderr）视为取消——用户点一次取消不会连弹三个框
+- Windows CredUI 失败码不再全部折叠为取消：`ERROR_CANCELLED` = 用户取消，其余（无交互桌面会话等）= unsupported 带指引
+- CI：npm publish「版本已存在」兜底 grep 与实际错误消息不匹配（大小写/单复数），残留版本撞车时 job 直接失败而非跳过——模式改 `grep -iE "cannot publish over (the )?previously published versions?|EPUBLISHCONFLICT"`；发版规范补「npm 版本号不可复用」预检条款（§2.2.1）
+- CI：macOS flaky——`update_check` 两个测试共享同一 pid 命名的缓存路径，并发执行时互相污染，改为每测试独立目录（0.3.0 引入的既有问题）
+
 ## [0.3.2] - 2026-09-11
 
-ADR-0019：Linux/macOS 凭据输入多级 fallback + 协议 v2 + 超时。10 场景 E2E 实测（含真实 zenity 弹框 + 完整 MCP 链路）全绿。
-
-### Fixed（发版过程修复）
-
-- npm publish「版本已存在」兜底 grep 与实际错误消息不匹配（大小写/单复数），win32-x64 历史残留 0.3.2 撞车时 job 直接失败而非跳过，导致其余三包未发布——模式改 `grep -iE "cannot publish over (the )?previously published versions?|EPUBLISHCONFLICT"`
-- macOS CI flaky：`update_check` 两个测试共享同一 pid 命名的缓存路径，并发执行时互相污染——改为每测试独立目录（0.3.0 引入的既有问题，本次 macOS runner 首次触发）
+> 残缺版本（见 0.3.3 段落说明）：ADR-0019 首发载体，GitHub Release 六资产完整，
+> npm 仅三包。内容与 0.3.3 完全一致。
 
 ### Added
 

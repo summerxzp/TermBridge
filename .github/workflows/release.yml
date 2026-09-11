@@ -246,7 +246,13 @@ jobs:
           done
           ( cd packaging/npm-platform && npm pack --dry-run )
 
-      - name: Publish to npm (OIDC trusted publishing)
+      # ── 两阶段发布（v0.3.3 起强制）────────────────────────────────
+      # 阶段 1：发布全部平台包 → 阶段 2：registry 矩阵验证全部落库后才发布主包。
+      # v0.3.2 事故根因：主包与平台包同批无序发布，win32 撞历史残留版本失败后
+      # 主包照发——Windows 用户 npx 装主包时平台二进制被 optional 静默跳过，
+      # 启动失败。主包后发 = 主包 0.3.x 落库时其 optionalDependencies 引用的
+      # 三个平台包版本必然已存在。
+      - name: Publish platform packages (stage 1 of 2)
         shell: bash
         run: |
           set -euo pipefail
@@ -256,8 +262,9 @@ jobs:
           #
           # 版本已存在 → 跳过该包继续（v0.3.1 实测教训：新包名首发必须手动
           # publish 一次才能配 trusted publisher，手动版与 CI 版同版本号冲突；
-          # unpublish 最后一个版本会触发 24h 禁止重发，比跳过更糟。手动版与
-          # CI 产物同源同内容，仅缺 provenance，功能无差异）。
+          # 手动版与 CI 产物同源同内容，仅缺 provenance，功能无差异）。
+          # 注意：跳过的包在阶段 2 的 registry 验证中必须真实存在，否则主包
+          # 不会发布——「跳过」只豁免重复发布错误，不豁免缺包。
           publish_one() {
             local pkg_dir="$1"
             # 输出落文件（tee 的退出码恒 0，管道会吞掉 npm 的失败状态）。
@@ -286,4 +293,48 @@ jobs:
                    packaging/npm-platform/generated/termbridge-darwin-arm64; do
             publish_one "$p"
           done
+
+      - name: Verify platform packages on registry (gate before main package)
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "── 发布矩阵检查：主包 @summerxzp/termbridge-mcp@$VERSION 的"
+          echo "── optionalDependencies 引用的平台包必须全部在 registry 落库"
+          # corgi 元数据端点（绕过 CDN 缓存；普通 GET 有传播延迟，
+          # 刚发布的版本可能查不到导致误判）
+          MISSING=0
+          for pkg in termbridge-win32-x64 termbridge-linux-x64 termbridge-darwin-arm64; do
+            if curl -sf -H "Accept: application/vnd.npm.install-v1+json" \
+                 "https://registry.npmjs.org/@summerxzp%2f$pkg" \
+                 | python3 -c "import json,sys; sys.exit(0 if '$VERSION' in json.load(sys.stdin).get('versions',{}) else 1)"; then
+              echo "  ✓ @summerxzp/$pkg@$VERSION"
+            else
+              echo "  ✗ @summerxzp/$pkg@$VERSION 不在 registry"
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" -ne 0 ]; then
+            echo "::error::平台包矩阵不完整（见上 ✗），主包禁止发布——否则 Windows/Linux/macOS 用户的 optionalDependencies 会静默缺失"
+            exit 1
+          fi
+          echo "── 矩阵完整，允许发布主包"
+
+      - name: Publish main package (stage 2 of 2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          publish_one() {
+            local pkg_dir="$1"
+            if ! ( cd "$pkg_dir" && npm publish --access public ) > /tmp/npm-publish.log 2>&1; then
+              if grep -qiE "cannot publish over (the )?previously published versions?|EPUBLISHCONFLICT" /tmp/npm-publish.log; then
+                echo "::warning::$pkg_dir 该版本已存在（历史残留/手动首发），跳过"
+                cat /tmp/npm-publish.log
+                return 0
+              fi
+              cat /tmp/npm-publish.log
+              return 1
+            fi
+            cat /tmp/npm-publish.log
+          }
           publish_one packaging/npm-platform
