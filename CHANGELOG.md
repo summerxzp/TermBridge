@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ADR-0019：Linux/macOS 凭据输入多级 fallback + 协议 v2 + 超时。10 场景 E2E 实测（含真实 zenity 弹框 + 完整 MCP 链路）全绿。
 
+### Fixed（发版过程修复）
+
+- npm publish「版本已存在」兜底 grep 与实际错误消息不匹配（大小写/单复数），win32-x64 历史残留 0.3.2 撞车时 job 直接失败而非跳过，导致其余三包未发布——模式改 `grep -iE "cannot publish over (the )?previously published versions?|EPUBLISHCONFLICT"`
+- macOS CI flaky：`update_check` 两个测试共享同一 pid 命名的缓存路径，并发执行时互相污染——改为每测试独立目录（0.3.0 引入的既有问题，本次 macOS runner 首次触发）
+
 ### Added
 
 - **Linux/macOS 凭据输入多级 fallback（ADR-0019）**：`bootstrap_host` / `auth=password` 的密码输入从「仅 `/dev/tty`」升级为 `TERMBRIDGE_ASKPASS`（显式配置，askpass 兼容）→ GUI 对话框（zenity / kdialog / yad / osascript，PATH 软依赖，不打包）→ TTY 兜底。GUI 客户端（VSCode / Trae / Cursor 等）首次连接现在能真实弹出密码框；设计原则是「优先选择不干扰宿主 Agent 终端的输入通道」，TTY 排最后（宿主 TUI 占用终端的风险见 ADR-0019 §2.6）
