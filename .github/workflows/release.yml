@@ -301,24 +301,42 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           echo "── 发布矩阵检查：主包 @summerxzp/termbridge-mcp@$VERSION 的"
           echo "── optionalDependencies 引用的平台包必须全部在 registry 落库"
-          # corgi 元数据端点（绕过 CDN 缓存；普通 GET 有传播延迟，
-          # 刚发布的版本可能查不到导致误判）
-          MISSING=0
+          # corgi 元数据端点（application/vnd.npm.install-v1+json）绕过 CDN
+          # 缓存。但 registry 写后读有传播延迟：v0.3.3 首跑实测发布后 ~15s
+          # 查询仍不可见（三个包实际都发布成功，门禁误判拦截）。因此轮询：
+          # 每 15s 查一次，最多 20 次（5 分钟）——传播窗口内等待而非误判。
+          check_pkg() {
+            local pkg="$1"
+            curl -sf -H "Accept: application/vnd.npm.install-v1+json" \
+              "https://registry.npmjs.org/@summerxzp%2f$pkg" \
+              | python3 -c "import json,sys; sys.exit(0 if '$VERSION' in json.load(sys.stdin).get('versions',{}) else 1)"
+          }
+          for attempt in $(seq 1 20); do
+            MISSING=0
+            RESULT=""
+            for pkg in termbridge-win32-x64 termbridge-linux-x64 termbridge-darwin-arm64; do
+              if check_pkg "$pkg"; then
+                RESULT="${RESULT}  ✓ @summerxzp/$pkg@$VERSION (attempt $attempt)\n"
+              else
+                MISSING=1
+              fi
+            done
+            if [ "$MISSING" -eq 0 ]; then
+              echo -e "$RESULT"
+              echo "── 矩阵完整，允许发布主包"
+              exit 0
+            fi
+            echo "attempt $attempt/20：部分平台包尚未在 registry 可见（传播延迟），15s 后重查"
+            sleep 15
+          done
+          # 5 分钟后仍缺失：逐包报告后失败
           for pkg in termbridge-win32-x64 termbridge-linux-x64 termbridge-darwin-arm64; do
-            if curl -sf -H "Accept: application/vnd.npm.install-v1+json" \
-                 "https://registry.npmjs.org/@summerxzp%2f$pkg" \
-                 | python3 -c "import json,sys; sys.exit(0 if '$VERSION' in json.load(sys.stdin).get('versions',{}) else 1)"; then
-              echo "  ✓ @summerxzp/$pkg@$VERSION"
-            else
+            if ! check_pkg "$pkg"; then
               echo "  ✗ @summerxzp/$pkg@$VERSION 不在 registry"
-              MISSING=1
             fi
           done
-          if [ "$MISSING" -ne 0 ]; then
-            echo "::error::平台包矩阵不完整（见上 ✗），主包禁止发布——否则 Windows/Linux/macOS 用户的 optionalDependencies 会静默缺失"
-            exit 1
-          fi
-          echo "── 矩阵完整，允许发布主包"
+          echo "::error::平台包矩阵不完整（见上 ✗，已轮询 5 分钟），主包禁止发布——否则 Windows/Linux/macOS 用户的 optionalDependencies 会静默缺失"
+          exit 1
 
       - name: Publish main package (stage 2 of 2)
         shell: bash
