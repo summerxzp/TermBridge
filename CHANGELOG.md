@@ -5,6 +5,20 @@ All notable changes to TermBridge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Linux/macOS 凭据输入多级 fallback（ADR-0019）**：`bootstrap_host` / `auth=password` 的密码输入从「仅 `/dev/tty`」升级为 `TERMBRIDGE_ASKPASS`（显式配置，askpass 兼容）→ GUI 对话框（zenity / kdialog / yad / osascript，PATH 软依赖，不打包）→ TTY 兜底。GUI 客户端（VSCode / Trae / Cursor 等）首次连接现在能真实弹出密码框；设计原则是「优先选择不干扰宿主 Agent 终端的输入通道」，TTY 排最后（宿主 TUI 占用终端的风险见 ADR-0019 §2.6）
+- **凭据输入超时**：默认 5 分钟（`TERMBRIDGE_PROMPT_TIMEOUT` 秒可配，0 = 禁用），TermBridge 父进程侧执行（SIGTERM → 2s 宽限 → SIGKILL），`bootstrap_host` 不再可能永久挂起。helper 侧安装 SIGTERM 守卫：超时被杀时恢复 termios（防终端停在无回显模式）+ 清理子对话框进程（防孤儿窗口）
+- `bootstrap_host` 新增 `timed_out` 返回状态（正常终态非错误，含超时秒数）；Agent 应提示用户在场时重试
+
+### Fixed
+
+- **凭据错误语义折叠（协议 v2）**：helper 响应区分 `cancelled`（用户取消）/ `unsupported`（环境无输入通道，含尝试轨迹与三条出路）/ `failed`（显式配置的 askpass 程序损坏）。此前 Linux/macOS 所有平台错误统一折叠成 `cancelled`，GUI 客户端用户会被告知「你取消了」而实际从未见过输入框
+- **级联信号防误判**：GUI provider 仅在「对话框从未展示」（ENOENT / stderr 环境失败特征 / <2s 快速退出）时级联到下一 provider；对话框展示后的任何非零退出（含用户取消、yad Esc 关窗码 252、osascript "User canceled" stderr）视为取消——用户点一次取消不会连弹三个框
+- Windows CredUI 失败码不再全部折叠为取消：`ERROR_CANCELLED` = 用户取消，其余（无交互桌面会话等）= unsupported 带指引
+
 ## [0.3.1] - 2026-09-07
 
 全量 code review（`docs/code-review-2026-08-30.md`）修复批次 + 真实 Linux 环境实测验证。

@@ -29,10 +29,9 @@
 use std::sync::Arc;
 
 use rmcp::{
-    ServerHandler, ServiceExt,
     handler::server::wrapper::Parameters,
     model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo},
-    schemars, tool, tool_handler, tool_router,
+    schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -85,7 +84,10 @@ fn parse_octal_mode(mode: Option<&str>) -> Result<u32, String> {
         None | Some("") => return Ok(0),
         Some(s) => s.trim(),
     };
-    let stripped = raw.strip_prefix("0o").or_else(|| raw.strip_prefix("0O")).unwrap_or(raw);
+    let stripped = raw
+        .strip_prefix("0o")
+        .or_else(|| raw.strip_prefix("0O"))
+        .unwrap_or(raw);
     u32::from_str_radix(stripped, 8)
         .map_err(|_| format!("invalid octal mode '{raw}'; expected e.g. '755' or '0o755'"))
 }
@@ -459,7 +461,11 @@ impl TermBridgeServer {
         session_manager: Arc<SessionManager>,
         bootstrap_host: Arc<BootstrapHost>,
     ) -> Self {
-        Self { host_manager, session_manager, bootstrap_host }
+        Self {
+            host_manager,
+            session_manager,
+            bootstrap_host,
+        }
     }
 
     /// 启动 stdio MCP server（阻塞直到连接关闭）。
@@ -478,7 +484,9 @@ impl TermBridgeServer {
 #[tool_router]
 impl TermBridgeServer {
     /// List all SSH hosts discovered from ~/.ssh/config.
-    #[tool(description = "List all SSH hosts from ~/.ssh/config. Returns host aliases and their configured hostnames.")]
+    #[tool(
+        description = "List all SSH hosts from ~/.ssh/config. Returns host aliases and their configured hostnames."
+    )]
     fn list_hosts(&self) -> CallToolResult {
         let entries = self.host_manager.list_hosts();
         let hosts: Vec<HostEntryDto> = entries
@@ -492,7 +500,9 @@ impl TermBridgeServer {
     }
 
     /// Open a new terminal session to an SSH host.
-    #[tool(description = "Open a new terminal session to an SSH host. Resolves host alias via `ssh -G`, connects via SSH, opens PTY + shell. Set persistent=true to use remote daemon for cross-restart session persistence (deploys termbridge-agentd if needed). Returns session_id for subsequent operations.")]
+    #[tool(
+        description = "Open a new terminal session to an SSH host. Resolves host alias via `ssh -G`, connects via SSH, opens PTY + shell. Set persistent=true to use remote daemon for cross-restart session persistence (deploys termbridge-agentd if needed). Returns session_id for subsequent operations."
+    )]
     async fn open_session(
         &self,
         Parameters(params): Parameters<OpenSessionParams>,
@@ -514,19 +524,24 @@ impl TermBridgeServer {
     }
 
     /// Send input text to a terminal session.
-    #[tool(description = "Send input text to a terminal session. Appends to PTY stdin immediately without waiting for command completion. Use \\n for Enter.")]
-    async fn send_input(
-        &self,
-        Parameters(params): Parameters<SendInputParams>,
-    ) -> CallToolResult {
-        match self.session_manager.send_input(&params.session_id, params.data.as_bytes()).await {
+    #[tool(
+        description = "Send input text to a terminal session. Appends to PTY stdin immediately without waiting for command completion. Use \\n for Enter."
+    )]
+    async fn send_input(&self, Parameters(params): Parameters<SendInputParams>) -> CallToolResult {
+        match self
+            .session_manager
+            .send_input(&params.session_id, params.data.as_bytes())
+            .await
+        {
             Ok(()) => ok_result(OkResult { ok: true }),
             Err(e) => err_result(&e),
         }
     }
 
     /// Read output from a terminal session.
-    #[tool(description = "Read output from a terminal session. Supports 4 modes: (1) default settle - drain output until stable; (2) wait_for - block until regex/substring appears; (3) tail_lines - peek last N lines; (4) since_cursor - incremental read from cursor. Only one mode active per call. Set strip_ansi=true to strip terminal control sequences (CSI/OSC/DCS) from returned output; stripping is stateful across contiguous since_cursor pages (escape sequences split at page boundaries are reassembled, non-contiguous reads fall back to best-effort).")]
+    #[tool(
+        description = "Read output from a terminal session. Supports 4 modes: (1) default settle - drain output until stable; (2) wait_for - block until regex/substring appears; (3) tail_lines - peek last N lines; (4) since_cursor - incremental read from cursor. Only one mode active per call. Set strip_ansi=true to strip terminal control sequences (CSI/OSC/DCS) from returned output; stripping is stateful across contiguous since_cursor pages (escape sequences split at page boundaries are reassembled, non-contiguous reads fall back to best-effort)."
+    )]
     async fn read_output(
         &self,
         Parameters(params): Parameters<ReadOutputParamsSchema>,
@@ -540,7 +555,11 @@ impl TermBridgeServer {
             context_lines: params.context_lines,
             strip_ansi: params.strip_ansi,
         };
-        match self.session_manager.read_output(&params.session_id, domain_params).await {
+        match self
+            .session_manager
+            .read_output(&params.session_id, domain_params)
+            .await
+        {
             Ok(r) => {
                 let mode = match r.mode {
                     crate::domain::output::ReadMode::SinceCursor => "since_cursor",
@@ -572,7 +591,9 @@ impl TermBridgeServer {
     }
 
     /// Send a control character to a terminal session.
-    #[tool(description = "Send a control character to a terminal session. Supported: ctrl+c, ctrl+d, ctrl+z, tab, enter, escape.")]
+    #[tool(
+        description = "Send a control character to a terminal session. Supported: ctrl+c, ctrl+d, ctrl+z, tab, enter, escape."
+    )]
     async fn send_control(
         &self,
         Parameters(params): Parameters<SendControlParams>,
@@ -590,18 +611,21 @@ impl TermBridgeServer {
                 }));
             }
         };
-        match self.session_manager.send_control(&params.session_id, key).await {
+        match self
+            .session_manager
+            .send_control(&params.session_id, key)
+            .await
+        {
             Ok(()) => ok_result(OkResult { ok: true }),
             Err(e) => err_result(&e),
         }
     }
 
     /// Resize a terminal session's PTY dimensions.
-    #[tool(description = "Resize a terminal session's PTY dimensions (cols x rows). Sends a window-change request to the remote PTY. Useful when the terminal UI layout changes.")]
-    async fn resize(
-        &self,
-        Parameters(params): Parameters<ResizeParams>,
-    ) -> CallToolResult {
+    #[tool(
+        description = "Resize a terminal session's PTY dimensions (cols x rows). Sends a window-change request to the remote PTY. Useful when the terminal UI layout changes."
+    )]
+    async fn resize(&self, Parameters(params): Parameters<ResizeParams>) -> CallToolResult {
         match self
             .session_manager
             .resize(&params.session_id, params.cols, params.rows)
@@ -613,7 +637,9 @@ impl TermBridgeServer {
     }
 
     /// Close a terminal session.
-    #[tool(description = "Close a terminal session. Sends EOF + disconnect to SSH channel. Session resources are released. Idempotent.")]
+    #[tool(
+        description = "Close a terminal session. Sends EOF + disconnect to SSH channel. Session resources are released. Idempotent."
+    )]
     async fn close_session(
         &self,
         Parameters(params): Parameters<CloseSessionParams>,
@@ -625,7 +651,9 @@ impl TermBridgeServer {
     }
 
     /// Transfer files via SFTP (Phase 1, upload/download only).
-    #[tool(description = "Transfer files via SFTP. Supports upload (local->remote) and download (remote->local). Path policy enforced: local paths must be under allowedLocalPaths (default: cwd + OS temp/termbridge, extendable via TERMBRIDGE_ALLOWED_LOCAL_PATHS); remote paths resolved via realpath to prevent ../ traversal and symlink escape, then checked against the effective remote scope: per-host `allowed_remote_paths` in hosts.toml, else TERMBRIDGE_ALLOWED_REMOTE_PATHS, else unrestricted (SSH account scope). Operations are guardrailed: SFTP write/create/delete/chmod of ~/.ssh/authorized_keys and /proc, /sys is hard-denied (authorized_keys deployment goes through bootstrap_host only). Both directions are atomic: the target is only replaced (rename) after the full content has been transferred and verified; a failed transfer never truncates the existing target.")]
+    #[tool(
+        description = "Transfer files via SFTP. Supports upload (local->remote) and download (remote->local). Path policy enforced: local paths must be under allowedLocalPaths (default: cwd + OS temp/termbridge, extendable via TERMBRIDGE_ALLOWED_LOCAL_PATHS); remote paths resolved via realpath to prevent ../ traversal and symlink escape, then checked against the effective remote scope: per-host `allowed_remote_paths` in hosts.toml, else TERMBRIDGE_ALLOWED_REMOTE_PATHS, else unrestricted (SSH account scope). Operations are guardrailed: SFTP write/create/delete/chmod of ~/.ssh/authorized_keys and /proc, /sys is hard-denied (authorized_keys deployment goes through bootstrap_host only). Both directions are atomic: the target is only replaced (rename) after the full content has been transferred and verified; a failed transfer never truncates the existing target."
+    )]
     async fn sftp_transfer(
         &self,
         Parameters(params): Parameters<SftpTransferParams>,
@@ -664,11 +692,10 @@ impl TermBridgeServer {
     }
 
     /// Create a remote directory via SFTP (Phase 2).
-    #[tool(description = "Create a remote directory via SFTP. Parent directory must exist. Path policy enforced. Mode is octal string like '755'; use '0' or omit for server default.")]
-    async fn sftp_mkdir(
-        &self,
-        Parameters(params): Parameters<SftpMkdirParams>,
-    ) -> CallToolResult {
+    #[tool(
+        description = "Create a remote directory via SFTP. Parent directory must exist. Path policy enforced. Mode is octal string like '755'; use '0' or omit for server default."
+    )]
+    async fn sftp_mkdir(&self, Parameters(params): Parameters<SftpMkdirParams>) -> CallToolResult {
         let mode = match parse_octal_mode(params.mode.as_deref()) {
             Ok(m) => m,
             Err(msg) => {
@@ -693,11 +720,10 @@ impl TermBridgeServer {
     }
 
     /// List remote directory contents via SFTP (Phase 2).
-    #[tool(description = "List remote directory contents via SFTP. Returns entry names, types (file/dir), sizes, and permissions. Path must exist. Path policy enforced.")]
-    async fn sftp_list(
-        &self,
-        Parameters(params): Parameters<SftpListParams>,
-    ) -> CallToolResult {
+    #[tool(
+        description = "List remote directory contents via SFTP. Returns entry names, types (file/dir), sizes, and permissions. Path must exist. Path policy enforced."
+    )]
+    async fn sftp_list(&self, Parameters(params): Parameters<SftpListParams>) -> CallToolResult {
         match self
             .session_manager
             .sftp_list(&params.session_id, params.remote_path.clone())
@@ -724,7 +750,9 @@ impl TermBridgeServer {
     }
 
     /// Delete a remote file or directory via SFTP (Phase 2).
-    #[tool(description = "Delete a remote file or directory via SFTP. Set recursive=true to delete a directory tree. Policy: recursive delete of system directories (/etc, /usr, etc.) is denied; other deletes need confirmation.")]
+    #[tool(
+        description = "Delete a remote file or directory via SFTP. Set recursive=true to delete a directory tree. Policy: recursive delete of system directories (/etc, /usr, etc.) is denied; other deletes need confirmation."
+    )]
     async fn sftp_remove(
         &self,
         Parameters(params): Parameters<SftpRemoveParams>,
@@ -743,31 +771,30 @@ impl TermBridgeServer {
         }
     }
 
-/// Change remote file/directory permissions via SFTP (Phase 2).
-#[tool(description = "Change remote file/directory permissions via SFTP (chmod). Mode is a non-zero octal string like '755' or '644'; mode '0' is rejected (it would execute chmod 0000 and lock the file). Path must exist. Policy: chmod 777 on system directories needs confirmation.")]
-async fn sftp_chmod(
-    &self,
-    Parameters(params): Parameters<SftpChmodParams>,
-) -> CallToolResult {
-    let mode = match parse_octal_mode(Some(&params.mode)) {
-        Ok(m) => m,
-        Err(msg) => {
+    /// Change remote file/directory permissions via SFTP (Phase 2).
+    #[tool(
+        description = "Change remote file/directory permissions via SFTP (chmod). Mode is a non-zero octal string like '755' or '644'; mode '0' is rejected (it would execute chmod 0000 and lock the file). Path must exist. Policy: chmod 777 on system directories needs confirmation."
+    )]
+    async fn sftp_chmod(&self, Parameters(params): Parameters<SftpChmodParams>) -> CallToolResult {
+        let mode = match parse_octal_mode(Some(&params.mode)) {
+            Ok(m) => m,
+            Err(msg) => {
+                return CallToolResult::structured_error(json!(ToolError {
+                    code: "INVALID_ARGUMENT".to_string(),
+                    message: msg,
+                    retriable: false,
+                }));
+            }
+        };
+        // 修复 P1-9：拒绝 mode "0"，防止 Agent 模仿 sftp_mkdir 的 "0 = 服务器默认"
+        // 约定把文件权限设成 0000
+        if let Err(msg) = validate_chmod_mode(mode) {
             return CallToolResult::structured_error(json!(ToolError {
                 code: "INVALID_ARGUMENT".to_string(),
                 message: msg,
                 retriable: false,
             }));
         }
-    };
-    // 修复 P1-9：拒绝 mode "0"，防止 Agent 模仿 sftp_mkdir 的 "0 = 服务器默认"
-    // 约定把文件权限设成 0000
-    if let Err(msg) = validate_chmod_mode(mode) {
-        return CallToolResult::structured_error(json!(ToolError {
-            code: "INVALID_ARGUMENT".to_string(),
-            message: msg,
-            retriable: false,
-        }));
-    }
         match self
             .session_manager
             .sftp_chmod(&params.session_id, params.remote_path.clone(), mode)
@@ -782,7 +809,9 @@ async fn sftp_chmod(
     }
 
     /// List remote daemon sessions (Phase 3-B).
-    #[tool(description = "List all sessions on the remote daemon (including detached ones). Used to discover persistent sessions across MCP restarts. Requires persistent provider.")]
+    #[tool(
+        description = "List all sessions on the remote daemon (including detached ones). Used to discover persistent sessions across MCP restarts. Requires persistent provider."
+    )]
     async fn list_remote_sessions(
         &self,
         Parameters(params): Parameters<ListRemoteSessionsParams>,
@@ -798,18 +827,16 @@ async fn sftp_chmod(
     }
 
     /// Attach to a remote session (Phase 3-B).
-    #[tool(description = "Attach to an existing remote daemon session (for cross-restart reconnection). The remote session must have been created by a previous open_session with persistent=true. Returns a new local session_id.")]
+    #[tool(
+        description = "Attach to an existing remote daemon session (for cross-restart reconnection). The remote session must have been created by a previous open_session with persistent=true. Returns a new local session_id."
+    )]
     async fn attach_remote_session(
         &self,
         Parameters(params): Parameters<AttachRemoteSessionParams>,
     ) -> CallToolResult {
         match self
             .session_manager
-            .attach_remote_session(
-                &params.host,
-                &params.remote_session_id,
-                params.name,
-            )
+            .attach_remote_session(&params.host, &params.remote_session_id, params.name)
             .await
         {
             Ok(session_id) => ok_result(AttachRemoteSessionResult { session_id }),
@@ -818,7 +845,9 @@ async fn sftp_chmod(
     }
 
     /// Detach a session (Phase 3-B).
-    #[tool(description = "Detach a persistent session: keeps the remote PTY alive but releases the local connection. The session can be reconnected later via attach_remote_session. Only persistent sessions support detach.")]
+    #[tool(
+        description = "Detach a persistent session: keeps the remote PTY alive but releases the local connection. The session can be reconnected later via attach_remote_session. Only persistent sessions support detach."
+    )]
     async fn detach_session(
         &self,
         Parameters(params): Parameters<DetachSessionParams>,
@@ -834,7 +863,9 @@ async fn sftp_chmod(
     }
 
     /// Get session execution timeline (Phase 4-A).
-    #[tool(description = "Get session execution timeline: ordered list of command/output/control/state events with timestamps and cursor metadata. Used for debugging (what was sent, what came back) and AI context. Output content stays in RingBuffer; timeline only records byte ranges.")]
+    #[tool(
+        description = "Get session execution timeline: ordered list of command/output/control/state events with timestamps and cursor metadata. Used for debugging (what was sent, what came back) and AI context. Output content stays in RingBuffer; timeline only records byte ranges."
+    )]
     async fn get_session_timeline(
         &self,
         Parameters(params): Parameters<GetSessionTimelineParams>,
@@ -849,7 +880,9 @@ async fn sftp_chmod(
     }
 
     /// Transfer a directory recursively via SFTP (Phase 5-A).
-    #[tool(description = "Transfer a directory recursively between local and remote via SFTP. Supports upload (local->remote) and download (remote->local). Creates target directories automatically. Entries that cannot be transferred are SKIPPED (not an error) and reported in the `skipped` list with a reason each: symlinks (never followed), non-regular entries (special files), and download-side names unsafe for the local filesystem (e.g. containing ':', reserved device names like CON/NUL). Check `skipped` after every call - files_transferred does not include them, and those entries are silently absent from the destination. Returns files_transferred count. Path policy enforced. A transfer error (as opposed to a skip) still aborts the whole operation.")]
+    #[tool(
+        description = "Transfer a directory recursively between local and remote via SFTP. Supports upload (local->remote) and download (remote->local). Creates target directories automatically. Entries that cannot be transferred are SKIPPED (not an error) and reported in the `skipped` list with a reason each: symlinks (never followed), non-regular entries (special files), and download-side names unsafe for the local filesystem (e.g. containing ':', reserved device names like CON/NUL). Check `skipped` after every call - files_transferred does not include them, and those entries are silently absent from the destination. Returns files_transferred count. Path policy enforced. A transfer error (as opposed to a skip) still aborts the whole operation."
+    )]
     async fn sftp_transfer_dir(
         &self,
         Parameters(params): Parameters<SftpTransferDirParams>,
@@ -886,7 +919,10 @@ async fn sftp_chmod(
                 skipped: report
                     .skipped
                     .into_iter()
-                    .map(|s| SkippedEntryDto { name: s.name, reason: s.reason })
+                    .map(|s| SkippedEntryDto {
+                        name: s.name,
+                        reason: s.reason,
+                    })
                     .collect(),
             }),
             Err(e) => err_result(&e),
@@ -894,7 +930,9 @@ async fn sftp_chmod(
     }
 
     /// Detect remote environment (Phase 5-B).
-    #[tool(description = "Detect remote environment: OS (uname -a), default shell ($SHELL), PATH, and installed tools (python, node, rustc, go, docker, git, etc.). Uses SSH exec (not PTY) to avoid polluting session output.")]
+    #[tool(
+        description = "Detect remote environment: OS (uname -a), default shell ($SHELL), PATH, and installed tools (python, node, rustc, go, docker, git, etc.). Uses SSH exec (not PTY) to avoid polluting session output."
+    )]
     async fn detect_remote_env(
         &self,
         Parameters(params): Parameters<DetectRemoteEnvParams>,
@@ -922,7 +960,9 @@ async fn sftp_chmod(
     /// `bootstrapped` 返回 `hint`（非阻塞建议，建议用户手动把 hosts.toml 的
     /// `auth` 改为 `key`）；若用户不修改，后续 `open_session` 仍按 host policy
     /// 执行（`auth=password` → 继续弹密码）。
-    #[tool(description = "Bootstrap SSH key authentication for a host. Deploys public key to remote authorized_keys via one-time password prompt (password never passed via MCP args). Does NOT modify host policy (hosts.toml): if auth=password is configured, open_session keeps prompting; bootstrapped includes a hint to update hosts.toml manually. Returns status: already_configured / bootstrapped / cancelled / authentication_failed / bootstrap_failed.")]
+    #[tool(
+        description = "Bootstrap SSH key authentication for a host. Deploys public key to remote authorized_keys via one-time password prompt (password never passed via MCP args). Does NOT modify host policy (hosts.toml): if auth=password is configured, open_session keeps prompting; bootstrapped includes a hint to update hosts.toml manually. Returns status: already_configured / bootstrapped / cancelled / timed_out / authentication_failed / bootstrap_failed. On timed_out the user did not respond within the prompt window (default 5 min) — ask the user and retry when they are present."
+    )]
     async fn bootstrap_host(
         &self,
         Parameters(params): Parameters<BootstrapHostParams>,
@@ -939,12 +979,18 @@ async fn sftp_chmod(
     /// is not preserved (starts fresh). Only works on Lost sessions; calling
     /// on a Ready/Closing/Closed session returns `not_lost`. If reconnect
     /// fails, the old session is closed and a new `open_session` is required.
-    #[tool(description = "Reconnect a lost session. Re-establishes SSH connection + PTY. Buffer history is not preserved (starts fresh). Attempts to restore previous working directory via cd. Only works on Lost sessions.")]
+    #[tool(
+        description = "Reconnect a lost session. Re-establishes SSH connection + PTY. Buffer history is not preserved (starts fresh). Attempts to restore previous working directory via cd. Only works on Lost sessions."
+    )]
     async fn reconnect_session(
         &self,
         Parameters(params): Parameters<ReconnectSessionParams>,
     ) -> CallToolResult {
-        match self.session_manager.reconnect_session(&params.session_id).await {
+        match self
+            .session_manager
+            .reconnect_session(&params.session_id)
+            .await
+        {
             Ok(result) => ok_result(result),
             Err(e) => err_result(&e),
         }
@@ -958,7 +1004,9 @@ async fn sftp_chmod(
     ///
     /// 破坏性：杀掉 daemon 会使所有经它接入的 session 失效（attached → Lost，
     /// PTY 进程收 SIGHUP），工具描述必须向 Agent 声明。
-    #[tool(description = "Restart the remote termbridge-agentd daemon on a host. Ensures the remote runtime is present (deploys the local agentd binary when missing or version-mismatched), kills the running daemon (SIGTERM with a 5s grace period, then SIGKILL; the pid from the remote pid file is validated via /proc/<pid>/comm before any kill, so a stale or reused pid is never killed), then bootstraps a fresh daemon and verifies the hello/version handshake. WARNING: this kills the remote daemon - sessions currently attached through it will be lost (state becomes 'lost') and their PTY processes get SIGHUP; detached remote sessions are destroyed as well. Use this to apply a freshly deployed agentd upgrade (open_session only replaces the binary on disk; the running daemon keeps serving the old build until restarted). Returns {stopped, was_running, deployed, version_before?, version_after, restarted}. restarted=false means bootstrap found the daemon still alive (it was not killed, e.g. a stale pid file) and the old daemon keeps serving - version_after then reflects the old build.")]
+    #[tool(
+        description = "Restart the remote termbridge-agentd daemon on a host. Ensures the remote runtime is present (deploys the local agentd binary when missing or version-mismatched), kills the running daemon (SIGTERM with a 5s grace period, then SIGKILL; the pid from the remote pid file is validated via /proc/<pid>/comm before any kill, so a stale or reused pid is never killed), then bootstraps a fresh daemon and verifies the hello/version handshake. WARNING: this kills the remote daemon - sessions currently attached through it will be lost (state becomes 'lost') and their PTY processes get SIGHUP; detached remote sessions are destroyed as well. Use this to apply a freshly deployed agentd upgrade (open_session only replaces the binary on disk; the running daemon keeps serving the old build until restarted). Returns {stopped, was_running, deployed, version_before?, version_after, restarted}. restarted=false means bootstrap found the daemon still alive (it was not killed, e.g. a stale pid file) and the old daemon keeps serving - version_after then reflects the old build."
+    )]
     async fn restart_remote_daemon(
         &self,
         Parameters(params): Parameters<RestartRemoteDaemonParams>,

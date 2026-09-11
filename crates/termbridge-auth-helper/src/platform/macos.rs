@@ -1,86 +1,130 @@
-// macOS native 凭据输入：通过 /dev/tty 直接读写终端（与 Linux 同为 POSIX termios），
-// 关闭 ECHO 隐藏输入，Ctrl+C 返回 Cancelled（关闭 ISIG，不触发 SIGINT 退出）。
-// GUI 集成（Security framework / Keychain）留待后续阶段。
+// macOS 凭据输入 resolver（ADR-0019）：多级 fallback 链。
+//
+//   1. TERMBRIDGE_ASKPASS（显式配置，askpass 兼容程序；失败不级联）
+//   2. GUI：osascript `display dialog ... with hidden answer`（系统自带，
+//      无第三方依赖；无 Aqua 会话如 SSH headless 时失败 → 级联）
+//   3. TTY：/dev/tty（headless 兜底）
+//   4. Unsupported：带可行动指引
+//
+// 原生 AppKit dialog（Security framework / SwiftUI helper）留待后续阶段，
+// osascript MVP 已满足「非干扰 + 系统自带 + 密码掩码」三个核心诉求。
 
-use super::PromptedCredential;
-use std::fs::OpenOptions;
-use std::io::{Read, Write};
-use std::os::unix::io::AsRawFd;
+use std::process::Command;
 
-pub enum PromptError {
-    Cancelled,
-    Unsupported,
+use super::prompt_cmd::{askpass_program, run_askpass, run_dialog, DialogResult};
+use super::tty::{self, TtyError};
+use super::PromptOutcome;
+
+pub fn prompt_password(host: &str, user: &str, reason: &str) -> PromptOutcome {
+    let prompt = format!("Password for {user}@{host} ({reason}): ");
+
+    let mut trace: Vec<String> = Vec::new();
+
+    // 1. 显式 askpass：终态语义（Password / Cancelled / Failed），不级联
+    if let Some(program) = askpass_program() {
+        return run_askpass(&program, &prompt);
+    }
+    trace.push("TERMBRIDGE_ASKPASS not set".into());
+
+    // 2. osascript GUI：stderr 明确区分用户取消（error -128 "User canceled"）
+    //    与环境失败（无 WindowServer 会话等）——后者级联到 TTY
+    match osascript(&prompt) {
+        DialogResult::Success { stdout } => {
+            return PromptOutcome::Password {
+                user: None,
+                password: stdout,
+            }
+        }
+        DialogResult::Cancelled => return PromptOutcome::Cancelled,
+        DialogResult::Unavailable { detail } => trace.push(format!("osascript: {detail}")),
+    }
+
+    // 3. TTY 兜底
+    match tty::prompt(&prompt) {
+        Ok(password) => {
+            return PromptOutcome::Password {
+                user: None,
+                password,
+            }
+        }
+        Err(TtyError::Cancelled) => return PromptOutcome::Cancelled,
+        Err(TtyError::Unavailable(detail)) => trace.push(detail),
+    }
+
+    // 4. 全部不可用：可行动指引
+    PromptOutcome::Unsupported {
+        message: unsupported_message(user, host, &trace),
+    }
 }
 
-pub fn prompt_password(
-    host: &str,
-    user: &str,
-    reason: &str,
-) -> Result<PromptedCredential, PromptError> {
-    // 1. 打开 /dev/tty（MCP 进程的 stdin/stdout 被 JSON-RPC 占用，必须直连终端）
-    let mut tty = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .map_err(|_| PromptError::Unsupported)?;
+/// `osascript -e 'return text returned of (display dialog ... with hidden answer)'`
+///
+/// - OK：stdout = 原始密码文本（human-readable 格式不加引号不转义）
+/// - 取消：AppleScript error -128 → osascript 退出码 1，stderr 含
+///   "User canceled" → Cancelled
+/// - 其它失败（headless 无 GUI 会话 / Apple Events 未授权等）→ Unavailable
+fn osascript(prompt: &str) -> DialogResult {
+    let script = format!(
+        "return text returned of (display dialog \"{}\" default answer \"\" \
+with hidden answer with title \"TermBridge Credential\")",
+        escape_applescript(prompt)
+    );
+    let mut cmd = Command::new("osascript");
+    cmd.arg("-e").arg(&script);
+    // 取消信号（stderr "User canceled"）由共享分类器的 USER_CANCEL_PATTERNS
+    // 识别，优先于快速退出启发——无需 always_cancel 码
+    run_dialog(&mut cmd, &[])
+}
 
-    // 2. 写 prompt
-    let prompt = format!("Password for {}@{} ({}): ", user, host, reason);
-    let _ = tty.write_all(prompt.as_bytes());
-    let _ = tty.flush();
-
-    // 3. 关闭 ECHO / ECHONL / ICANON / ISIG：隐藏输入、字节级读取、Ctrl+C 不触发 SIGINT
-    let fd = tty.as_raw_fd();
-    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
-    if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
-        let _ = tty.write_all(b"\n");
-        return Err(PromptError::Unsupported);
+/// AppleScript 字符串字面量转义（prompt 中的 host/user 来自 ssh config，
+/// 用户可控，必须转义防止注入脚本）。
+fn escape_applescript(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(c),
+        }
     }
-    let original = termios;
-    termios.c_lflag &= !(libc::ECHO | libc::ECHONL | libc::ICANON | libc::ISIG);
-    termios.c_cc[libc::VMIN] = 1;
-    termios.c_cc[libc::VTIME] = 0;
-    let disabled = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &termios) } == 0;
+    out
+}
 
-    // 4. 读密码（字节级）；若无法关闭 ECHO 则不读取，避免密码回显暴露
-    let mut bytes: Vec<u8> = Vec::new();
-    let read_result: Result<(), PromptError> = if !disabled {
-        Err(PromptError::Unsupported)
-    } else {
-        (|| {
-            let mut buf = [0u8; 1];
-            loop {
-                match tty.read(&mut buf) {
-                    Ok(0) => break, // EOF
-                    Ok(_) => {
-                        if buf[0] == b'\n' || buf[0] == b'\r' {
-                            break;
-                        }
-                        if buf[0] == 0x03 {
-                            // Ctrl+C
-                            return Err(PromptError::Cancelled);
-                        }
-                        bytes.push(buf[0]);
-                    }
-                    Err(_) => break,
-                }
-            }
-            Ok(())
-        })()
-    };
+fn unsupported_message(user: &str, host: &str, trace: &[String]) -> String {
+    format!(
+        "no interactive password prompt available for {user}@{host} \
+(tried: {}). Options: (1) run from a desktop (Aqua) session; (2) set \
+TERMBRIDGE_ASKPASS to an askpass-compatible program; (3) run from an \
+interactive terminal.",
+        trace.join("; ")
+    )
+}
 
-    // 5. 恢复 ECHO（无论成功失败都恢复，避免终端紊乱）
-    let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
-    let _ = tty.write_all(b"\n");
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    read_result?;
-    if bytes.is_empty() {
-        Err(PromptError::Cancelled)
-    } else {
-        // tty prompt 不提供用户名编辑：原样返回请求的预填用户名
-        Ok(PromptedCredential {
-            user: user.to_string(),
-            password: String::from_utf8_lossy(&bytes).into_owned(),
-        })
+    #[test]
+    fn applescript_escaping() {
+        assert_eq!(escape_applescript("plain"), "plain");
+        assert_eq!(escape_applescript("a\"b"), "a\\\"b");
+        assert_eq!(escape_applescript("a\\b"), "a\\\\b");
+        // 注入尝试：引号闭合被转义
+        assert_eq!(
+            escape_applescript("\") & do shell script \"rm -rf /"),
+            "\\\") & do shell script \\\"rm -rf /"
+        );
+    }
+
+    #[test]
+    fn unsupported_message_is_actionable() {
+        let msg = unsupported_message(
+            "root",
+            "mac.example",
+            &["osascript: No user interaction allowed".into()],
+        );
+        assert!(msg.contains("root@mac.example"));
+        assert!(msg.contains("TERMBRIDGE_ASKPASS"));
+        assert!(msg.contains("desktop"));
     }
 }

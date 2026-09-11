@@ -1,12 +1,18 @@
 // Windows native 凭据对话框：通过 CredUIPromptForCredentialsW (credui.dll)
-// 弹出系统原生凭据输入框，支持密码掩码。用户取消或任何错误统一回 Cancelled。
+// 弹出系统原生凭据输入框，支持密码掩码。
+//
+// 协议 v2（ADR-0019）：用户取消回 Cancelled；CredUI 环境失败（无交互
+// 桌面会话，如 SSH 远程会话 / 服务进程启动的 MCP server）回
+// Unsupported——两者不再折叠，Agent 才能给出正确的排障指引。
 //
 // 安全：密码缓冲读取后立即用 write_volatile 清零（模拟 SecureZeroMemory），
 // 避免依赖额外 windows feature。
 
-use super::PromptedCredential;
+use super::PromptOutcome;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{FALSE, ERROR_SUCCESS};
+use windows::Win32::Foundation::{ERROR_SUCCESS, FALSE};
+// ERROR_CANCELLED 是常量不是类型，经命名空间别名引入避免 non_snake_case 告警
+use windows::Win32::Foundation as win;
 use windows::Win32::Graphics::Gdi::HBITMAP;
 use windows::Win32::Security::Credentials::{
     CredUIPromptForCredentialsW, CREDUI_FLAGS_ALWAYS_SHOW_UI, CREDUI_FLAGS_DO_NOT_PERSIST,
@@ -14,17 +20,7 @@ use windows::Win32::Security::Credentials::{
 };
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
-pub enum PromptError {
-    Cancelled,
-    #[allow(dead_code)]
-    Unsupported,
-}
-
-pub fn prompt_password(
-    host: &str,
-    user: &str,
-    reason: &str,
-) -> Result<PromptedCredential, PromptError> {
+pub fn prompt_password(host: &str, user: &str, reason: &str) -> PromptOutcome {
     unsafe {
         // CREDUI 用户名/密码缓冲（WCHAR 计数）。CredUI wrapper 用切片 len 作 max chars。
         const USER_BUF_LEN: usize = 256;
@@ -82,16 +78,30 @@ pub fn prompt_password(
                 let password = from_wide_buf(&password_buf);
                 secure_zero(&mut user_buf);
                 secure_zero(&mut password_buf);
-                Ok(PromptedCredential {
-                    user: user_out,
+                PromptOutcome::Password {
+                    user: Some(user_out),
                     password,
-                })
+                }
             }
-            // ERROR_CANCELLED 或任何其它失败：保守当取消，不暴露内部错误
+            win::ERROR_CANCELLED => {
+                secure_zero(&mut user_buf);
+                secure_zero(&mut password_buf);
+                PromptOutcome::Cancelled
+            }
+            // 其它失败码（ERROR_NO_SUCH_LOGON_SESSION 等）：CredUI 无法在
+            // 当前会话展示对话框（典型：无交互桌面），按环境不可用上报
             _ => {
                 secure_zero(&mut user_buf);
                 secure_zero(&mut password_buf);
-                Err(PromptError::Cancelled)
+                PromptOutcome::Unsupported {
+                    message: format!(
+                        "CredUI prompt failed with Windows error {} \
+(no interactive desktop session?). Options: (1) run TermBridge from an \
+interactive desktop session; (2) set TERMBRIDGE_ASKPASS to an \
+askpass-compatible program.",
+                        result.0
+                    ),
+                }
             }
         }
     }

@@ -146,8 +146,10 @@ termbridge policy prod         # 单 host 有效值 + 修改提示
 
 Agent: list_hosts → 确认 my-server 可见
 Agent: bootstrap_host(host="my-server")
-       → 桌面弹出 termbridge-auth-helper 凭据窗口
-       → 用户输入密码
+       → 弹出密码输入（按环境自动选择，ADR-0019：
+          Windows CredUI / Linux zenity·kdialog·yad / macOS osascript
+          / TERMBRIDGE_ASKPASS 程序 / headless 终端提示）
+       → 用户输入密码（等待上限默认 5 分钟，超时返回 timed_out）
        → 公钥部署 + key 认证验证
        → 返回 bootstrapped
 

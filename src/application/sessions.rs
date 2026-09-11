@@ -14,12 +14,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use serde::Serialize;
 use tokio::task::JoinHandle;
-use bytes::Bytes;
 
+use crate::application::host_policy::{AuthMode, HostPolicyResolver, SessionMode};
+use crate::application::path_policy::{PathPolicy, RemoteOperation};
+use crate::application::policy::PolicyManager;
 use crate::domain::credential::{
     CredentialError, CredentialProvider, NoopCredentialProvider, PasswordCredential,
     PasswordRequest,
@@ -27,7 +30,7 @@ use crate::domain::credential::{
 use crate::domain::output::{ReadOutputParams, ReadOutputResult};
 use crate::domain::policy::{Action, ApprovalMode, Decision};
 use crate::domain::provider::{
-    ControlKey, Host, HostName, OpenTerminalRequest, PtySize, TerminalProvider, TermError,
+    ControlKey, Host, HostName, OpenTerminalRequest, PtySize, TermError, TerminalProvider,
     TransferDirection,
 };
 use crate::domain::session::{Session, SessionId, SessionSummary};
@@ -40,9 +43,6 @@ use crate::infrastructure::sftp::DirTransferReport;
 use crate::infrastructure::ssh::SshTerminalHandle;
 use crate::infrastructure::sshconfig;
 use crate::infrastructure::username_store;
-use crate::application::host_policy::{AuthMode, HostPolicyResolver, SessionMode};
-use crate::application::path_policy::{PathPolicy, RemoteOperation};
-use crate::application::policy::PolicyManager;
 
 // ───────────────────────────────────────────────────────────────────────────
 // idleReaper 配置常量（§7.4 Phase 1）
@@ -107,10 +107,7 @@ pub enum ReconnectResult {
         current_state: String,
     },
     /// 重连失败
-    Failed {
-        session_id: String,
-        reason: String,
-    },
+    Failed { session_id: String, reason: String },
 }
 
 /// SessionManager：管理所有活跃 Session。
@@ -159,10 +156,7 @@ impl SessionManager {
     }
 
     /// 用自定义路径策略构造（测试 / 配置覆盖用）。
-    pub fn with_path_policy(
-        provider: Arc<dyn TerminalProvider>,
-        path_policy: PathPolicy,
-    ) -> Self {
+    pub fn with_path_policy(provider: Arc<dyn TerminalProvider>, path_policy: PathPolicy) -> Self {
         Self::build(
             provider,
             path_policy,
@@ -358,10 +352,7 @@ impl SessionManager {
     /// 必须在 credential prompt 之前调用——用户不应为注定失败的请求输入密码。
     /// 显式失败（InvalidArgument + 修复建议），**不做静默降级**：不把用户显式
     /// 请求的 persistent session 悄悄变成 standard（ADR-0017 §2.3 禁止）。
-    fn validate_auth_session_combo(
-        auth: AuthMode,
-        session: SessionMode,
-    ) -> Result<(), TermError> {
+    fn validate_auth_session_combo(auth: AuthMode, session: SessionMode) -> Result<(), TermError> {
         if auth == AuthMode::Password && session == SessionMode::Persistent {
             return Err(TermError::InvalidArgument(
                 "auth=password with session=persistent is not supported: password \
@@ -393,6 +384,9 @@ impl SessionManager {
             .await
             .map_err(|e| match e {
                 CredentialError::Cancelled => TermError::AuthFailed,
+                // 超时（ADR-0019）：认证未发生，映射 AuthFailed——Agent 应提示
+                // 用户重新 open_session（用户在场时再试）
+                CredentialError::Timeout(_) => TermError::AuthFailed,
                 CredentialError::HelperFailed(msg) | CredentialError::Unsupported(msg) => {
                     TermError::InvalidArgument(msg)
                 }
@@ -420,11 +414,7 @@ impl SessionManager {
     /// Policy 检查在 session 查找前——拒绝危险命令不泄漏 session 存在性。
     ///
     /// Phase 1：若返回 SessionClosed 且 session 已 Lost/Closed，从 map 移除防泄漏。
-    pub async fn send_input(
-        &self,
-        session_id: &str,
-        data: &[u8],
-    ) -> Result<(), TermError> {
+    pub async fn send_input(&self, session_id: &str, data: &[u8]) -> Result<(), TermError> {
         // Phase 4-B：tracing（debug 级别，截断长命令 + 转义换行，避免日志爆炸）
         let data_display = truncate_for_log(data, 200);
         tracing::debug!(session = %session_id, input = %data_display, "send_input");
@@ -471,11 +461,7 @@ impl SessionManager {
     }
 
     /// 发控制字符（§4.6 契约 8）。
-    pub async fn send_control(
-        &self,
-        session_id: &str,
-        key: ControlKey,
-    ) -> Result<(), TermError> {
+    pub async fn send_control(&self, session_id: &str, key: ControlKey) -> Result<(), TermError> {
         // Phase 4-B：tracing（info 级别，低频重要操作）
         tracing::info!(session = %session_id, control = ?key, "send_control");
         let session = self.get_session(session_id)?;
@@ -521,12 +507,7 @@ impl SessionManager {
     }
 
     /// 调整 PTY 尺寸（window_change）。
-    pub async fn resize(
-        &self,
-        session_id: &str,
-        cols: u16,
-        rows: u16,
-    ) -> Result<(), TermError> {
+    pub async fn resize(&self, session_id: &str, cols: u16, rows: u16) -> Result<(), TermError> {
         // Phase 4-B：tracing（info 级别，低频重要操作）
         tracing::info!(session = %session_id, cols, rows, "resize");
         let session = self.get_session(session_id)?;
@@ -857,10 +838,7 @@ impl SessionManager {
     ///
     /// 通过 session 的 SSH 连接 exec 一条探测命令（不开 PTY，不污染 session 输出），
     /// 解析输出提取结构化信息。
-    pub async fn detect_remote_env(
-        &self,
-        session_id: &str,
-    ) -> Result<RemoteEnvInfo, TermError> {
+    pub async fn detect_remote_env(&self, session_id: &str) -> Result<RemoteEnvInfo, TermError> {
         let session = self.get_session(session_id)?;
         let handle = session.handle();
         let ssh_handle = handle
@@ -905,11 +883,7 @@ impl SessionManager {
     /// 设置 session 审批模式（ADR-0018，仅 Control IPC 调用）。
     ///
     /// Agent 不可直接调用——通过 Local Control IPC 由用户经 CLI/GUI 操作。
-    pub fn set_approval_mode(
-        &self,
-        session_id: &str,
-        mode: ApprovalMode,
-    ) -> Result<(), TermError> {
+    pub fn set_approval_mode(&self, session_id: &str, mode: ApprovalMode) -> Result<(), TermError> {
         let session = self.get_session(session_id)?;
         session.set_approval_mode(mode);
         Ok(())
@@ -939,10 +913,15 @@ impl SessionManager {
         host_alias: &HostName,
     ) -> Result<Vec<SessionInfo>, TermError> {
         let host = sshconfig::resolve(host_alias).await?;
-        let provider = self.provider.as_any().downcast_ref::<PersistentProvider>()
-            .ok_or_else(|| TermError::InvalidArgument(
-                "list_remote_sessions requires persistent provider".into()
-            ))?;
+        let provider = self
+            .provider
+            .as_any()
+            .downcast_ref::<PersistentProvider>()
+            .ok_or_else(|| {
+                TermError::InvalidArgument(
+                    "list_remote_sessions requires persistent provider".into(),
+                )
+            })?;
         provider.list_remote_sessions(&host).await
     }
 
@@ -959,12 +938,19 @@ impl SessionManager {
         // Phase 4-B：tracing（info 级别，低频重要操作）
         tracing::info!(host = %host_alias, remote_session_id, "attach_remote_session");
         let host = sshconfig::resolve(host_alias).await?;
-        let provider = self.provider.as_any().downcast_ref::<PersistentProvider>()
-            .ok_or_else(|| TermError::InvalidArgument(
-                "attach_remote_session requires persistent provider".into()
-            ))?;
+        let provider = self
+            .provider
+            .as_any()
+            .downcast_ref::<PersistentProvider>()
+            .ok_or_else(|| {
+                TermError::InvalidArgument(
+                    "attach_remote_session requires persistent provider".into(),
+                )
+            })?;
 
-        let handle = provider.attach_remote_session(&host, remote_session_id).await?;
+        let handle = provider
+            .attach_remote_session(&host, remote_session_id)
+            .await?;
 
         let id = self.next_session_id();
         let session = Arc::new(Session::new(
@@ -1010,9 +996,11 @@ impl SessionManager {
         let persistent = handle
             .as_any()
             .downcast_ref::<PersistentTerminalHandle>()
-            .ok_or_else(|| TermError::InvalidArgument(
-                "session does not support detach (non-persistent handle)".into()
-            ))?;
+            .ok_or_else(|| {
+                TermError::InvalidArgument(
+                    "session does not support detach (non-persistent handle)".into(),
+                )
+            })?;
 
         // 3. 远端 detach（网络调用）：失败 → session 保留在 map，错误向上传播
         persistent.detach().await?;
@@ -1042,10 +1030,15 @@ impl SessionManager {
         // 低频、破坏性操作：info 级别 tracing
         tracing::info!(host = %host_alias, "restart_remote_daemon");
         let host = sshconfig::resolve(host_alias).await?;
-        let provider = self.provider.as_any().downcast_ref::<PersistentProvider>()
-            .ok_or_else(|| TermError::InvalidArgument(
-                "restart_remote_daemon requires persistent provider".into()
-            ))?;
+        let provider = self
+            .provider
+            .as_any()
+            .downcast_ref::<PersistentProvider>()
+            .ok_or_else(|| {
+                TermError::InvalidArgument(
+                    "restart_remote_daemon requires persistent provider".into(),
+                )
+            })?;
         provider.restart_remote_daemon(&host).await
     }
 
@@ -1075,10 +1068,7 @@ impl SessionManager {
     /// - buffer 历史不保留（从新开始）
     /// - 不恢复 shell 状态（cwd/env/history）
     /// - 重连失败后旧 session 已 close，需 open_session 新建
-    pub async fn reconnect_session(
-        &self,
-        session_id: &str,
-    ) -> Result<ReconnectResult, TermError> {
+    pub async fn reconnect_session(&self, session_id: &str) -> Result<ReconnectResult, TermError> {
         tracing::info!(session = %session_id, "reconnect_session: starting");
 
         // 1. 取出旧 session
@@ -1390,7 +1380,9 @@ fn policy_reason(action: &Action, status: &str) -> String {
                 format!("command {status}: {snippet}")
             }
         }
-        Action::SftpTransfer { direction, remote, .. } => {
+        Action::SftpTransfer {
+            direction, remote, ..
+        } => {
             format!("sftp {} {status}: {remote}", direction.as_str())
         }
         Action::SftpRemove { remote, recursive } => {
@@ -1425,9 +1417,9 @@ fn parse_remote_env(output: &str) -> Result<RemoteEnvInfo, TermError> {
     const START_MARKER: &str = "__ENV_START__";
     const END_MARKER: &str = "__ENV_END__";
 
-    let start = output
-        .find(START_MARKER)
-        .ok_or_else(|| TermError::ChannelError("detect_remote_env: start marker not found".into()))?;
+    let start = output.find(START_MARKER).ok_or_else(|| {
+        TermError::ChannelError("detect_remote_env: start marker not found".into())
+    })?;
     let end_rel = output[start..]
         .find(END_MARKER)
         .ok_or_else(|| TermError::ChannelError("detect_remote_env: end marker not found".into()))?;
@@ -1546,7 +1538,10 @@ impl crate::transport::control::ControlHandler for SessionManager {
             _ => {
                 return Err(crate::transport::control::ControlError::new(
                     "INVALID_ARGUMENT",
-                    format!("invalid mode '{}'; expected 'standard' or 'unrestricted'", mode),
+                    format!(
+                        "invalid mode '{}'; expected 'standard' or 'unrestricted'",
+                        mode
+                    ),
                 ));
             }
         };
@@ -1673,6 +1668,7 @@ mod tests {
         Cancelled,
         HelperFailed(String),
         Unsupported(String),
+        Timeout(u64),
     }
 
     struct FakeCredentialProvider {
@@ -1693,6 +1689,7 @@ mod tests {
                 FakeResponse::Cancelled => Err(CredentialError::Cancelled),
                 FakeResponse::HelperFailed(msg) => Err(CredentialError::HelperFailed(msg)),
                 FakeResponse::Unsupported(msg) => Err(CredentialError::Unsupported(msg)),
+                FakeResponse::Timeout(secs) => Err(CredentialError::Timeout(secs)),
             }
         }
 
@@ -1718,7 +1715,10 @@ mod tests {
     async fn resolve_session_mode_no_config_defaults_standard() {
         // 无 hosts.toml（empty resolver）→ system default = standard（false）
         let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
-        assert_eq!(mgr.resolve_session_mode("prod", None), SessionMode::Standard);
+        assert_eq!(
+            mgr.resolve_session_mode("prod", None),
+            SessionMode::Standard
+        );
         assert_eq!(
             mgr.resolve_session_mode("prod", Some(false)),
             SessionMode::Standard
@@ -1830,25 +1830,25 @@ mod tests {
     #[test]
     fn validate_auth_session_combo_allows_valid_combinations() {
         // 其余三种主要路径全部放行（ADR-0017 §2.3）
-        assert!(
-            SessionManager::validate_auth_session_combo(
-                AuthMode::Password,
-                SessionMode::Standard
-            )
-            .is_ok()
-        );
-        assert!(
-            SessionManager::validate_auth_session_combo(AuthMode::Key, SessionMode::Persistent)
-                .is_ok()
-        );
+        assert!(SessionManager::validate_auth_session_combo(
+            AuthMode::Password,
+            SessionMode::Standard
+        )
+        .is_ok());
+        assert!(SessionManager::validate_auth_session_combo(
+            AuthMode::Key,
+            SessionMode::Persistent
+        )
+        .is_ok());
         assert!(
             SessionManager::validate_auth_session_combo(AuthMode::Key, SessionMode::Standard)
                 .is_ok()
         );
-        assert!(
-            SessionManager::validate_auth_session_combo(AuthMode::Auto, SessionMode::Persistent)
-                .is_ok()
-        );
+        assert!(SessionManager::validate_auth_session_combo(
+            AuthMode::Auto,
+            SessionMode::Persistent
+        )
+        .is_ok());
     }
 
     // ── ADR-0017 §2.3：request_password 错误映射 ──────────────────────
@@ -1896,12 +1896,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_password_maps_timeout_to_auth_failed() {
+        // 超时（ADR-0019）：认证未发生 → AuthFailed（Agent 提示用户在场时重试）
+        let mgr = mgr_with_credentials(FakeResponse::Timeout(300));
+        let err = mgr.request_password(&test_host()).await.unwrap_err();
+        assert_eq!(err.code(), "AUTH_FAILED");
+        assert!(!err.retriable());
+    }
+
+    #[tokio::test]
     async fn session_not_found_errors() {
         let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
-        let err = mgr
-            .send_input("nonexistent", b"ls\n")
-            .await
-            .unwrap_err();
+        let err = mgr.send_input("nonexistent", b"ls\n").await.unwrap_err();
         assert_eq!(err.code(), "SESSION_NOT_FOUND");
 
         let err = mgr
@@ -1988,10 +1994,7 @@ mod tests {
         reap_idle(&sessions, 1).await;
 
         assert!(sessions.is_empty() == false, "应至少保留活跃 session");
-        assert!(
-            sessions.contains_key("sess_active"),
-            "活跃 session 应保留"
-        );
+        assert!(sessions.contains_key("sess_active"), "活跃 session 应保留");
         assert!(
             !sessions.contains_key("sess_idle"),
             "空闲 session 应被 reaper 移除"
@@ -2050,7 +2053,10 @@ mod tests {
         }
         // 不死锁即通过；奇数 i 的 session 保留（每个线程 10 个）
         let remaining = sessions.len();
-        assert_eq!(remaining, 40, "每线程 10 个奇数 i session 保留，4 线程共 40");
+        assert_eq!(
+            remaining, 40,
+            "每线程 10 个奇数 i session 保留，4 线程共 40"
+        );
     }
 
     #[tokio::test]
@@ -2183,7 +2189,11 @@ mod tests {
         mgr.sessions.insert(id.clone(), session.clone());
         // 等 read task 消费完 chunks 并 EOF → Lost
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(session.state(), SessionState::Lost, "session 应进入 Lost 状态");
+        assert_eq!(
+            session.state(),
+            SessionState::Lost,
+            "session 应进入 Lost 状态"
+        );
         id
     }
 
@@ -2191,11 +2201,7 @@ mod tests {
     #[tokio::test]
     async fn lost_state_buffer_still_readable() {
         let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
-        let id = make_lost_session(
-            &mgr,
-            vec![Bytes::from_static(b"hello lost session\n")],
-        )
-        .await;
+        let id = make_lost_session(&mgr, vec![Bytes::from_static(b"hello lost session\n")]).await;
 
         let result = mgr
             .read_output(
@@ -2208,10 +2214,7 @@ mod tests {
             )
             .await
             .expect("Lost 状态 read_output 应成功");
-        assert!(
-            !result.output.is_empty(),
-            "Lost 状态 buffer 应仍有数据可读"
-        );
+        assert!(!result.output.is_empty(), "Lost 状态 buffer 应仍有数据可读");
     }
 
     /// Lost 状态下 send_input 返回 SESSION_CLOSED（连接已断，不可写）。
@@ -2323,7 +2326,10 @@ mod tests {
         // rm -rf / 命中 blocklist → POLICY_DENIED
         // Policy 检查在 session 查找前，无需真实 session
         let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
-        let err = mgr.send_input("any_session", b"rm -rf /\n").await.unwrap_err();
+        let err = mgr
+            .send_input("any_session", b"rm -rf /\n")
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "POLICY_DENIED");
         assert!(!err.retriable());
     }
@@ -2341,7 +2347,10 @@ mod tests {
     #[tokio::test]
     async fn send_input_sudo_returns_policy_needs_confirm() {
         let mgr = SessionManager::new(Arc::new(FakeProvider) as Arc<dyn TerminalProvider>);
-        let err = mgr.send_input("any", b"sudo apt update\n").await.unwrap_err();
+        let err = mgr
+            .send_input("any", b"sudo apt update\n")
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), "POLICY_NEEDS_CONFIRM");
     }
 

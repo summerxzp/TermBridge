@@ -1,5 +1,8 @@
-// 平台分发：按 target_os 选择对应的 native 凭据对话框实现。
-// macOS / Linux 当前为 stub（返回 Unsupported），仅 Windows 真实实现。
+// 平台分发：按 target_os 选择 native 凭据输入实现（ADR-0019）。
+//
+// Unix（Linux / macOS）侧是多级 fallback resolver：
+//   TERMBRIDGE_ASKPASS → 平台 GUI → TTY → Unsupported（可行动指引）
+// Windows 侧保持 CredUI 原生对话框（ADR-0009），仅区分取消与环境失败。
 
 #[cfg(target_os = "windows")]
 #[path = "windows.rs"]
@@ -13,17 +16,36 @@ mod imp;
 #[path = "linux.rs"]
 mod imp;
 
-/// `prompt_password` 的返回：密码 + 对话框中实际确认/编辑的用户名。
-///
-/// Windows CredUI 的用户名缓冲是 in/out 的——用户可以编辑预填的用户名
-/// （如把 ssh config 的 root 改成普通用户），必须读回传给 TermBridge。
-/// POSIX tty prompt 不提供用户名编辑，原样返回请求的预填值。
-pub struct PromptedCredential {
-    /// 对话框中实际确认/编辑的用户名
-    pub user: String,
-    /// 密码
-    pub password: String,
-}
+// Unix 共享：外部命令式 prompt（askpass / GUI dialog）+ POSIX tty prompt
+#[cfg(unix)]
+pub mod prompt_cmd;
+#[cfg(unix)]
+pub mod tty;
 
-#[allow(unused_imports)]
-pub use imp::{prompt_password, PromptError};
+pub use imp::prompt_password;
+
+/// `prompt_password` 的结果（协议 v2，ADR-0019）。
+///
+/// 区分四种终态，TermBridge 据此向 Agent 返回不同的错误语义：
+/// - 用户取消 ≠ 环境不可用（旧协议把两者折叠成 cancelled，误导排障）
+/// - 显式配置的 provider 损坏（Failed）不静默级联
+#[derive(Debug)]
+pub enum PromptOutcome {
+    /// 用户提交了密码。
+    ///
+    /// `user`：对话框中实际编辑后的用户名。仅支持用户名编辑的 provider
+    /// （Windows CredUI / zenity --username）回传 Some；其余回传 None，
+    /// 调用方（TermBridge Core）回退请求中的预填用户名。
+    Password {
+        user: Option<String>,
+        password: String,
+    },
+    /// 用户取消（对话框 / 终端已展示给用户后的取消动作）。
+    Cancelled,
+    /// 当前环境没有任何可用的输入通道，`message` 含可行动指引。
+    Unsupported { message: String },
+    /// provider 执行失败（如 TERMBRIDGE_ASKPASS 指向的程序损坏）。
+    /// Windows CredUI 无此终态（环境失败归 Unsupported），仅 Unix askpass 使用。
+    #[allow(dead_code)]
+    Failed { message: String },
+}

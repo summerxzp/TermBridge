@@ -26,3 +26,7 @@ windows = { version = "0.58", features = [
 # Linux / macOS：/dev/tty + termios 控制 ECHO，弹出系统级密码输入。
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"
+
+# 集成测试：pre_exec setsid 脱离控制终端（模拟 GUI 客户端环境）
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"

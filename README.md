@@ -132,13 +132,26 @@ Host my-server
 ```
 Agent: 我需要连接 my-server，请先 bootstrap。
  工具调用: bootstrap_host({ "host": "my-server" })
- 桌面弹出原生凭据输入框
+ 弹出密码输入（见下）
  用户输入密码
  TermBridge 部署公钥 + 验证 key 认证
 ← 返回: { "status": "bootstrapped", "authentication": "public_key" }
 ```
 
 之后所有 `open_session` 调用均使用 SSH key 免密连接。
+
+密码输入方式按环境自动选择（ADR-0019），优先不干扰宿主 Agent 的终端：
+
+| 环境 | 输入方式 |
+|------|---------|
+| Windows | 系统原生凭据对话框（CredUI，用户名可编辑） |
+| Linux 桌面 | zenity → kdialog → yad（PATH 中第一个可用的弹密码框，无需预装） |
+| macOS | osascript 系统对话框 |
+| 任意平台 + `TERMBRIDGE_ASKPASS` | 你指定的 askpass 兼容程序（如 ksshaskpass） |
+| headless 服务器 | 终端提示（`/dev/tty`，无回显） |
+
+- 输入等待默认 5 分钟，超时返回 `timed_out`（`TERMBRIDGE_PROMPT_TIMEOUT` 秒可调）
+- 全部通道不可用时返回可行动指引（装 zenity / 配 askpass / 用终端），不再误报「用户取消」
 
 > 完整流程见 [docs/getting-started.md](docs/getting-started.md)。
 

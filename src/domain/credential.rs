@@ -130,9 +130,13 @@ pub enum CredentialError {
     #[error("credential helper error: {0}")]
     HelperFailed(String),
 
-    /// 平台不支持（如 Linux 无 GUI 且无 TTY）
+    /// 平台不支持（如无 GUI 且无 TTY，ADR-0019：message 含可行动指引）
     #[error("credential prompt not supported on this platform: {0}")]
     Unsupported(String),
+
+    /// 凭据输入等待超时（ADR-0019：父进程侧计时，用户可能离开桌面）
+    #[error("credential prompt timed out after {0}s (user did not respond)")]
+    Timeout(u64),
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -209,7 +213,10 @@ mod tests {
     fn debug_does_not_leak_secret() {
         let s = Secret::new("hunter2-super-secret".to_string());
         let dbg = format!("{:?}", s);
-        assert!(!dbg.contains("hunter2-super-secret"), "Debug 泄漏明文: {dbg}");
+        assert!(
+            !dbg.contains("hunter2-super-secret"),
+            "Debug 泄漏明文: {dbg}"
+        );
         assert!(dbg.contains("Secret"), "Debug 应保留类型名: {dbg}");
     }
 
@@ -234,7 +241,10 @@ mod tests {
             secret: Secret::new("hunter2-super-secret".to_string()),
         };
         let dbg = format!("{cred:?}");
-        assert!(!dbg.contains("hunter2-super-secret"), "Debug 泄漏明文: {dbg}");
+        assert!(
+            !dbg.contains("hunter2-super-secret"),
+            "Debug 泄漏明文: {dbg}"
+        );
         assert!(dbg.contains("alice"), "用户名非机密，应正常显示: {dbg}");
     }
 }

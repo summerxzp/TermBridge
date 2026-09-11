@@ -133,13 +133,26 @@ If the target server doesn't have your SSH public key yet, have the Agent call `
 ```
 Agent: I need to connect to my-server, please bootstrap first.
  Tool call: bootstrap_host({ "host": "my-server" })
- Native credential dialog pops up
+ Password prompt appears (see table below)
  User enters password
  TermBridge deploys public key + verifies key auth
 ← Returns: { "status": "bootstrapped", "authentication": "public_key" }
 ```
 
 All subsequent `open_session` calls use SSH key authentication.
+
+The password prompt is chosen per environment (ADR-0019), preferring channels that don't interfere with the host Agent's terminal:
+
+| Environment | Prompt |
+|------|---------|
+| Windows | Native credential dialog (CredUI, username editable) |
+| Linux desktop | zenity → kdialog → yad (first available on PATH, no pre-install needed) |
+| macOS | osascript system dialog |
+| Any + `TERMBRIDGE_ASKPASS` | Your askpass-compatible program (e.g. ksshaskpass) |
+| Headless server | Terminal prompt (`/dev/tty`, no echo) |
+
+- Prompt waits 5 minutes by default; on timeout returns `timed_out` (tunable via `TERMBRIDGE_PROMPT_TIMEOUT` seconds)
+- When no channel is available at all, returns an actionable error (install zenity / configure askpass / use a terminal) instead of a misleading "cancelled"
 
 > Full workflow: [docs/getting-started.md](docs/getting-started.md)
 

@@ -63,6 +63,8 @@ pub enum BootstrapResult {
     },
     /// 用户取消密码输入。
     Cancelled { host: String },
+    /// 用户未在超时窗口内响应密码输入（ADR-0019，默认 5 分钟）。
+    TimedOut { host: String, timeout_secs: u64 },
     /// 密码错误。
     AuthenticationFailed { host: String },
     /// 公钥部署成功但 key 重连验证失败。
@@ -87,7 +89,9 @@ pub struct BootstrapHost {
 
 impl BootstrapHost {
     pub fn new(credential_provider: Arc<dyn CredentialProvider>) -> Self {
-        Self { credential_provider }
+        Self {
+            credential_provider,
+        }
     }
 
     /// 执行 ADR-0009 §4 bootstrap 流程。
@@ -141,6 +145,14 @@ impl BootstrapHost {
                     host: host_alias.into(),
                 });
             }
+            Err(CredentialError::Timeout(secs)) => {
+                // ADR-0019：超时是正常终态（用户离开桌面），不是错误——
+                // Agent 可提示用户重新发起 bootstrap
+                return Ok(BootstrapResult::TimedOut {
+                    host: host_alias.into(),
+                    timeout_secs: secs,
+                });
+            }
             Err(CredentialError::HelperFailed(msg)) => {
                 return Err(TermError::InvalidArgument(msg));
             }
@@ -165,8 +177,9 @@ impl BootstrapHost {
         // 步骤 6：重连 + 密码认证（用有效用户名）
         let connected = ssh::connect_unauthenticated(&host).await?;
         let mut session = connected.handle;
-        let ok = ssh::authenticate_with_password(&mut session, &effective_user, cred.secret.reveal())
-            .await?;
+        let ok =
+            ssh::authenticate_with_password(&mut session, &effective_user, cred.secret.reveal())
+                .await?;
         drop(cred); // 立即 Zeroize
 
         if !ok {
@@ -192,18 +205,17 @@ impl BootstrapHost {
         let mut session = connected.handle;
         // host.identity_files 可能为空（刚生成的 key），用实际 key_path
         let identity_files = vec![key_path];
-        let via = match ssh::authenticate_session(&mut session, &effective_user, &identity_files)
-            .await
-        {
-            Ok(v) => v,
-            Err(TermError::AuthFailed) => {
-                return Ok(BootstrapResult::BootstrapFailed {
-                    host: host_alias.into(),
-                    reason: "key auth verification failed after install".into(),
-                });
-            }
-            Err(e) => return Err(e),
-        };
+        let via =
+            match ssh::authenticate_session(&mut session, &effective_user, &identity_files).await {
+                Ok(v) => v,
+                Err(TermError::AuthFailed) => {
+                    return Ok(BootstrapResult::BootstrapFailed {
+                        host: host_alias.into(),
+                        reason: "key auth verification failed after install".into(),
+                    });
+                }
+                Err(e) => return Err(e),
+            };
 
         // 步骤 10：Bootstrapped
         Ok(BootstrapResult::Bootstrapped {
@@ -250,15 +262,7 @@ async fn ensure_identity_file(host: &Host) -> Result<PathBuf, TermError> {
         ))
     })?;
     let output = tokio::process::Command::new("ssh-keygen")
-        .args([
-            "-t",
-            "ed25519",
-            "-f",
-            key_path_str,
-            "-N",
-            "",
-            "-q",
-        ])
+        .args(["-t", "ed25519", "-f", key_path_str, "-N", "", "-q"])
         .output()
         .await
         .map_err(|e| TermError::InvalidArgument(format!("ssh-keygen failed: {e}")))?;
@@ -369,9 +373,15 @@ mod tests {
         assert_eq!(json["authentication"], "public_key");
         let hint = json["hint"].as_str().unwrap();
         assert!(hint.contains("auth=key"), "hint 应建议改 auth=key: {hint}");
-        assert!(hint.contains("hosts.toml"), "hint 应指向 hosts.toml: {hint}");
+        assert!(
+            hint.contains("hosts.toml"),
+            "hint 应指向 hosts.toml: {hint}"
+        );
         // 无 auth 字段——TermBridge 没有修改 host policy，只是给了建议
-        assert!(json.get("auth").is_none(), "hint 不得出现在 auth 字段: {json}");
+        assert!(
+            json.get("auth").is_none(),
+            "hint 不得出现在 auth 字段: {json}"
+        );
     }
 
     #[test]
@@ -385,6 +395,20 @@ mod tests {
             !BOOTSTRAP_HINT.contains("changed host policy"),
             "hint 不得宣称已修改 host policy: {BOOTSTRAP_HINT}"
         );
+    }
+
+    // ── ADR-0019：超时是正常终态，不是错误 ────────────────────────────
+
+    #[test]
+    fn timed_out_serializes_with_status_and_window() {
+        let result = BootstrapResult::TimedOut {
+            host: "prod".into(),
+            timeout_secs: 300,
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["status"], "timed_out");
+        assert_eq!(json["host"], "prod");
+        assert_eq!(json["timeout_secs"], 300);
     }
 
     // ── P2-11：shell 注入安全 + 非 UTF-8 HOME ──────────────────────────
@@ -421,7 +445,10 @@ mod tests {
         // 追加走 base64 解码，原文不进入 shell 可解释位置
         let expected_b64 = BASE64_STANDARD.encode(key.as_bytes());
         assert!(
-            cmd.contains(&format!("printf '%s' {}", shell_single_quote(&expected_b64))),
+            cmd.contains(&format!(
+                "printf '%s' {}",
+                shell_single_quote(&expected_b64)
+            )),
             "追加路径应为 base64: {cmd}"
         );
         assert!(

@@ -54,6 +54,12 @@ jobs:
       - name: Check auth helper
         run: cargo check -p termbridge-auth-helper
 
+      # ADR-0019：helper 协议 v2 / 级联分类 / 超时测试（含 stub 集成测试，
+      # 需要 script(1) 提供 PTY —— Ubuntu runner 自带）
+      - name: Test auth helper (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo test -p termbridge-auth-helper
+
       - name: Check agentd (Linux only)
         if: runner.os == 'Linux'
         run: cargo check -p termbridge-agentd
