@@ -265,8 +265,14 @@ jobs:
             # 路径当 git spec 解析（v0.3.1 第四次实测：git ls-remote
             # ssh://git@github.com/packaging/npm-platform.git → publickey 拒绝）
             if ! ( cd "$pkg_dir" && npm publish --access public ) > /tmp/npm-publish.log 2>&1; then
-              if grep -qE "cannot publish over the previously published versions|EPUBLISHCONFLICT" /tmp/npm-publish.log; then
-                echo "::warning::$pkg_dir 该版本已存在（手动首发过），跳过"
+              # 版本已存在（手动首发残留 / 历史事故残留）：跳过该包继续。
+              # grep -i + 单复数通配：实测错误消息是
+              # "Cannot publish over previously published version"（v0.3.2
+              # 实测：旧模式 'cannot publish over the previously published
+              # versions' 大小写/单复数都不匹配，导致 win32 残留 0.3.2 撞车
+              # 时 job 直接失败，后续三个包未发布）
+              if grep -qiE "cannot publish over (the )?previously published versions?|EPUBLISHCONFLICT" /tmp/npm-publish.log; then
+                echo "::warning::$pkg_dir 该版本已存在（历史残留/手动首发），跳过"
                 cat /tmp/npm-publish.log
                 return 0
               fi

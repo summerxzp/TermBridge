@@ -145,8 +145,14 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn temp_dir() -> PathBuf {
-        std::env::temp_dir().join(format!("termbridge-update-check-test-{}", std::process::id()))
+    /// 每个测试独立目录（测试名后缀）：两个测试曾共享同一 pid 命名路径，
+    /// 并发执行时 roundtrip 写入的缓存可能被 cache_missing_is_stale 读到
+    /// （v0.3.2 macOS CI 实测 flaky）。
+    fn temp_dir(test: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "termbridge-update-check-test-{test}-{}",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -169,7 +175,7 @@ mod tests {
 
     #[test]
     fn cache_roundtrip_and_throttle() {
-        let dir = temp_dir();
+        let dir = temp_dir("roundtrip");
         let path = dir.join(CACHE_FILE);
         let _ = fs::remove_file(&path);
 
@@ -196,7 +202,7 @@ mod tests {
 
     #[test]
     fn cache_missing_is_stale() {
-        let dir = temp_dir();
+        let dir = temp_dir("missing");
         let path = dir.join(CACHE_FILE);
         let _ = fs::remove_file(&path);
         assert!(read_cache(&path).is_none());
