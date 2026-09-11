@@ -77,6 +77,10 @@ jobs:
       # ── ADR-0020：musl 静态构建验证（Linux 发布产物线）──────────────
       # 发布产物是 musl 静态（agentd + 主控三件套），CI 必须在 musl target
       # 上跑同样的 check + 测试，防止「gnu 过了 musl 挂了」的发布事故
+      - name: Install musl toolchain (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Check musl targets (Linux only)
         if: runner.os == 'Linux'
         run: |
