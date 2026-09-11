@@ -24,6 +24,12 @@ jobs:
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
 
+      # ADR-0020：Windows 发布产物用静态 CRT，CI 同参数 check 防漂移
+      - name: Configure static CRT (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> "$GITHUB_ENV"
+
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -67,6 +73,23 @@ jobs:
       - name: Test agentd (Linux only)
         if: runner.os == 'Linux'
         run: cargo test -p termbridge-agentd
+
+      # ── ADR-0020：musl 静态构建验证（Linux 发布产物线）──────────────
+      # 发布产物是 musl 静态（agentd + 主控三件套），CI 必须在 musl target
+      # 上跑同样的 check + 测试，防止「gnu 过了 musl 挂了」的发布事故
+      - name: Check musl targets (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          cargo check --target x86_64-unknown-linux-musl -p termbridge --bins --bin termbridge-mcp --bin termbridge -p termbridge-auth-helper -p termbridge-agentd
+
+      - name: Test agentd on musl (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo test --target x86_64-unknown-linux-musl -p termbridge-agentd
+
+      - name: Test auth helper on musl (Linux only)
+        if: runner.os == 'Linux'
+        run: cargo test --target x86_64-unknown-linux-musl -p termbridge-auth-helper
 
       - name: Check GUI (Tauri)
         run: cargo check -p termbridge-gui

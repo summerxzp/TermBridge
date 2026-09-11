@@ -56,12 +56,14 @@ MCP 客户端直接配置，无需手动下载二进制：
 
 从 [GitHub Release](https://github.com/summerxzp/TermBridge/releases/latest) 下载对应平台的压缩包：
 
-| 平台 | 文件 |
-|------|------|
-| Windows x86_64 | `termbridge-windows-x86_64.zip` |
-| Linux x86_64 | `termbridge-linux-x86_64.tar.gz` |
-| macOS Apple Silicon (M1/M2/M3...) | `termbridge-macos-arm64.tar.gz` |
+| 平台 | 文件 | 兼容性基线 |
+|------|------|-----------|
+| Windows x86_64 | `termbridge-windows-x86_64.zip` | Win10+ / Server 2016+，静态 CRT，无需安装 VC++ Redistributable |
+| Linux x86_64 | `termbridge-linux-x86_64.tar.gz` | musl 静态链接，无 glibc / 运行库依赖（Ubuntu / Debian / RHEL / Rocky / Alpine 等） |
+| macOS Apple Silicon (M1/M2/M3...) | `termbridge-macos-arm64.tar.gz` | macOS 11+（Big Sur） |
 
+> **Linux 二进制为 musl 静态链接**，不依赖目标机 glibc 或其它运行库。支持标准 DNS 与 `/etc/hosts` 主机名解析；依赖 NSS 特有集成（mDNS `.local`、SSSD/LDAP 企业主机名）的环境请使用标准 DNS 域名或 IP 连接。
+>
 > macOS Intel 用户：当前暂无预构建包，请自行从源码构建，或等待后续 x86_64 macOS release。
 
 解压后包含（归档为扁平结构，文件直接位于解压根目录）：
@@ -74,7 +76,7 @@ MCP 客户端直接配置，无需手动下载二进制：
 ├── SKILL.md                  Agent Skill
 ├── README.txt                快速开始
 └── resources/agentd/
-    └── linux-x86_64/         远端 daemon（bootstrap_host 自动部署，无需手动操作）
+    └── linux-x86_64/         远端 daemon（musl 静态，任意 Linux 发行版可运行；bootstrap_host 自动部署，无需手动操作）
 ```
 
 ### 方式三：从源码构建

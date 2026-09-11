@@ -5,6 +5,27 @@ All notable changes to TermBridge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2026-09-11
+
+三平台发布二进制兼容性基线（ADR-0020）。修复 v0.3.1 起 Linux 产物无法在 Ubuntu 22.04 / RHEL 9 / Debian 12 等系统运行的 GLIBC_2.39 问题。
+
+### Fixed
+
+- **Linux 产物 GLIBC_2.39 依赖（v0.3.1 起）**：CI 在 `ubuntu-latest`（24.04，glibc 2.39）构建，rustix 0.38.44 的 `pidfd_spawnp` 弱符号在链接时写死 GLIBC_2.39——Ubuntu 20.04/22.04、Debian 11/12、RHEL/Rocky/Alma 8/9 全部无法运行（`npx` 实测复现）。**修复：Linux 全产物线（含 agentd）切换 musl 静态链接**，零 libc 依赖，任意现代 x86_64 Linux 内核可运行；agentd 部署到远端服务器不再依赖目标机发行版
+- **Windows 产物 VCRUNTIME140.dll 依赖**：动态链接 MSVC CRT 导致缺 VC++ Redistributable 的机器（portable VSCode / Server Core / 精简镜像）上 MCP server 静默启动失败。**修复：静态 CRT（`crt-static`）**，产物自包含；代价为包体积 +3%~16%（npm 包 27.4MB 基线实测）
+
+### Added
+
+- CI 静态性验证门禁：Linux 产物断言 0 个 GLIBC 引用、Windows 断言无 VCRUNTIME140/ucrtbase 导入、macOS 断言 deployment target 11.0——防止未来依赖或 runner 漂移无声破坏基线
+- CI 增加 musl target 的 agentd 测试（46/46）与 auth-helper 集成测试，与发布产物线同参数
+- macOS 显式锚定 `MACOSX_DEPLOYMENT_TARGET=11.0`（Rust target 默认值，显式写入防漂移）
+- README 平台兼容性表：三端基线（Win10+ 静态 CRT / Linux musl 静态 / macOS 11+）+ musl DNS/NSS 边界说明
+
+### 已知限制（ADR-0020 §5，文档化接受）
+
+- musl 无 NSS 扩展：mDNS（`.local`）/ SSSD/LDAP 企业主机名场景需用标准 DNS 域名或 IP 连接（agentd 零影响——源码无主机名解析；本地侧唯一影响点是 SSH 连接的目标解析）
+- musl malloc 多线程分配性能弱于 glibc：本项目 I/O 型负载，影响可忽略
+
 ## [0.3.3] - 2026-09-11
 
 0.3.2 的重发行：内容与 0.3.2 完全一致（ADR-0019 + 发版修复），仅版本号顺延。

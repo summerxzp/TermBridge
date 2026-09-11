@@ -57,12 +57,14 @@ Configure your MCP client directly — no manual binary download needed:
 
 Download the archive for your platform from [GitHub Release](https://github.com/summerxzp/TermBridge/releases/latest):
 
-| Platform | File |
-|----------|------|
-| Windows x86_64 | `termbridge-windows-x86_64.zip` |
-| Linux x86_64 | `termbridge-linux-x86_64.tar.gz` |
-| macOS Apple Silicon (M1/M2/M3...) | `termbridge-macos-arm64.tar.gz` |
+| Platform | File | Compatibility baseline |
+|----------|------|------------------------|
+| Windows x86_64 | `termbridge-windows-x86_64.zip` | Win10+ / Server 2016+, static CRT — no Visual C++ Redistributable required |
+| Linux x86_64 | `termbridge-linux-x86_64.tar.gz` | musl static, no glibc or other runtime library dependency (Ubuntu / Debian / RHEL / Rocky / Alpine, ...) |
+| macOS Apple Silicon (M1/M2/M3...) | `termbridge-macos-arm64.tar.gz` | macOS 11+ (Big Sur) |
 
+> **Linux binaries are statically linked with musl** and require no glibc or other runtime libraries. Standard DNS and `/etc/hosts` hostname resolution are supported; environments relying on NSS-specific integrations (mDNS `.local`, SSSD/LDAP hostnames) should resolve the host via a standard DNS name or IP.
+>
 > macOS Intel users: no pre-built package yet. Please build from source, or wait for a future x86_64 macOS release.
 
 Archive contents (flat archive — files are extracted directly to the extraction root):
@@ -75,7 +77,7 @@ Archive contents (flat archive — files are extracted directly to the extractio
 ├── SKILL.md                  Agent Skill
 ├── README.txt                Quick start
 └── resources/agentd/
-    └── linux-x86_64/         Remote daemon (auto-deployed by bootstrap_host, no manual action needed)
+    └── linux-x86_64/         Remote daemon (musl static, runs on any Linux distro; auto-deployed by bootstrap_host, no manual action needed)
 ```
 
 ### Option 3: Build from Source

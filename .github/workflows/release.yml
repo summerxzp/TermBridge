@@ -2,10 +2,10 @@ name: Release
 
 # 触发：推送 v* tag 时构建 release 资产并上传到 GitHub Release
 #
-# 发布矩阵（3 个主控包 + 1 个内嵌 runtime 组件）：
-#   windows-x86_64  (windows-latest,  MSVC)
-#   linux-x86_64    (ubuntu-latest,   GNU)
-#   macos-arm64     (macos-latest,    Apple Silicon 原生)
+# 发布矩阵（3 个主控包 + 1 个内嵌 runtime 组件，ADR-0020 二进制兼容性基线）：
+#   windows-x86_64  (windows-latest,  MSVC + 静态 CRT，Win10+)
+#   linux-x86_64    (ubuntu-latest,   musl 静态，任意现代 x86_64 Linux)
+#   macos-arm64     (macos-latest,    Apple Silicon 原生，deployment target 11.0)
 #
 # agentd (Linux x86_64 远端 daemon) 单独构建一次，嵌入所有主控包的
 # resources/agentd/linux-x86_64/，由 bootstrap_host 自动部署到远端，
@@ -28,27 +28,43 @@ env:
 jobs:
   # agentd 是 Linux-only 远端 daemon（依赖 nix crate），只能在 Linux runner 上构建
   # 构建一次后作为 artifact 分发给 3 个主控 build job 嵌入
+  # ADR-0020：agentd 用 musl 静态——部署目标是任意发行版的远端服务器，
+  # 不能赌目标机 glibc（v0.3.3 实测 GLIBC_2.39 要求导致 Ubuntu 22.04/RHEL 9 全挂）
   build-agentd:
-    name: Build agentd (Linux x86_64)
+    name: Build agentd (Linux x86_64 musl)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-agentd
 
-      - name: Build agentd
-        run: cargo build --release -p termbridge-agentd
+      - name: Build agentd (musl static)
+        run: cargo build --release --target x86_64-unknown-linux-musl -p termbridge-agentd
+
+      - name: Verify static linkage
+        run: |
+          f=target/x86_64-unknown-linux-musl/release/termbridge-agentd
+          file "$f" | grep -q "statically linked\|static-pie"
+          n_glibc=$(objdump -T "$f" 2>/dev/null | grep -c GLIBC || true)
+          [ "$n_glibc" -eq 0 ] || { echo "::error::agentd 含 $n_glibc 个 GLIBC 引用"; exit 1; }
+          strip "$f"
+          file "$f"
 
       - name: Upload agentd artifact
         uses: actions/upload-artifact@v5
         with:
           name: agentd-linux-x86_64
-          path: target/release/termbridge-agentd
+          path: target/x86_64-unknown-linux-musl/release/termbridge-agentd
 
   build:
     name: Build (${{ matrix.asset }})
@@ -63,7 +79,7 @@ jobs:
             target: x86_64-pc-windows-msvc
           - asset: linux-x86_64
             runner: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
           - asset: macos-arm64
             runner: macos-latest
             target: aarch64-apple-darwin
@@ -74,6 +90,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # ADR-0020：Linux musl 需要 musl-gcc（ring 的 C 汇编编译）
+      - name: Install musl toolchain
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # ADR-0020：Windows 静态 CRT——产物不再依赖目标机 VC++ Redistributable
+      #（portable VSCode / Server Core / 精简镜像可能缺 VCRUNTIME140.dll，
+      #  失败模式是 MCP server 静默起不来）。代价：包体积 +3%~16%
+      - name: Configure static CRT
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> "$GITHUB_ENV"
+
+      # ADR-0020：macOS deployment target 显式锚定 11.0（Rust target 默认即此值，
+      # 显式写入防 runner SDK / 依赖漂移无声抬高基线）
+      - name: Pin macOS deployment target
+        if: runner.os == 'macOS'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=11.0" >> "$GITHUB_ENV"
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -91,6 +126,49 @@ jobs:
 
       - name: Build auth helper
         run: cargo build --release --target ${{ matrix.target }} -p termbridge-auth-helper
+
+      # ADR-0020 §4：静态性验证——Linux 期望 0 个 GLIBC 引用；
+      # Windows 期望导入表无 VCRUNTIME140/ucrtbase；macOS 期望 minos=11.0
+      - name: Verify binary linkage baseline
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          T="${{ matrix.target }}"
+          for b in termbridge-mcp termbridge termbridge-auth-helper; do
+            f="target/$T/release/$b"
+            if [ "$(uname -s)" = "Linux" ]; then
+              file "$f" | grep -q "statically linked\|static-pie" || { echo "::error::$b 非静态"; exit 1; }
+              n=$(objdump -T "$f" 2>/dev/null | grep -c GLIBC || true)
+              [ "$n" -eq 0 ] || { echo "::error::$b 含 $n 个 GLIBC 引用"; exit 1; }
+            else
+              # macOS：Mach-O LC_BUILD_VERSION 的 minos 应为 11.0
+              otool -l "$f" | grep -A2 LC_BUILD_VERSION | grep -q "minos 11.0" || { echo "::error::$b minos 非 11.0"; exit 1; }
+            fi
+          done
+          # strip（Unix）：减小体积；Windows 侧 msvc 默认已无调试符号膨胀
+          if [ "$(uname -s)" = "Linux" ]; then
+            strip "target/$T/release/termbridge-mcp" "target/$T/release/termbridge" "target/$T/release/termbridge-auth-helper"
+          fi
+          echo "── 静态性验证通过"
+
+      - name: Verify binary linkage baseline (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($b in @("termbridge-mcp", "termbridge", "termbridge-auth-helper")) {
+            $exe = "target/${{ matrix.target }}/release/$b.exe"
+            $bytes = [System.IO.File]::ReadAllBytes($exe)
+            $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+            foreach ($dll in @("VCRUNTIME140", "ucrtbase")) {
+              if ($ascii.Contains("$dll.dll")) {
+                Write-Host "::error::$b 导入表仍含 $dll.dll（crt-static 未生效）"
+                exit 1
+              }
+            }
+          }
+          Write-Host "-- 静态 CRT 验证通过（无 VCRUNTIME140/ucrtbase 导入）"
 
       - name: Stage artifacts (Windows)
         if: runner.os == 'Windows'
