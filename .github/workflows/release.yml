@@ -142,8 +142,9 @@ jobs:
               n=$(objdump -T "$f" 2>/dev/null | grep -c GLIBC || true)
               [ "$n" -eq 0 ] || { echo "::error::$b 含 $n 个 GLIBC 引用"; exit 1; }
             else
-              # macOS：Mach-O LC_BUILD_VERSION 的 minos 应为 11.0
-              otool -l "$f" | grep -A2 LC_BUILD_VERSION | grep -q "minos 11.0" || { echo "::error::$b minos 非 11.0"; exit 1; }
+              # macOS：Mach-O LC_BUILD_VERSION 块为 cmd/platform/sdk/minos/ntools，
+              # minos 在第 4 行（首跑实测 -A2 只取到 platform/sdk 导致误报）
+              otool -l "$f" | grep -A4 LC_BUILD_VERSION | grep -q "minos 11.0" || { echo "::error::$b minos 非 11.0"; exit 1; }
             fi
           done
           # strip（Unix）：减小体积；Windows 侧 msvc 默认已无调试符号膨胀
