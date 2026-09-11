@@ -5,7 +5,9 @@ All notable changes to TermBridge are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.2] - 2026-09-11
+
+ADR-0019：Linux/macOS 凭据输入多级 fallback + 协议 v2 + 超时。10 场景 E2E 实测（含真实 zenity 弹框 + 完整 MCP 链路）全绿。
 
 ### Added
 

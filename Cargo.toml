@@ -3,7 +3,7 @@
 members = ["agentd", "cli", "crates/termbridge-auth-helper", "gui/src-tauri"]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 
 [package]
 name = "termbridge"
