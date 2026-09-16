@@ -28,7 +28,7 @@ use crate::session::SessionManager;
 // ───────────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "termbridge-agentd", about = "TermBridge 远端 daemon")]
+#[command(name = "termbridge-agentd", version, about = "TermBridge 远端 daemon")]
 struct Cli {
     #[command(subcommand)]
     mode: Mode,

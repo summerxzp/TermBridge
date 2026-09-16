@@ -21,6 +21,13 @@ use termbridge::transport::mcp::server::TermBridgeServer;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // 手动解析 --version/-V（MCP stdio server 不引入 clap 依赖面）：
+    // 输出一行版本号后退出，便于脚本/客户端确认安装版本
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("termbridge-mcp {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // tracing → stderr（stdio 留给 MCP JSON-RPC），经 RedactingMakeWriter 脱敏（§5.5）
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())

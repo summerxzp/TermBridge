@@ -33,7 +33,7 @@ use termbridge::infrastructure::persistent::PersistentProvider;
 // ───────────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "termbridge", about = "TermBridge CLI — 人类管理员工具")]
+#[command(name = "termbridge", version, about = "TermBridge CLI — 人类管理员工具")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
